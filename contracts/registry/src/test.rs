@@ -304,7 +304,12 @@ fn test_reinstate_restores_verified_and_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone()).into_val(&env),
+                (
+                    Symbol::new(&env, "profile_verified"),
+                    issuer.clone(),
+                    admin.clone(),
+                )
+                    .into_val(&env),
                 true.into_val(&env),
             ),
             (
@@ -1071,6 +1076,59 @@ fn test_verify_profile_updates_status() {
 }
 
 #[test]
+fn test_verify_profile_emits_event_with_authorizing_admin() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+
+    client.verify_profile(&issuer, &true);
+
+    // The verification event indexes both the profile and the stored admin
+    // that authorized the status change, with the new status as data.
+    assert_eq!(
+        env.events().all(),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "contract_initialized"), admin.clone()).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "issuer_registered"), issuer.clone()).into_val(&env),
+                ().into_val(&env),
+            ),
+            (
+                client.address.clone(),
+                (
+                    Symbol::new(&env, "profile_verified"),
+                    issuer.clone(),
+                    admin.clone(),
+                )
+                    .into_val(&env),
+                true.into_val(&env),
+            ),
+        ]
+    );
+
+    // Un-verifying reports `false` while attributing the same admin.
+    client.verify_profile(&issuer, &false);
+    let events = env.events().all();
+    let (_, topics, data) = events.get(events.len() - 1).unwrap();
+    let topics_val: Val = topics.into_val(&env);
+    let (symbol, profile, authorizer): (Symbol, Address, Address) =
+        topics_val.try_into_val(&env).unwrap();
+    assert_eq!(symbol, Symbol::new(&env, "profile_verified"));
+    assert_eq!(profile, issuer);
+    assert_eq!(authorizer, admin);
+    let status: bool = bool::try_from_val(&env, &data).unwrap();
+    assert!(!status);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_verify_profile_unknown_panics() {
     let (env, client) = setup();
@@ -1808,7 +1866,12 @@ fn test_revoke_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone()).into_val(&env),
+                (
+                    Symbol::new(&env, "profile_verified"),
+                    issuer.clone(),
+                    admin.clone(),
+                )
+                    .into_val(&env),
                 true.into_val(&env),
             ),
             (

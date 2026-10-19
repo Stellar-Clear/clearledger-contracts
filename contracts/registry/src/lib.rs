@@ -1,7 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 use clearledger_pause::{require_not_paused, set_paused};
+use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 
 mod constants;
 mod errors;
@@ -726,7 +726,7 @@ impl RegistryContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::profile_verified(&env, &address, verify);
+        events::profile_verified(&env, &address, &admin, verify);
         Self::extend_instance_ttl(&env);
         true
     }

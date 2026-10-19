@@ -717,16 +717,22 @@ Emitted when a batch registration completes.
 
 ### `profile_verified`
 
-Emitted when a profile's verification status is checked/updated.
+Emitted when a profile's verification status is updated by the admin.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"profile_verified"` |
 | `topic[1]` | `Address` | Profile address |
+| `topic[2]` | `Address` | Authorizing admin (the stored `DataKey::Admin`) |
 | **Data** | `bool` | Verification status (true = verified) |
 
-**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs:570`
+The admin is appended as `topic[2]`; existing topic/data positions are
+unchanged, so consumers matching on `topic[0]` / `topic[1]` and the `bool` data
+payload keep working while indexers can attribute each status change to the
+admin who authorized it.
+
+**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs`
 
 ---
 

@@ -42,6 +42,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `registry`: the `profile_verified` event now includes the authorizing admin
+  as `topic[2]`, so indexers can attribute verification status changes. The
+  existing profile topic and `bool` status data are unchanged (#8)
 - `pool.initialize` accepts three new arguments: `share_name`, `share_symbol`
   and `share_decimals`
 

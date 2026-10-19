@@ -29,9 +29,17 @@ pub fn batch_registered(env: &Env, registered: u32, skipped: u32) {
     );
 }
 
-pub fn profile_verified(env: &Env, address: &Address, status: bool) {
+/// Emitted by `verify_profile` when a profile's verification status changes.
+/// `address` is the profile being updated and `admin` is the stored contract
+/// admin that authorized the change; both are indexed so indexers can
+/// attribute the status update to the authorizing admin.
+pub fn profile_verified(env: &Env, address: &Address, admin: &Address, status: bool) {
     env.events().publish(
-        (Symbol::new(env, "profile_verified"), address.clone()),
+        (
+            Symbol::new(env, "profile_verified"),
+            address.clone(),
+            admin.clone(),
+        ),
         status,
     );
 }
