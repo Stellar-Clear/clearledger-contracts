@@ -1526,3 +1526,21 @@ fn test_pause_is_scoped_to_one_instance() {
     assert!(a.try_lock(&id, &1_000, &issuer).is_err());
     assert!(b.lock(&id, &1_000, &issuer));
 }
+
+// Issue #35: releasing the collateral record is terminal today. This pins the
+// compatibility constraint a future issuer-payout implementation must remove.
+#[test]
+fn issuer_release_is_terminal_even_when_buyer_repays_escrow() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 235);
+    let amount = 1_000_000_000u128;
+    assert!(client.lock(&invoice_id, &amount, &issuer));
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    assert_eq!(client.get_locked(&invoice_id), 0);
+
+    // Simulate buyer repayment arriving after the issuer has been paid. A
+    // replenished token balance cannot restore the removed per-invoice record.
+    let token = MockTokenClient::new(&env, &usdc_id);
+    token.transfer(&issuer, &client.address, &(amount as i128));
+    assert!(client.try_release_to_pool(&invoice_id, &amount).is_err());
+}
