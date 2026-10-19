@@ -187,7 +187,10 @@ fn assert_fee_settlement(lifecycle: &FeeLifecycle, expected: FeeSettlementExpect
     assert_eq!(token.balance(&lifecycle.escrow_id), 9_800_000_000);
 }
 
-fn expected_repayment_split(invoice: &clearledger_invoice::Invoice, repaid_at: u64) -> (u128, u128) {
+fn expected_repayment_split(
+    invoice: &clearledger_invoice::Invoice,
+    repaid_at: u64,
+) -> (u128, u128) {
     let funded_at = invoice
         .funded_at
         .expect("funded invoice should record its funding timestamp");
@@ -201,6 +204,68 @@ fn expected_repayment_split(invoice: &clearledger_invoice::Invoice, repaid_at: u
     };
     let refund_to_buyer = discount - earned_by_pool;
     (earned_by_pool, refund_to_buyer)
+}
+
+// Focused SEP-41 consumer checklist using the generic token client.
+#[test]
+fn test_sep41_share_transfer_and_allowance_checklist() {
+    let lifecycle = setup_fee_lifecycle();
+    let minted = lifecycle.pool.deposit(&lifecycle.lp, &12_000_000_000);
+    let recipient = Address::generate(&lifecycle.env);
+    let spender = Address::generate(&lifecycle.env);
+    let stranger = Address::generate(&lifecycle.env);
+    let shares = soroban_sdk::token::Client::new(&lifecycle.env, &lifecycle.pool_id);
+    assert_eq!(
+        shares.name(),
+        String::from_str(&lifecycle.env, "ClearLedger USDC Pool Shares")
+    );
+    assert_eq!(shares.symbol(), String::from_str(&lifecycle.env, "TT-USDC"));
+    assert_eq!(shares.decimals(), DEFAULT_SHARE_DECIMALS);
+    let stats_before = lifecycle.pool.get_stats().to_xdr(&lifecycle.env);
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let pool_assets = token.balance(&lifecycle.pool_id);
+    assert_eq!(shares.balance(&lifecycle.lp), minted as i128);
+    assert_eq!(shares.balance(&recipient), 0);
+    shares.transfer(&lifecycle.lp, &recipient, &100);
+    assert_eq!(shares.balance(&lifecycle.lp), minted as i128 - 100);
+    assert_eq!(shares.balance(&recipient), 100);
+    let expiry = lifecycle.env.ledger().sequence() + 10;
+    shares.approve(&lifecycle.lp, &spender, &300, &expiry);
+    shares.approve(&lifecycle.lp, &spender, &200, &expiry);
+    assert_eq!(shares.allowance(&lifecycle.lp, &spender), 200);
+    assert_eq!(shares.allowance(&lifecycle.lp, &stranger), 0);
+    shares.transfer_from(&spender, &lifecycle.lp, &recipient, &150);
+    assert_eq!(shares.allowance(&lifecycle.lp, &spender), 50);
+    assert!(shares
+        .try_transfer_from(&spender, &lifecycle.lp, &recipient, &51)
+        .is_err());
+    assert_eq!(shares.allowance(&lifecycle.lp, &spender), 50);
+    assert_eq!(shares.balance(&recipient), 250);
+    lifecycle.env.ledger().set_sequence_number(expiry);
+    assert_eq!(shares.allowance(&lifecycle.lp, &spender), 50);
+    lifecycle.env.ledger().set_sequence_number(expiry + 1);
+    assert_eq!(shares.allowance(&lifecycle.lp, &spender), 0);
+    assert!(shares
+        .try_transfer_from(&spender, &lifecycle.lp, &recipient, &1)
+        .is_err());
+    shares.approve(&lifecycle.lp, &spender, &0, &0);
+    assert_eq!(shares.allowance(&lifecycle.lp, &spender), 0);
+    assert_eq!(
+        shares.balance(&lifecycle.lp) + shares.balance(&recipient),
+        minted as i128
+    );
+    assert_eq!(
+        lifecycle.pool.get_stats().to_xdr(&lifecycle.env),
+        stats_before
+    );
+    assert_eq!(token.balance(&lifecycle.pool_id), pool_assets);
+    // Blanket authorization is disabled for this negative control.
+    lifecycle.env.set_auths(&[]);
+    assert!(shares.try_transfer(&lifecycle.lp, &recipient, &1).is_err());
+    assert!(shares
+        .try_approve(&lifecycle.lp, &spender, &1, &(expiry + 10))
+        .is_err());
+    assert_eq!(shares.balance(&recipient), 250);
 }
 
 // --------------- Mock Agent Registry ---------------
