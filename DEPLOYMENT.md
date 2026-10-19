@@ -172,6 +172,77 @@ submit the initialization transaction with the configured threshold. Subsequent
 admin-only invocations, including contract upgrades, must likewise carry
 authorization satisfying the 3-of-5 threshold.
 
+## Testnet Pause and Recovery Runbook
+
+This procedure applies to the current Testnet deployment only. It is an
+operator response guide, not evidence of Mainnet readiness. The `pause` and
+`unpause` entry points are available on the registry, invoice, escrow, and pool
+contracts. Each contract has an independent pause flag; pausing one contract
+does not pause the others. Read-only methods remain available while paused,
+but guarded state changes fail with `ContractPaused`.
+
+The manual commands below use the contract IDs from `.env` (see
+`.env.example`) and the admin methods implemented in
+`contracts/{registry,invoice,escrow,pool}/src/lib.rs`. `scripts/deploy.sh`
+deploys contracts but does not provide an incident pause workflow.
+`.github/workflows/ci.yml` runs build and test jobs only; it does not deploy,
+pause, or resume contracts. An authorized Testnet operator must run this
+procedure.
+
+### Contain an Incident
+
+1. Confirm the affected contract IDs in `.env` and check their admins with the
+   existing read-only `get_admin` calls. Stop deploy/redeploy jobs while
+   investigating; do not use `--fresh` as an incident response.
+2. Use the configured admin signer (or the configured multi-sig threshold) to
+   pause the affected contracts. For a broad protocol incident, pause each
+   deployed pool first to stop new funding and LP activity, then pause the
+   invoice, escrow, and registry contracts as needed. The experimental XLM
+   contracts are optional and should only be included when deployed.
+
+   ```bash
+   stellar contract invoke --id "$POOL_USDC_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$POOL_XLM_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$INVOICE_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$ESCROW_USDC_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$ESCROW_XLM_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$REGISTRY_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   ```
+
+   Omit an optional ID when its contract is not deployed. The signer used by
+   `--source` must satisfy the contract admin's authorization policy; for a
+   multi-sig admin, submit with the required threshold rather than replacing
+   the admin with a single signer.
+
+3. Confirm each transaction succeeds and inspect that contract's events on
+   [Stellar Expert Testnet](https://stellar.expert/explorer/testnet) for the
+   `paused` event and its admin. The current contracts do not expose a
+   read-only pause-status method, so `get_admin`, `get_stats`, or `get_counts`
+   alone cannot confirm pause state. Use those existing views to capture
+   contract configuration and balances while investigating. Do not submit a
+   real state-changing transaction just to test whether a contract is paused.
+4. Record the incident time, affected contract IDs, transaction hashes,
+   observed event(s), relevant ledger/state observations, and the operator who
+   authorized the pause. Tell integrators that affected state-changing calls
+   will fail until the contracts are resumed.
+
+### Recover
+
+1. Resolve the underlying incident and verify the affected contract wiring and
+   state using the existing read-only queries in [Contract Verification](#contract-verification).
+   Check the relevant pool `get_stats`, invoice `get_counts`, escrow lock
+   records, and registry state before resuming. Re-running `scripts/verify.sh`
+   is an additional deployment/wiring check; it does not report pause state.
+2. Obtain the operator/multi-sig approval to resume, then call `unpause` on
+   each contract that was paused. Use the same contract IDs, network, admin
+   signer, and authorization threshold as for `pause`, replacing the final
+   `pause` argument with `unpause`.
+3. Confirm successful transaction inclusion and inspect each contract's
+   `unpaused` event on Stellar Expert Testnet. Start with a small, controlled
+   operation and monitor contract events and balances before restoring normal
+   traffic. Do not describe Testnet assets as having Mainnet or real-value
+   status.
+
 ## Agent Registry Wiring
 
 `AGENT_REGISTRY_CONTRACT` in `.env.example` refers to the agent-registry

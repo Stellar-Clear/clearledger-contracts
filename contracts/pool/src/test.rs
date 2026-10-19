@@ -578,6 +578,9 @@ fn test_dust_deposit_rejection_preserves_state_and_funds() {
 
     let before = te.pool.get_stats();
     let lp2 = create_lp_with_balance(&te, 10_000_000_000);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let lp_balance_before = usdc.balance(&lp2);
+    let pool_balance_before = usdc.balance(&te.pool_id);
 
     // try_* returns Err on contract panic instead of unwinding the test.
     let res = te.pool.try_deposit(&lp2, &1);
@@ -587,6 +590,8 @@ fn test_dust_deposit_rejection_preserves_state_and_funds() {
     let after = te.pool.get_stats();
     assert_eq!(after.total_deposits, before.total_deposits);
     assert_eq!(after.total_shares, before.total_shares);
+    assert_eq!(usdc.balance(&lp2), lp_balance_before);
+    assert_eq!(usdc.balance(&te.pool_id), pool_balance_before);
 
     // The rejected depositor holds no shares.
     let pos = te.pool.get_lp_position(&lp2);
@@ -4561,6 +4566,49 @@ fn test_freshly_initialized_pool_has_zero_protocol_fee() {
 }
 
 #[test]
+fn test_protocol_fee_rounding_at_zero_max_and_truncation_boundaries() {
+    let cases = [
+        (0u32, 1u128, 0u128),
+        (1, 9_999, 0),
+        (1, 10_000, 1),
+        (MAX_PROTOCOL_FEE_BPS, 4, 0),
+        (MAX_PROTOCOL_FEE_BPS, 5, 1),
+        (MAX_PROTOCOL_FEE_BPS, 10_001, 2_000),
+    ];
+
+    for (fee_bps, yield_amount, expected_fee) in cases {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list(&te, &te.usdc_id);
+        te.pool.fund_invoice(&invoice_id);
+
+        let treasury = Address::generate(&te.env);
+        te.pool.set_protocol_fee(&fee_bps, &treasury);
+
+        let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+        let treasury_before = usdc.balance(&treasury);
+        let stats_before = te.pool.get_stats();
+        assert!(te
+            .pool
+            .receive_repayment(&invoice_id, &(DEFAULT_FUNDED_AMOUNT + yield_amount)));
+
+        let stats_after = te.pool.get_stats();
+        assert_eq!(
+            usdc.balance(&treasury) - treasury_before,
+            expected_fee as i128
+        );
+        assert_eq!(
+            stats_after.total_yield_distributed - stats_before.total_yield_distributed,
+            yield_amount - expected_fee
+        );
+        assert_eq!(
+            stats_after.total_deposits - stats_before.total_deposits,
+            yield_amount - expected_fee
+        );
+    }
+}
+
+#[test]
 fn test_nonzero_protocol_fee_splits_receive_repayment() {
     let te = setup();
     te.pool.deposit(&te.lp, &100_000_000_000);
@@ -6649,13 +6697,19 @@ fn test_batch_fund_invoice_stops_on_insufficient_liquidity() {
         &te.env,
         create_and_list(&te, &te.usdc_id),
         create_and_list(&te, &te.usdc_id),
+        create_and_list(&te, &te.usdc_id),
+        create_and_list(&te, &te.usdc_id),
     ];
 
     let funded = te.pool.batch_fund_invoice(&ids);
     assert_eq!(funded.len(), 1);
     assert_eq!(funded.get(0).unwrap(), ids.get(0).unwrap());
-    assert_eq!(te.invoice.get_status(&ids.get(1).unwrap()), 1); // Listed
-    assert_eq!(te.pool.get_stats().active_invoice_count, 1);
+    for index in 1..ids.len() {
+        assert_eq!(te.invoice.get_status(&ids.get(index).unwrap()), 1); // Listed
+    }
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_funded, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(stats.active_invoice_count, 1);
 }
 
 /// Eligibility failures are NOT treated as a capacity stop: an ineligible entry
