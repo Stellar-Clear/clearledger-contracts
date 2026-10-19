@@ -187,7 +187,10 @@ fn assert_fee_settlement(lifecycle: &FeeLifecycle, expected: FeeSettlementExpect
     assert_eq!(token.balance(&lifecycle.escrow_id), 9_800_000_000);
 }
 
-fn expected_repayment_split(invoice: &clearledger_invoice::Invoice, repaid_at: u64) -> (u128, u128) {
+fn expected_repayment_split(
+    invoice: &clearledger_invoice::Invoice,
+    repaid_at: u64,
+) -> (u128, u128) {
     let funded_at = invoice
         .funded_at
         .expect("funded invoice should record its funding timestamp");
@@ -1018,4 +1021,87 @@ fn test_partial_repayment_then_default_pool_loss_calculation() {
     // 16. LP withdrawal should reflect correct principal after loss
     let returned = pool.withdraw(&lp, &shares);
     assert_eq!(returned, deposit_amount - expected_loss);
+}
+
+/// Opt-in measurement only: normal correctness tests do not rewrite baselines.
+#[test]
+#[ignore = "run scripts/report-budgets.sh to generate a native testutils report"]
+fn report_core_workflow_budgets() {
+    fn measure<T>(
+        env: &Env,
+        rows: &mut std::vec::Vec<std::string::String>,
+        name: &str,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        env.budget().reset_unlimited();
+        let result = action();
+        let cpu = env.budget().cpu_instruction_cost();
+        let memory = env.budget().memory_bytes_cost();
+        assert!(cpu > 0, "measurement did not execute host work");
+        rows.push(std::format!(
+            "{{\"workflow\":\"{name}\",\"cpu_instructions\":{cpu},\"memory_bytes\":{memory}}}"
+        ));
+        result
+    }
+
+    let mut rows = std::vec::Vec::new();
+    let lifecycle = setup_fee_lifecycle();
+    let env = &lifecycle.env;
+    let shares = measure(env, &mut rows, "deposit", || {
+        lifecycle.pool.deposit(&lifecycle.lp, &12_000_000_000)
+    });
+    let due = env.ledger().timestamp() + 30 * 86400;
+    let id = measure(env, &mut rows, "create", || {
+        lifecycle.invoice.create(
+            &lifecycle.issuer,
+            &lifecycle.buyer,
+            &10_000_000_000,
+            &due,
+            &lifecycle.usdc_id,
+        )
+    });
+    attest_invoice(env, &lifecycle.invoice, &id);
+    measure(env, &mut rows, "list", || {
+        lifecycle.invoice.list_for_financing(&id, &200)
+    });
+    assert!(measure(env, &mut rows, "fund", || lifecycle
+        .pool
+        .fund_invoice(&id)));
+    lifecycle.invoice.mark_shipped(&id);
+    lifecycle.invoice.confirm_delivery(&id, &lifecycle.issuer);
+    lifecycle.invoice.confirm_delivery(&id, &lifecycle.buyer);
+    env.ledger().set_timestamp(due);
+    assert!(measure(env, &mut rows, "repay", || lifecycle
+        .invoice
+        .repay(&id)));
+    assert!(
+        measure(env, &mut rows, "withdraw", || lifecycle
+            .pool
+            .withdraw(&lifecycle.lp, &shares))
+            > 0
+    );
+
+    // Separate fixture: repayment and default are mutually exclusive terminal
+    // paths. Measure the existing pool default entry, not the known-reentrant
+    // invoice.trigger_default path documented by the lifecycle tests above.
+    let default_case = setup_fee_lifecycle();
+    default_case.pool.deposit(&default_case.lp, &12_000_000_000);
+    let (default_id, default_due) = create_fee_lifecycle_invoice(&default_case);
+    default_case.env.ledger().set_timestamp(default_due + 60);
+    assert!(measure(&default_case.env, &mut rows, "default", || {
+        default_case.pool.handle_default(&default_id)
+    }));
+    assert!(default_case.invoice.mark_defaulted(&default_id));
+    assert_eq!(rows.len(), 7);
+
+    let report = std::format!("{{\n  \"schema_version\":1,\n  \"execution\":\"native-soroban-testutils\",\n  \"budget_limits\":\"unlimited\",\n  \"mock_authorization\":true,\n  \"amount_stroops\":10000000000,\n  \"deposit_stroops\":12000000000,\n  \"discount_bps\":200,\n  \"results\":[\n    {}\n  ]\n}}\n", rows.join(",\n    "));
+    let destination = std::env::var("CLEARLEDGER_BUDGET_REPORT")
+        .expect("set CLEARLEDGER_BUDGET_REPORT via scripts/report-budgets.sh");
+    let path = std::path::Path::new(&destination);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create report directory");
+    }
+    // Do not publish a partial report if any workflow failed above.
+    std::fs::write(path, report).expect("write budget report");
+    std::println!("Budget report written to {}", path.display());
 }
