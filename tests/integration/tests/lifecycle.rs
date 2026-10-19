@@ -20,6 +20,11 @@ pub struct MockToken;
 #[contractimpl]
 impl MockToken {
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        if let Some(fail_to) = env.storage().instance().get::<_, Address>(&FailToKey) {
+            if to == fail_to {
+                panic!("mock token: transfer to issuer failed");
+            }
+        }
         let from_key = TKey(from.clone());
         let to_key = TKey(to.clone());
         let from_bal: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
@@ -33,10 +38,38 @@ impl MockToken {
     pub fn balance(env: Env, addr: Address) -> i128 {
         env.storage().persistent().get(&TKey(addr)).unwrap_or(0)
     }
+
+    pub fn set_fail_transfers_to(env: Env, target: Address) {
+        env.storage().instance().set(&FailToKey, &target);
+    }
 }
 
 #[contracttype]
 pub struct TKey(Address);
+
+#[contracttype]
+pub struct FailToKey;
+
+// --------------- Test-only Funding Orchestrator ---------------
+
+/// Composes funding and the issuer payout in a single top-level invocation so
+/// a payout failure must roll back the funding writes too.
+#[contract]
+pub struct FundingOrchestrator;
+
+#[contractimpl]
+impl FundingOrchestrator {
+    pub fn fund_and_release(
+        env: Env,
+        pool: Address,
+        escrow: Address,
+        issuer: Address,
+        invoice_id: BytesN<32>,
+    ) {
+        PoolContractClient::new(&env, &pool).fund_invoice(&invoice_id);
+        EscrowContractClient::new(&env, &escrow).release_to_issuer(&invoice_id, &issuer);
+    }
+}
 
 struct FeeLifecycle {
     env: Env,
@@ -1018,4 +1051,92 @@ fn test_partial_repayment_then_default_pool_loss_calculation() {
     // 16. LP withdrawal should reflect correct principal after loss
     let returned = pool.withdraw(&lp, &shares);
     assert_eq!(returned, deposit_amount - expected_loss);
+}
+
+// --------------- Funding Atomicity (Issue #20) ---------------
+
+#[test]
+fn test_fund_invoice_rolls_back_atomically_when_issuer_payout_fails() {
+    let lifecycle = setup_fee_lifecycle();
+    let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+
+    let deposit = 12_000_000_000u128;
+    lifecycle.pool.deposit(&lifecycle.lp, &deposit);
+
+    let face_value = 10_000_000_000u128;
+    let due_date = lifecycle.env.ledger().timestamp() + 30 * 86400;
+    let invoice_id = lifecycle.invoice.create(
+        &lifecycle.issuer,
+        &lifecycle.buyer,
+        &face_value,
+        &due_date,
+        &lifecycle.usdc_id,
+    );
+    attest_invoice(&lifecycle.env, &lifecycle.invoice, &invoice_id);
+    lifecycle.invoice.list_for_financing(&invoice_id, &200);
+
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let locked_before = escrow.get_locked(&invoice_id);
+    let history_len_before = escrow.get_history(&invoice_id).len();
+    let issuer_before = token.balance(&lifecycle.issuer);
+    let escrow_before = token.balance(&lifecycle.escrow_id);
+    let pool_before = token.balance(&lifecycle.pool_id);
+    let lp_before = token.balance(&lifecycle.lp);
+
+    // Make only the escrow -> issuer payout leg fail; pool -> escrow lock and
+    // LP -> pool deposit still succeed.
+    token.set_fail_transfers_to(&lifecycle.issuer);
+
+    let orchestrator_id = lifecycle.env.register_contract(None, FundingOrchestrator);
+    let orchestrator = FundingOrchestratorClient::new(&lifecycle.env, &orchestrator_id);
+    let result = orchestrator.try_fund_and_release(
+        &lifecycle.pool_id,
+        &lifecycle.escrow_id,
+        &lifecycle.issuer,
+        &invoice_id,
+    );
+    assert!(result.is_err(), "issuer payout failure must revert the call");
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    assert_eq!(invoice_after.status, invoice_before.status);
+    assert_eq!(invoice_after.status, InvoiceStatus::Listed);
+    assert_eq!(invoice_after.funded_amount, invoice_before.funded_amount);
+    assert_eq!(invoice_after.funded_at, invoice_before.funded_at);
+    assert_eq!(invoice_after.funding_pool, invoice_before.funding_pool);
+    assert_eq!(invoice_after.listed_at, invoice_before.listed_at);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.repaid_amount);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.remaining_balance
+    );
+
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    assert_eq!(
+        stats_after.utilization_rate_bps,
+        stats_before.utilization_rate_bps
+    );
+    assert_eq!(
+        stats_after.active_invoice_count,
+        stats_before.active_invoice_count
+    );
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+
+    assert_eq!(escrow.get_locked(&invoice_id), locked_before);
+    assert_eq!(escrow.get_locked(&invoice_id), 0);
+    assert_eq!(
+        escrow.get_history(&invoice_id).len(),
+        history_len_before
+    );
+    assert_eq!(token.balance(&lifecycle.issuer), issuer_before);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_before);
+    assert_eq!(token.balance(&lifecycle.pool_id), pool_before);
+    assert_eq!(token.balance(&lifecycle.lp), lp_before);
 }
