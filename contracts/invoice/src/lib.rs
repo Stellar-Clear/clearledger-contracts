@@ -509,9 +509,12 @@ impl InvoiceContract {
             .instance()
             .get(&DataKey::SupportedAssetCount)
             .unwrap_or(0);
+        let next_count = count
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::CounterOverflow));
         env.storage()
             .instance()
-            .set(&DataKey::SupportedAssetCount, &(count + 1));
+            .set(&DataKey::SupportedAssetCount, &next_count);
         env.storage().persistent().set(&key, &true);
         Self::extend_instance_ttl(&env);
         events::supported_asset_added(&env, &asset);
@@ -2761,13 +2764,16 @@ fn require_verified(env: &Env, registry_id: &Address, addr: &Address, err: Invoi
 /// * `invoice_id` - The invoice ID to add.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics with `CounterOverflow` when the index has no remaining capacity.
 ///
 /// # Returns
 /// * `()` - No value is returned.
 fn extend_issuer_index(env: &Env, issuer: &Address, invoice_id: &BytesN<32>) {
     let count_key = DataKey::IssuerIndexCount(issuer.clone());
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, InvoiceError::CounterOverflow));
 
     // Check if invoice_id already exists in this issuer index
     for i in 0..count {
@@ -2784,7 +2790,7 @@ fn extend_issuer_index(env: &Env, issuer: &Address, invoice_id: &BytesN<32>) {
 
     let entry_key = DataKey::IssuerIndexEntry(issuer.clone(), count);
     env.storage().persistent().set(&entry_key, invoice_id);
-    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage().persistent().set(&count_key, &next_count);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -2801,13 +2807,16 @@ fn extend_issuer_index(env: &Env, issuer: &Address, invoice_id: &BytesN<32>) {
 /// * `invoice_id` - The invoice ID to add.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics with `CounterOverflow` when the index has no remaining capacity.
 ///
 /// # Returns
 /// * `()` - No value is returned.
 fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
     let count_key = DataKey::BuyerIndexCount(buyer.clone());
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, InvoiceError::CounterOverflow));
 
     // Check if invoice_id already exists in this buyer index
     for i in 0..count {
@@ -2824,7 +2833,7 @@ fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
 
     let entry_key = DataKey::BuyerIndexEntry(buyer.clone(), count);
     env.storage().persistent().set(&entry_key, invoice_id);
-    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage().persistent().set(&count_key, &next_count);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -2846,7 +2855,7 @@ fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
 /// * `invoice_id` - The invoice ID to add.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics with `CounterOverflow` when the index has no remaining capacity.
 ///
 /// # Returns
 /// * `()` - No value is returned.
@@ -2860,10 +2869,13 @@ fn extend_status_index(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>
     let status_u32 = status as u32;
     let count_key = DataKey::StatusIndexCount(status_u32);
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, InvoiceError::CounterOverflow));
 
     let entry_key = DataKey::StatusIndexEntry(status_u32, count);
     env.storage().persistent().set(&entry_key, invoice_id);
-    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage().persistent().set(&count_key, &next_count);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_THRESHOLD, TTL_EXTEND_TO);

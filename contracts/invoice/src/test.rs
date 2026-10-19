@@ -4847,3 +4847,102 @@ fn test_move_status_index_compacts_storage() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed.get(0).unwrap().id, id2);
 }
+
+#[test]
+fn test_supported_asset_count_accepts_last_slot_then_rejects_overflow() {
+    let (env, client, _, _, _, _) = setup();
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&crate::DataKey::SupportedAssetCount, &(u32::MAX - 1));
+    });
+    let last = Address::generate(&env);
+    client.add_supported_asset(&last);
+    let overflow = Address::generate(&env);
+    assert!(client.try_add_supported_asset(&overflow).is_err());
+    env.as_contract(&client.address, || {
+        assert_eq!(
+            env.storage()
+                .instance()
+                .get::<_, u32>(&crate::DataKey::SupportedAssetCount),
+            Some(u32::MAX)
+        );
+        assert!(env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::SupportedAsset(last)));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::SupportedAsset(overflow)));
+    });
+}
+
+#[test]
+fn test_status_index_last_slot_and_page_range_at_u32_limit() {
+    let (env, client, _, _, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        let count_key = crate::DataKey::StatusIndexCount(InvoiceStatus::Created as u32);
+        env.storage().persistent().set(&count_key, &(u32::MAX - 1));
+        crate::extend_status_index(&env, InvoiceStatus::Created, &id);
+        assert_eq!(
+            env.storage().persistent().get::<_, u32>(&count_key),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, BytesN<32>>(&crate::DataKey::StatusIndexEntry(
+                    InvoiceStatus::Created as u32,
+                    u32::MAX - 1
+                )),
+            Some(id)
+        );
+        assert_eq!(
+            crate::page_range(&env, u32::MAX, u32::MAX - 1, 1),
+            (u32::MAX - 1, u32::MAX)
+        );
+        assert_eq!(crate::page_range(&env, u32::MAX, u32::MAX, 2), (0, 0));
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_extend_issuer_index_overflow_fails_before_scan_or_write() {
+    let (env, client, issuer, _buyer, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::IssuerIndexCount(issuer.clone()), &u32::MAX);
+        crate::extend_issuer_index(&env, &issuer, &id);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_extend_buyer_index_overflow_fails_before_scan_or_write() {
+    let (env, client, _issuer, buyer, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::BuyerIndexCount(buyer.clone()), &u32::MAX);
+        crate::extend_buyer_index(&env, &buyer, &id);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_extend_status_index_overflow_fails_before_scan_or_write() {
+    let (env, client, _issuer, _buyer, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &crate::DataKey::StatusIndexCount(InvoiceStatus::Created as u32),
+            &u32::MAX,
+        );
+        crate::extend_status_index(&env, InvoiceStatus::Created, &id);
+    });
+}
