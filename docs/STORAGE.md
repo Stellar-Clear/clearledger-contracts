@@ -100,12 +100,24 @@ Profile {
 
 - Profiles are looked up by `is_verified(address)`; the per-role
   `ProfileIndex` / `ProfileCount` keys back the enumeration views
-  `get_profile_count(role)` and `list_profiles(role, start, limit)`.
+  `get_profile_count(role)`, `list_profiles(role, start, limit)` and
+  `list_profiles_page(role, cursor, limit)`.
 - `list_profiles` returns pages of at most 50 addresses (the same cap as the
   batch registration entry points) and panics with `PageSizeExceeded` (`#8`)
   above it, so a single call can never walk the whole index. Pages are
   contiguous and non-overlapping: page `n` is
   `list_profiles(role, n * limit, limit)`.
+- `list_profiles_page` is the cursor-based variant. Start with
+  `cursor = None` and pass each returned `ProfilePage.next_cursor` until it is
+  `None`. The cursor is an opaque absolute index (the next unread
+  `ProfileIndex` slot), so appending registrations between reads cannot shift,
+  duplicate, or omit entries already covered by the cursor. `limit` must be in
+  `1..=50`: `0` panics with `InvalidPageSize` (`#9`) and a larger value with
+  `PageSizeExceeded` (`#8`). A cursor greater than `get_profile_count(role)`
+  panics with `InvalidCursor` (`#10`); a cursor equal to the count is a valid
+  empty tail page. Each call examines at most `limit` index slots, so a slot
+  that has aged out can make a page shorter than `limit` while the cursor
+  still advances past the gap. Ordering is registration order.
 - The index is append-only. The registry has no deregistration path —
   `revoke` only flips the profile's verification flags — so a slot is never
   rewritten or freed, and revoked profiles stay enumerated.

@@ -2537,3 +2537,180 @@ fn test_pause_is_scoped_to_one_instance() {
     assert!(a.try_register_issuer(&issuer, &map![&env]).is_err());
     assert!(b.register_issuer(&issuer, &map![&env]));
 }
+
+// ============== ISSUE #12: CURSOR PAGINATION ==============
+
+fn register_issuers(env: &Env, client: &RegistryContractClient, count: u32) -> Vec<Address> {
+    let mut addresses = Vec::new(env);
+    for _ in 0..count {
+        let address = Address::generate(env);
+        client.register_issuer(&address, &map![env]);
+        addresses.push_back(address);
+    }
+    addresses
+}
+
+#[test]
+fn test_list_profiles_page_empty_list() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+
+    let page = client.list_profiles_page(&Role::Issuer, &None, &10);
+    assert_eq!(page.items.len(), 0);
+    assert_eq!(page.next_cursor, None);
+}
+
+#[test]
+fn test_list_profiles_page_first_page() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let addresses = register_issuers(&env, &client, 3);
+
+    let page = client.list_profiles_page(&Role::Issuer, &None, &2);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap(), addresses.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap(), addresses.get(1).unwrap());
+    assert_eq!(page.next_cursor, Some(2));
+}
+
+#[test]
+fn test_list_profiles_page_walks_all_pages_without_duplicates_or_omissions() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let addresses = register_issuers(&env, &client, 7);
+
+    let mut cursor: Option<u32> = None;
+    let mut collected: Vec<Address> = Vec::new(&env);
+    let mut pages: u32 = 0;
+    loop {
+        let page = client.list_profiles_page(&Role::Issuer, &cursor, &2);
+        pages += 1;
+        for item in page.items.iter() {
+            collected.push_back(item);
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, 4);
+    assert_eq!(collected, addresses);
+}
+
+#[test]
+fn test_list_profiles_page_stable_when_registrations_appended_between_reads() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let original = register_issuers(&env, &client, 5);
+
+    let first = client.list_profiles_page(&Role::Issuer, &None, &2);
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.next_cursor, Some(2));
+
+    // Append new registrations after the first page was read. Existing index
+    // slots must not shift, so the second page still starts at index 2.
+    let appended = register_issuers(&env, &client, 2);
+
+    let second = client.list_profiles_page(&Role::Issuer, &first.next_cursor, &2);
+    assert_eq!(second.items.len(), 2);
+    assert_eq!(second.items.get(0).unwrap(), original.get(2).unwrap());
+    assert_eq!(second.items.get(1).unwrap(), original.get(3).unwrap());
+    assert_eq!(second.next_cursor, Some(4));
+
+    let third = client.list_profiles_page(&Role::Issuer, &second.next_cursor, &2);
+    assert_eq!(third.items.len(), 2);
+    assert_eq!(third.items.get(0).unwrap(), original.get(4).unwrap());
+    assert_eq!(third.items.get(1).unwrap(), appended.get(0).unwrap());
+    assert_eq!(third.next_cursor, Some(6));
+
+    let fourth = client.list_profiles_page(&Role::Issuer, &third.next_cursor, &2);
+    assert_eq!(fourth.items.len(), 1);
+    assert_eq!(fourth.items.get(0).unwrap(), appended.get(1).unwrap());
+    assert_eq!(fourth.next_cursor, None);
+}
+
+#[test]
+fn test_list_profiles_page_exact_limit_boundary() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let addresses = register_issuers(&env, &client, 3);
+
+    // A page whose limit exactly equals the number of remaining entries is
+    // the final page and must not hand back a cursor.
+    let page = client.list_profiles_page(&Role::Issuer, &None, &3);
+    assert_eq!(page.items, addresses);
+    assert_eq!(page.next_cursor, None);
+
+    // A cursor equal to the count is the valid empty tail page.
+    let tail = client.list_profiles_page(&Role::Issuer, &Some(3), &2);
+    assert_eq!(tail.items.len(), 0);
+    assert_eq!(tail.next_cursor, None);
+}
+
+#[test]
+fn test_list_profiles_page_accepts_max_limit() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+
+    let mut entries = Vec::new(&env);
+    for _ in 0..crate::MAX_LIST_LIMIT {
+        entries.push_back((Address::generate(&env), map![&env]));
+    }
+    client.batch_register_issuers(&entries);
+    let last = Address::generate(&env);
+    client.register_issuer(&last, &map![&env]);
+
+    let first = client.list_profiles_page(&Role::Issuer, &None, &crate::MAX_LIST_LIMIT);
+    assert_eq!(first.items.len(), crate::MAX_LIST_LIMIT);
+    assert_eq!(first.next_cursor, Some(crate::MAX_LIST_LIMIT));
+
+    let second =
+        client.list_profiles_page(&Role::Issuer, &first.next_cursor, &crate::MAX_LIST_LIMIT);
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items.get(0).unwrap(), last);
+    assert_eq!(second.next_cursor, None);
+}
+
+#[test]
+fn test_list_profiles_page_roles_are_independent() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuers = register_issuers(&env, &client, 2);
+    let buyer = Address::generate(&env);
+    client.register_buyer(&buyer, &map![&env]);
+
+    let issuer_page = client.list_profiles_page(&Role::Issuer, &None, &5);
+    assert_eq!(issuer_page.items, issuers);
+    assert_eq!(issuer_page.next_cursor, None);
+
+    let buyer_page = client.list_profiles_page(&Role::Buyer, &None, &5);
+    assert_eq!(buyer_page.items.len(), 1);
+    assert_eq!(buyer_page.items.get(0).unwrap(), buyer);
+    assert_eq!(buyer_page.next_cursor, None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_list_profiles_page_rejects_zero_limit() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    client.list_profiles_page(&Role::Issuer, &None, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_list_profiles_page_rejects_limit_above_max() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    client.list_profiles_page(&Role::Issuer, &None, &(crate::MAX_LIST_LIMIT + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_list_profiles_page_rejects_cursor_past_end() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    register_issuers(&env, &client, 3);
+    client.list_profiles_page(&Role::Issuer, &Some(4), &2);
+}

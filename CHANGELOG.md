@@ -17,6 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   dashboards no longer have to replay `issuer_registered` / `buyer_registered`
   events from genesis. `limit` is capped at 50 (mirroring the batch cap) and a
   larger page panics with the new `RegistryError::PageSizeExceeded` (#8) (#841)
+- `registry`: `list_profiles_page(role, cursor, limit)` cursor-based view,
+  returning a `ProfilePage { items, next_cursor }`. The cursor resumes from an
+  absolute enumeration-index slot, so appending registrations between page
+  reads cannot shift, duplicate, or omit earlier entries. `limit` must be
+  `1..=50` (`InvalidPageSize` #9 for 0, `PageSizeExceeded` #8 above 50) and a
+  cursor past the current count is rejected with `InvalidCursor` #10. The
+  existing offset-based `list_profiles` view is unchanged (#12)
 - `registry`: per-role enumeration index, written by every registration path
   (`register_issuer`, `register_buyer`, `batch_register_issuers`,
   `batch_register_buyers`) as `DataKey::ProfileIndex(Role, u32)` plus

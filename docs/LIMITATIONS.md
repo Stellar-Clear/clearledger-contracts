@@ -68,6 +68,7 @@ relative costs based on code analysis.
 | `registry::revoke` | 0 | 0 | — | — | Very Low |
 | `registry::get_profile_count` | 0 | 0 | — | — | Very Low |
 | `registry::list_profiles` | 0 | 0 | — | — | Low (O(limit), ≤ 50) |
+| `registry::list_profiles_page` | 0 | 0 | — | — | Low (O(limit), ≤ 50) |
 | `invoice::create` | 2 (`is_verified` ×2) | 0 | — | — | Low |
 | `invoice::batch_create` | 2 per entry (`is_verified` ×2) | 0 | — | — | Low per entry, **up to 50× `create`** |
 | `invoice::list_for_financing` | 0 | 0 | — | — | Low |
@@ -128,11 +129,15 @@ The benchmark demonstrates negligible gas overhead (~0.25% CPU instruction delta
   cost entirely: they read a single stored counter (`u32`) in O(1), so
   pagination and badge UIs should prefer them over `.len()` on the
   full-fetch views.
-- `registry::list_profiles` is bounded per call: it returns at most 50
-  addresses (`PageSizeExceeded` above that, mirroring the 50-entry batch cap)
-  and costs O(1) in `limit`, not in the total number of registered profiles.
-  Read `registry::get_profile_count(role)` once to size the final page, then
-  walk `start = 0, limit, 2 * limit, …` until a page comes back short. Each
+- `registry::list_profiles` and `registry::list_profiles_page` are bounded per
+  call: each returns at most 50 addresses (`PageSizeExceeded` above that,
+  mirroring the 50-entry batch cap) and costs O(1) in `limit`, not in the total
+  number of registered profiles. Read `registry::get_profile_count(role)` once
+  to size the final page, then either walk `start = 0, limit, 2 * limit, …`
+  until a page comes back short, or start `list_profiles_page` with
+  `cursor = None` and follow `next_cursor` until it is `None`. Prefer the
+  cursor variant when registrations may be appended concurrently: its cursor
+  addresses an absolute index slot, so appends do not shift pages. Each
   enumerated address costs one persistent entry plus its TTL bump, so a page of
   50 is roughly 50 reads — indexers that want thousands of addresses should
   page off-chain rather than in one call.

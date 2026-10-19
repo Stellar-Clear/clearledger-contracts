@@ -1,7 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 use clearledger_pause::{require_not_paused, set_paused};
+use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 
 mod constants;
 mod errors;
@@ -544,6 +544,12 @@ impl RegistryContract {
     /// page comes back shorter than `limit` enumerates every registered
     /// address for `role` exactly once.
     ///
+    /// Prefer [`list_profiles_page`](Self::list_profiles_page) when
+    /// registrations may be appended while a caller is paging: its cursor
+    /// resumes from an absolute index slot, so appends cannot shift entries
+    /// across page boundaries. This offset-based view remains available for
+    /// callers that already track `start` themselves.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `role` - The role to enumerate (`Role::Issuer` or `Role::Buyer`).
@@ -607,6 +613,121 @@ impl RegistryContract {
             index += 1;
         }
         addresses
+    }
+
+    /// Returns a cursor-paginated page of registered addresses for `role`.
+    ///
+    /// This is the cursor-based companion to
+    /// [`list_profiles`](Self::list_profiles). Instead of a caller-supplied
+    /// offset, each call returns an opaque `next_cursor` that resumes exactly
+    /// after the last index slot examined by the previous call. Because the
+    /// role's enumeration index is append-only (registrations only ever append
+    /// new slots; there is no deregistration path), appending registrations
+    /// between two page reads cannot shift, duplicate, or omit the entries
+    /// already covered by the cursor.
+    ///
+    /// Walking the list is a simple loop: start with `cursor = None`, then pass
+    /// the returned [`ProfilePage::next_cursor`] until it is `None`. Every
+    /// indexed address for `role` is returned exactly once, in registration
+    /// order. A cursor obtained for one role is only meaningful for that role.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `role` - The role to enumerate (`Role::Issuer` or `Role::Buyer`).
+    /// * `cursor` - `None` to start at the beginning, or the `next_cursor`
+    ///   from the previous page. A cursor equal to `get_profile_count(role)` is
+    ///   valid and yields an empty final page; larger cursors are rejected.
+    /// * `limit` - Maximum number of index slots to examine. Must be in
+    ///   `1..=MAX_LIST_LIMIT` (50).
+    ///
+    /// # Auth
+    /// * No `require_auth()` call is made — this is a read-only view.
+    ///
+    /// # Panics
+    /// * `RegistryError::InvalidPageSize` if `limit == 0`.
+    /// * `RegistryError::PageSizeExceeded` if `limit > MAX_LIST_LIMIT`.
+    /// * `RegistryError::InvalidCursor` if `cursor` is greater than the
+    ///   current profile count for `role`.
+    ///
+    /// # Returns
+    /// * `ProfilePage` - Up to `limit` addresses in registration order plus the
+    ///   cursor for the next page, or `None` when the end of the index was
+    ///   reached.
+    ///
+    /// # Cost
+    /// Bounded by `limit`: at most `limit` index reads plus TTL extensions and
+    /// one counter read, never the whole index. An index slot that has aged out
+    /// is skipped, so a page can contain fewer than `limit` items while its
+    /// cursor still advances past the gap.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut cursor = None;
+    /// loop {
+    ///     let page = client.list_profiles_page(&Role::Issuer, &cursor, &25);
+    ///     // ... process page.items ...
+    ///     match page.next_cursor {
+    ///         Some(next) => cursor = Some(next),
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn list_profiles_page(
+        env: Env,
+        role: Role,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ProfilePage {
+        if limit == 0 {
+            panic_with_error!(&env, RegistryError::InvalidPageSize);
+        }
+        if limit > MAX_LIST_LIMIT {
+            panic_with_error!(&env, RegistryError::PageSizeExceeded);
+        }
+
+        let count_key = DataKey::ProfileCount(role.clone());
+        let count: u32 = match env.storage().persistent().get::<_, u32>(&count_key) {
+            Some(count) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                count
+            }
+            None => 0,
+        };
+
+        let start = match cursor {
+            Some(position) => {
+                if position > count {
+                    panic_with_error!(&env, RegistryError::InvalidCursor);
+                }
+                position
+            }
+            None => 0,
+        };
+
+        // Bound the scan to `limit` slots and clamp it to the indexed range.
+        // `saturating_add` keeps a cursor near `u32::MAX` from overflowing.
+        let end = start.saturating_add(limit).min(count);
+
+        let mut items: Vec<Address> = Vec::new(&env);
+        let mut index = start;
+        while index < end {
+            let index_key = DataKey::ProfileIndex(role.clone(), index);
+            // A slot can be missing if its entry aged out while the profile
+            // itself survived. Skip the gap rather than failing the page; the
+            // cursor still advances past it.
+            if let Some(address) = env.storage().persistent().get::<_, Address>(&index_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&index_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                items.push_back(address);
+            }
+            index += 1;
+        }
+
+        let next_cursor = if end < count { Some(end) } else { None };
+        ProfilePage { items, next_cursor }
     }
 
     /// Revokes a registered profile by setting its verification status to `false`.
