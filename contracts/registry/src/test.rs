@@ -793,6 +793,27 @@ fn test_batch_register_issuers_all_duplicate() {
 }
 
 #[test]
+fn test_batch_register_issuers_duplicate_within_batch() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let issuer = Address::generate(&env);
+    let entries = vec![
+        &env,
+        (issuer.clone(), map![&env]),
+        (issuer.clone(), map![&env]),
+    ];
+
+    let skipped = client.batch_register_issuers(&entries);
+    // First occurrence registers, the second is reported as skipped.
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped.get(0).unwrap(), issuer);
+    assert_eq!(client.get_profile(&issuer).role(), Role::Issuer);
+    assert_eq!(client.get_profile_count(&Role::Issuer), 1);
+}
+
+#[test]
 fn test_batch_register_issuers_mixed() {
     let (env, client) = setup();
     let admin = Address::generate(&env);
@@ -995,6 +1016,27 @@ fn test_batch_register_buyers_all_duplicate() {
 }
 
 #[test]
+fn test_batch_register_buyers_duplicate_within_batch() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let buyer = Address::generate(&env);
+    let entries = vec![
+        &env,
+        (buyer.clone(), map![&env]),
+        (buyer.clone(), map![&env]),
+    ];
+
+    let skipped = client.batch_register_buyers(&entries);
+    // First occurrence registers, the second is reported as skipped.
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped.get(0).unwrap(), buyer);
+    assert_eq!(client.get_profile(&buyer).role(), Role::Buyer);
+    assert_eq!(client.get_profile_count(&Role::Buyer), 1);
+}
+
+#[test]
 fn test_batch_register_buyers_mixed() {
     let (env, client) = setup();
     let admin = Address::generate(&env);
@@ -1024,6 +1066,30 @@ fn test_batch_register_buyers_mixed() {
 
     assert_eq!(client.get_profile(&buyer2).role(), crate::Role::Buyer);
     assert_eq!(client.get_profile(&buyer3).role(), crate::Role::Buyer);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_batch_register_buyers_invalid_metadata_rejects_all() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let buyer1 = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
+    let bad_metadata = map![
+        &env,
+        (String::from_str(&env, ""), String::from_str(&env, "value"))
+    ];
+
+    let entries = vec![
+        &env,
+        (buyer1.clone(), map![&env]),
+        (buyer2.clone(), bad_metadata),
+    ];
+
+    // Invalid metadata is never skipped: it rejects the whole batch.
+    client.batch_register_buyers(&entries);
 }
 
 #[test]

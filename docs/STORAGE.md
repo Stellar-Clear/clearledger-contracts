@@ -114,6 +114,25 @@ Profile {
 - `get_verification_status(address)` returns a three-valued enum
   (`Unregistered`, `Verified`, `Revoked`).
 
+### Batch Registration Semantics
+
+`batch_register_issuers` / `batch_register_buyers` process entries in order
+and never revert merely because an address is already registered:
+
+| Case | Behaviour |
+|------|-----------|
+| Address already registered (by a single or earlier batch call) | Skipped; existing profile is untouched and the address is returned in the skipped list |
+| Same address repeated within one batch | First occurrence is registered; later occurrences are skipped and reported |
+| All entries are duplicates | Nothing is written; the result lists every skipped occurrence |
+| Valid entries mixed with duplicates | Valid new entries are registered; only duplicates are skipped |
+| Invalid metadata | Entire call panics with `InvalidMetadata`; no entry from the batch is persisted |
+| More than 50 entries | Entire call panics with `BatchSizeExceeded`; nothing is persisted |
+
+On-chain `Address` values are always structurally valid, so there is no
+invalid-address branch. Single-address registration differs deliberately:
+`register_issuer` / `register_buyer` panic with `AlreadyRegistered` instead of
+skipping.
+
 ### Storage Key Count
 
 **Approximately 2 keys per registered address** — one `Profile` record and one

@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `registry`: documented the deterministic duplicate semantics of
+  `batch_register_issuers` / `batch_register_buyers` — already-registered
+  addresses (including repeated addresses within one batch) are skipped and
+  returned, while invalid metadata or more than 50 entries reverts the whole
+  call (#11)
 - `pool.initialize` accepts three new arguments: `share_name`, `share_symbol`
   and `share_decimals`
 
