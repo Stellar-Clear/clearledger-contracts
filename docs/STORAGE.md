@@ -244,6 +244,7 @@ EscrowRecord {
     invoice_id: BytesN<32>,
     amount:     u128,      // USDC stroops
     locked_at:  u64,       // Unix timestamp
+    issuer:     Address,   // only address funds may be released to
 }
 ```
 
@@ -264,7 +265,11 @@ EscrowEvent {
 
 #### Lifecycle
 
-1. `lock()` creates an `EscrowRecord` and transfers USDC from pool → escrow.
+1. `lock()` validates that `amount` is in `1..=i128::MAX` and that no
+   `Locked` record already exists for the invoice **before** transferring
+   USDC. Invalid amounts fail with `InvalidAmount`; a duplicate invoice fails
+   with `AlreadyLocked` and leaves the original `amount`/`issuer` unchanged.
+   On success it creates an `EscrowRecord` and transfers USDC from pool → escrow.
 2. `release_to_issuer()` or `release_to_pool()` transfers USDC out and
    **removes** the `Locked` key (caller must re-lock for a new funding cycle).
 3. `handle_default()` returns locked USDC to the pool and **removes** the key.

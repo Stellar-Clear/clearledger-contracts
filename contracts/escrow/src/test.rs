@@ -18,7 +18,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    DataKey, EscrowAction, EscrowContract, EscrowContractClient, EscrowEvent, EscrowRecord,
+    DataKey, EscrowAction, EscrowContract, EscrowContractClient, EscrowError, EscrowEvent,
+    EscrowRecord,
 };
 
 #[contract]
@@ -101,6 +102,84 @@ mod strict {
                 .get(&BalanceKey(addr))
                 .unwrap_or(0)
         }
+    }
+}
+
+/// A token that aborts on any transfer. Used to prove that `lock` rejects
+/// invalid amounts before it reaches the token transfer, independent of any
+/// storage rollback the test environment performs for a failed invocation.
+mod rejecting {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct RejectingToken;
+
+    #[contractimpl]
+    impl RejectingToken {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
+            panic!("token transfer must not be called for a rejected lock");
+        }
+    }
+}
+
+fn setup_with_strict_usdc(
+    pool_balance: i128,
+) -> (
+    Env,
+    EscrowContractClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = env.register_contract(None, MockCaller);
+    let pool = env.register_contract(None, MockCaller);
+    let issuer = env.register_contract(None, MockCaller);
+    let usdc_id = env.register_contract(None, strict::StrictMockToken);
+
+    let pool_bal_key = BalanceKey(pool.clone());
+    env.as_contract(&usdc_id, || {
+        env.storage().persistent().set(&pool_bal_key, &pool_balance);
+    });
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &pool, &usdc_id);
+
+    (env, client, pool, issuer, usdc_id)
+}
+
+fn setup_with_rejecting_usdc() -> (Env, EscrowContractClient<'static>, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = env.register_contract(None, MockCaller);
+    let pool = env.register_contract(None, MockCaller);
+    let issuer = env.register_contract(None, MockCaller);
+    let usdc_id = env.register_contract(None, rejecting::RejectingToken);
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &pool, &usdc_id);
+
+    (env, client, pool, issuer)
+}
+
+fn assert_lock_rejected_with(
+    client: &EscrowContractClient,
+    invoice_id: &BytesN<32>,
+    amount: u128,
+    issuer: &Address,
+    expected: EscrowError,
+) {
+    match client.try_lock(invoice_id, &amount, issuer) {
+        Err(Ok(err)) => assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(expected as u32)
+        ),
+        _ => panic!("expected lock to fail with {:?}", expected),
     }
 }
 
@@ -413,11 +492,110 @@ fn test_lock_fails_amount_exceeds_i128_max() {
 
 #[test]
 fn test_lock_succeeds_at_i128_max() {
-    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
-    let invoice_id = generate_invoice_id(&env, 5);
     let amount = i128::MAX as u128;
-    let result = client.lock(&invoice_id, &amount, &issuer);
-    assert!(result);
+    let (env, client, pool, issuer, usdc_id) = setup_with_strict_usdc(i128::MAX);
+    let invoice_id = generate_invoice_id(&env, 5);
+
+    assert!(client.lock(&invoice_id, &amount, &issuer));
+
+    assert_eq!(client.get_locked(&invoice_id), amount);
+    assert_eq!(client.get_history(&invoice_id).len(), 1);
+
+    let token = strict::StrictMockTokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&pool), 0);
+    assert_eq!(token.balance(&client.address), i128::MAX);
+
+    assert_last_event_three(
+        &env,
+        "funds_locked",
+        invoice_id.clone(),
+        issuer.clone(),
+        amount,
+    );
+}
+
+#[test]
+fn test_lock_zero_amount_rejected_before_token_transfer() {
+    // The token aborts on any transfer, so this only passes if the amount is
+    // validated before `usdc.transfer` is reached.
+    let (env, client, _pool, issuer) = setup_with_rejecting_usdc();
+    let invoice_id = generate_invoice_id(&env, 6);
+
+    assert_lock_rejected_with(&client, &invoice_id, 0, &issuer, EscrowError::InvalidAmount);
+
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked_at(&invoice_id), 0);
+    assert!(client.get_history(&invoice_id).is_empty());
+}
+
+#[test]
+fn test_lock_boundary_above_max_rejected_before_token_transfer() {
+    // i128::MAX is the largest value the token can receive; MAX + 1 must be
+    // rejected before the token transfer is attempted.
+    let (env, client, _pool, issuer) = setup_with_rejecting_usdc();
+    let invoice_id = generate_invoice_id(&env, 7);
+    let amount = i128::MAX as u128 + 1;
+
+    assert_lock_rejected_with(
+        &client,
+        &invoice_id,
+        amount,
+        &issuer,
+        EscrowError::InvalidAmount,
+    );
+
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked_at(&invoice_id), 0);
+    assert!(client.get_history(&invoice_id).is_empty());
+}
+
+#[test]
+fn test_duplicate_lock_preserves_original_issuer_and_amount() {
+    let original_amount: u128 = 1_000_000_000;
+    // Seed the strict token with exactly the original amount: any second
+    // transfer would overdraw the pool and abort, so a typed AlreadyLocked
+    // error proves the duplicate check runs before the token transfer.
+    let (env, client, pool, issuer, usdc_id) = setup_with_strict_usdc(original_amount as i128);
+    let invoice_id = generate_invoice_id(&env, 8);
+    let other_issuer = Address::generate(&env);
+
+    assert!(client.lock(&invoice_id, &original_amount, &issuer));
+    let locked_at = client.get_locked_at(&invoice_id);
+    let history_len = client.get_history(&invoice_id).len();
+
+    let token = strict::StrictMockTokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&pool), 0);
+    assert_eq!(token.balance(&client.address), original_amount as i128);
+
+    assert_lock_rejected_with(
+        &client,
+        &invoice_id,
+        500_000_000,
+        &other_issuer,
+        EscrowError::AlreadyLocked,
+    );
+
+    // The failed duplicate must not overwrite the original record.
+    assert_eq!(client.get_locked(&invoice_id), original_amount);
+    assert_eq!(client.get_locked_at(&invoice_id), locked_at);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(token.balance(&pool), 0);
+    assert_eq!(token.balance(&client.address), original_amount as i128);
+
+    // The original issuer is still the only address that can receive the
+    // funds, proving the duplicate did not replace it with `other_issuer`.
+    match client.try_release_to_issuer(&invoice_id, &other_issuer) {
+        Err(Ok(err)) => assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(EscrowError::InvalidRecipient as u32)
+        ),
+        _ => panic!("expected release to a non-issuer to fail"),
+    }
+    assert_eq!(client.get_locked(&invoice_id), original_amount);
+
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(token.balance(&issuer), original_amount as i128);
 }
 
 #[test]
