@@ -6252,10 +6252,10 @@ fn prop_utilization_cap_and_funding_accounting_hold_across_op_sequences() {
 
                 let other_lp = Address::generate(&te.env);
                 te.env.as_contract(&te.usdc_id, || {
-                    te.env.storage().persistent().set(
-                        &TKey(other_lp.clone()),
-                        &100_000_000_000_000i128,
-                    );
+                    te.env
+                        .storage()
+                        .persistent()
+                        .set(&TKey(other_lp.clone()), &100_000_000_000_000i128);
                 });
                 // A small set of fundable invoices plus enough LP liquidity.
                 let invoices = [
