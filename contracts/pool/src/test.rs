@@ -3654,11 +3654,11 @@ fn test_fund_invoice_before_initialize_panics() {
 // production code rather than the mock. Refs: issue #631.
 mod real_registry_integration {
     use super::*;
-    use soroban_sdk::{map, Map, String};
     use clearledger_registry::{
         RegistryContract as RealRegistry, RegistryContractClient as RealRegistryClient,
         VerificationStatus,
     };
+    use soroban_sdk::{map, Map, String};
 
     #[test]
     fn test_real_registry_revoke_reinstate_gates_create_and_funding() {
