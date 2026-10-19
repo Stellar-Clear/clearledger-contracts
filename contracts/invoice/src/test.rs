@@ -787,6 +787,35 @@ fn test_create_fails_above_max_face_value() {
 }
 
 #[test]
+fn prop_invalid_face_values_do_not_create_invoices() {
+    let invalid_face_values = prop_oneof![
+        Just(0u128),
+        (MAX_FACE_VALUE + 1)..=u128::MAX,
+    ];
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(&invalid_face_values, |face_value| {
+            let (env, client, issuer, buyer, _, usdc) = setup();
+            let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+            let before = client.get_counts();
+
+            prop_assert!(
+                client
+                    .try_create(&issuer, &buyer, &face_value, &due_date, &usdc)
+                    .is_err(),
+                "invalid face value {face_value} must fail"
+            );
+            let after = client.get_counts();
+            prop_assert_eq!(
+                after.get(String::from_str(&env, "Created")),
+                before.get(String::from_str(&env, "Created"))
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_create_fails_past_due_date() {
     let (env, client, issuer, buyer, _, usdc) = setup();

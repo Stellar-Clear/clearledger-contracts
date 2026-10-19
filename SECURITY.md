@@ -66,6 +66,7 @@ A security audit is planned prior to any mainnet deployment.
 ## Further Reading
 
 - [Threat Model](./docs/THREAT_MODEL.md) — detailed trust assumptions, auth gates, and attack vectors
+- [Pre-Mainnet Audit Scope](./docs/MAINNET_AUDIT_SCOPE.md) — code map, known-risk inventory, and independent-audit questions; not an audit or readiness claim
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout and TTL management
 - [Limitations](./docs/LIMITATIONS.md) — known gaps, testnet constraints, and unhandled edge cases
 

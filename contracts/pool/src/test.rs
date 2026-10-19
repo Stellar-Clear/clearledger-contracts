@@ -4396,6 +4396,30 @@ fn prop_initial_deposit_below_minimum_always_rejected() {
         .unwrap();
 }
 
+#[test]
+fn prop_deposits_above_token_amount_range_rejected_without_mutation() {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(&((i128::MAX as u128 + 1)..=u128::MAX), |deposit_amount| {
+            let te = setup();
+            let pool_before = te.pool.get_stats();
+            let token = MockTokenClient::new(&te.env, &te.usdc_id);
+            let lp_balance_before = token.balance(&te.lp);
+            let pool_balance_before = token.balance(&te.pool_id);
+
+            prop_assert!(
+                te.pool.try_deposit(&te.lp, &deposit_amount).is_err(),
+                "deposit {deposit_amount} exceeds the SEP-41 signed amount range"
+            );
+            prop_assert_eq!(te.pool.get_stats().total_deposits, pool_before.total_deposits);
+            prop_assert_eq!(te.pool.get_stats().total_shares, pool_before.total_shares);
+            prop_assert_eq!(token.balance(&te.lp), lp_balance_before);
+            prop_assert_eq!(token.balance(&te.pool_id), pool_balance_before);
+            Ok(())
+        })
+        .unwrap();
+}
+
 // For any withdrawal of all shares after a deposit, the USDC returned must
 // equal the deposited amount (no yield, no loss).
 #[test]

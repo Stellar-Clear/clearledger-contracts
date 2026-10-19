@@ -223,11 +223,13 @@ Or on Windows (PowerShell):
 powershell ./scripts/verify.ps1
 ```
 
-This checks each contract responds to a read-only query
-(`get_admin`, `get_counts`, `get_stats`, `get_locked`) and that the
-invoice contract's post-deploy wiring is in place
-(`get_escrow_contract`, `get_agent_registry_contract`,
-`is_supported_asset`).
+This checks that each deployed contract responds, its WASM hash matches the
+local release artifact, admin addresses match `DEPLOYER_ACCOUNT`, cross-contract
+references and configured assets match `.env`, and the invoice asset allow-list
+is correct. Experimental XLM contracts are checked only when
+`DEPLOY_XLM=true`. Build the same release artifacts that were deployed before
+running verification; a different local build is expected to fail the hash
+check.
 
 You can also verify on [Stellar Expert Testnet](https://stellar.expert/explorer/testnet).
 

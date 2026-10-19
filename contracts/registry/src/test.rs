@@ -1866,6 +1866,18 @@ fn test_get_profile_extends_ttl() {
         ttl_after_read >= 1_999_000,
         "TTL should be extended close to EXTEND_TO (2_000_000), got {ttl_after_read}"
     );
+
+    // A profile remains readable after a long supported-activity interval,
+    // and the read renews it before the persistent entry can expire.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + ttl_after_read - 50);
+    assert!(client.get_profile(&issuer).verified());
+    let ttl_after_activity: u32 =
+        env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key));
+    assert!(
+        ttl_after_activity >= 1_999_000,
+        "active profile TTL should be renewed before expiry, got {ttl_after_activity}"
+    );
 }
 
 #[test]

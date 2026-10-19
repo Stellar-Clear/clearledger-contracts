@@ -54,6 +54,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: TTL ledger-advance regressions
+        run: cargo test --workspace ttl
+
       - name: Check wasm size budget
         run: |
           echo "=== WASM Size Report ==="

@@ -2069,7 +2069,7 @@ impl PoolContract {
     }
 
     fn shares_for_deposit(env: &Env, usdc_amount: u128) -> u128 {
-        if usdc_amount == 0 {
+        if usdc_amount == 0 || usdc_amount > i128::MAX as u128 {
             panic_with_error!(env, PoolError::InvalidAmount);
         }
 
