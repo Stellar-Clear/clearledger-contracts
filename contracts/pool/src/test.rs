@@ -6827,3 +6827,41 @@ fn test_get_funded_amount_returns_none_after_default() {
 
     assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
 }
+#[test]
+fn config_v1_matches_getters_and_tracks_admin_updates_while_paused() {
+    let te = setup();
+    let config = te.pool.get_config_v1();
+    assert_eq!(config.version, 1);
+    assert_eq!(config.funding_asset, te.pool.get_funding_asset());
+    assert_eq!(config.invoice_contract, te.pool.get_invoice_contract());
+    assert_eq!(config.escrow_contract, te.pool.get_escrow_contract());
+    assert_eq!(config.treasury, te.pool.get_treasury());
+    assert_eq!(config.protocol_fee_bps, te.pool.get_protocol_fee_bps());
+    assert_eq!(config.initialization_fee_bps, te.pool.get_fee_bps());
+    assert_eq!(config.min_initial_deposit, DEFAULT_MIN_INITIAL_DEPOSIT);
+    assert_eq!(config.max_utilization_bps, te.pool.get_stats().max_utilization_bps);
+    assert_eq!(config.max_batch_size, MAX_BATCH_SIZE);
+    assert_eq!(config.max_protocol_fee_bps, MAX_PROTOCOL_FEE_BPS);
+    assert!(!config.paused);
+
+    let treasury = Address::generate(&te.env);
+    assert!(te.pool.set_protocol_fee(&MAX_PROTOCOL_FEE_BPS, &treasury));
+    assert!(te.pool.set_max_utilization(&te.admin, &7500));
+    te.pool.pause();
+    let paused = te.pool.get_config_v1();
+    assert!(paused.paused);
+    assert_eq!(paused.protocol_fee_bps, MAX_PROTOCOL_FEE_BPS);
+    assert_eq!(paused.treasury, treasury);
+    assert_eq!(paused.max_utilization_bps, 7500);
+    assert_eq!(paused.funding_asset, config.funding_asset);
+    te.pool.unpause();
+    assert!(!te.pool.get_config_v1().paused);
+}
+
+#[test]
+fn config_v1_rejects_uninitialized_pool() {
+    let env = Env::default();
+    let contract = env.register_contract(None, PoolContract);
+    let client = PoolContractClient::new(&env, &contract);
+    assert!(client.try_get_config_v1().is_err());
+}

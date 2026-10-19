@@ -1991,6 +1991,36 @@ impl PoolContract {
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0u32)
+    /// Returns configuration schema version 1 in one call.
+    ///
+    /// Permissionless and available while paused; rejects uninitialized pools.
+    /// Existing getters and stored keys are unchanged. Settlement uses
+    /// `protocol_fee_bps`; `initialization_fee_bps` exposes the legacy fee key.
+    pub fn get_config_v1(env: Env) -> PoolConfigV1 {
+        Self::require_initialized(&env);
+        let invoice_contract = Self::invoice_contract(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let escrow_contract = Self::escrow_contract(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let config = PoolConfigV1 {
+            version: 1,
+            funding_asset: Self::funding_asset(&env),
+            min_initial_deposit: Self::min_initial_deposit(&env),
+            max_utilization_bps: Self::totals(&env).max_utilization_bps,
+            max_batch_size: MAX_BATCH_SIZE,
+            max_protocol_fee_bps: MAX_PROTOCOL_FEE_BPS,
+            protocol_fee_bps: Self::get_protocol_fee_bps(env.clone()),
+            initialization_fee_bps: Self::fee_bps(&env).unwrap_or(0),
+            treasury: Self::get_treasury(env.clone()),
+            invoice_contract,
+            escrow_contract,
+            registry_contract: Self::registry_contract(&env),
+            paused: clearledger_pause::is_paused(&env),
+        };
+        Self::extend_instance_ttl(&env);
+        config
+    }
+
     }
 
     /// Returns the configured treasury address.
