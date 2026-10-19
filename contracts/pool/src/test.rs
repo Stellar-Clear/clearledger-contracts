@@ -20,8 +20,8 @@ use crate::{
         MAX_BATCH_SIZE, MAX_PROTOCOL_FEE_BPS, SUGGESTED_DISCOUNT_CEILING_BPS,
         SUGGESTED_DISCOUNT_FLOOR_BPS,
     },
-    DataKey, PoolContract, PoolContractClient, DEFAULT_MIN_INITIAL_DEPOSIT, DEFAULT_SHARE_DECIMALS,
-    TTL_EXTEND_TO, TTL_THRESHOLD,
+    DataKey, PoolContract, PoolContractClient, PoolError, DEFAULT_MIN_INITIAL_DEPOSIT,
+    DEFAULT_SHARE_DECIMALS, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
 use clearledger_escrow::{EscrowContract as RealEscrow, EscrowContractClient as RealEscrowClient};
@@ -145,6 +145,18 @@ pub struct MockToken;
 #[contractimpl]
 impl MockToken {
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        // A hostile/non-conforming funding asset can fail the SAC call. Pool
+        // tests flip this switch to prove the whole invocation rolls back.
+        let fail_key = Symbol::new(&env, "fail_transfers");
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&fail_key)
+            .unwrap_or(false)
+        {
+            panic!("mock token: transfer failed");
+        }
+
         let from_key = TKey(from.clone());
         let to_key = TKey(to.clone());
         let from_bal: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
@@ -155,8 +167,27 @@ impl MockToken {
         env.storage().persistent().set(&to_key, &(to_bal + amount));
     }
 
+    /// Returns the stored balance, unless a test has installed a lying
+    /// `balance()` response for this address. The pool must never derive its
+    /// accounting from this view — see
+    /// `test_deposit_does_not_consume_token_balance`.
     pub fn balance(env: Env, addr: Address) -> i128 {
+        let override_key = (Symbol::new(&env, "balance_override"), addr.clone());
+        if let Some(override_balance) = env.storage().persistent().get::<_, i128>(&override_key) {
+            return override_balance;
+        }
         env.storage().persistent().get(&TKey(addr)).unwrap_or(0)
+    }
+
+    pub fn set_fail_transfers(env: Env, fail: bool) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "fail_transfers"), &fail);
+    }
+
+    pub fn set_balance_override(env: Env, addr: Address, balance: i128) {
+        let key = (Symbol::new(&env, "balance_override"), addr);
+        env.storage().persistent().set(&key, &balance);
     }
 }
 
@@ -3654,11 +3685,11 @@ fn test_fund_invoice_before_initialize_panics() {
 // production code rather than the mock. Refs: issue #631.
 mod real_registry_integration {
     use super::*;
-    use soroban_sdk::{map, Map, String};
     use clearledger_registry::{
         RegistryContract as RealRegistry, RegistryContractClient as RealRegistryClient,
         VerificationStatus,
     };
+    use soroban_sdk::{map, Map, String};
 
     #[test]
     fn test_real_registry_revoke_reinstate_gates_create_and_funding() {
@@ -6826,4 +6857,227 @@ fn test_get_funded_amount_returns_none_after_default() {
     assert!(te.pool.handle_default(&invoice_id));
 
     assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+}
+
+//  HOSTILE FUNDING ASSET (issue #48) //
+//
+// The pool has exactly one external token dependency: the configured funding
+// asset, called via `token::Client::transfer`. These tests pin the trust
+// boundary around that call:
+// * a failed SAC transfer reverts the whole invocation, so neither deposit
+//   accounting nor invoice-funding state can be half-written;
+// * amounts outside the token's signed `i128` range are rejected before the
+//   transfer (a plain `as i128` cast would turn them negative);
+// * the pool never derives accounting from untrusted `balance()` responses;
+// * the successful path and the `AlreadyFunded` replay guard are unaffected.
+
+#[test]
+fn test_hostile_token_deposit_transfer_failure_rolls_back_pool_and_shares() {
+    let te = setup();
+    let token = MockTokenClient::new(&te.env, &te.usdc_id);
+    let amount = 5_000_000_000u128;
+
+    let stats_before = te.pool.get_stats();
+    let lp_token_before = token.balance(&te.lp);
+    let pool_token_before = token.balance(&te.pool_id);
+    let events_before = te.env.events().all().len();
+
+    token.set_fail_transfers(&true);
+    let result = te.pool.try_deposit(&te.lp, &amount);
+    assert!(
+        result.is_err(),
+        "a failed SAC transfer must abort deposit rather than mint unbacked shares"
+    );
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    assert_eq!(
+        stats_after.active_invoice_count,
+        stats_before.active_invoice_count
+    );
+
+    let position = te.pool.get_lp_position(&te.lp);
+    assert_eq!(position.shares, 0);
+    assert_eq!(position.usdc_value, 0);
+    assert_eq!(position.deposit_count, 0);
+    assert_eq!(te.pool.balance(&te.lp), 0);
+    assert_eq!(te.pool.total_supply(), 0);
+
+    // No USDC moved and no deposit event escaped the reverted invocation.
+    assert_eq!(token.balance(&te.lp), lp_token_before);
+    assert_eq!(token.balance(&te.pool_id), pool_token_before);
+    assert_eq!(te.env.events().all().len(), events_before);
+}
+
+#[test]
+fn test_hostile_token_deposit_succeeds_after_failure_is_cleared() {
+    let te = setup();
+    let token = MockTokenClient::new(&te.env, &te.usdc_id);
+    let amount = 5_000_000_000u128;
+
+    token.set_fail_transfers(&true);
+    assert!(te.pool.try_deposit(&te.lp, &amount).is_err());
+    assert_eq!(te.pool.total_supply(), 0);
+
+    token.set_fail_transfers(&false);
+    let shares = te.pool.deposit(&te.lp, &amount);
+    assert_eq!(shares, amount);
+
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_deposits, amount);
+    assert_eq!(stats.total_shares, amount);
+    assert_eq!(te.pool.balance(&te.lp), amount as i128);
+    assert_eq!(te.pool.get_lp_position(&te.lp).deposit_count, 1);
+}
+
+#[test]
+fn test_hostile_token_deposit_rejects_amount_outside_i128_range() {
+    let te = setup();
+    let token = MockTokenClient::new(&te.env, &te.usdc_id);
+    let amount = i128::MAX as u128 + 1;
+
+    let stats_before = te.pool.get_stats();
+    let lp_token_before = token.balance(&te.lp);
+    let pool_token_before = token.balance(&te.pool_id);
+
+    let outer = te.pool.try_deposit(&te.lp, &amount);
+    let contract_error = outer
+        .expect_err("oversized deposit must be rejected")
+        .expect("rejection must be a typed contract error, not a host error");
+    assert_eq!(
+        contract_error,
+        soroban_sdk::Error::from_contract_error(PoolError::Overflow as u32)
+    );
+
+    // The guard runs before the token call: a truncating `as i128` would have
+    // handed the token a negative amount and credited the pool.
+    assert_eq!(token.balance(&te.lp), lp_token_before);
+    assert_eq!(token.balance(&te.pool_id), pool_token_before);
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(te.pool.balance(&te.lp), 0);
+}
+
+#[test]
+fn test_hostile_token_deposit_ignores_malformed_balance_responses() {
+    let te = setup();
+    let token = MockTokenClient::new(&te.env, &te.usdc_id);
+    let amount = 5_000_000_000u128;
+
+    // A hostile token lies about balances in both directions. The pool must
+    // not use `balance()` as an accounting input: shares come from its own
+    // internal totals, and the whole call is reverted if the transfer fails.
+    token.set_balance_override(&te.lp, &i128::MIN);
+    token.set_balance_override(&te.pool_id, &i128::MAX);
+
+    let shares = te.pool.deposit(&te.lp, &amount);
+    assert_eq!(shares, amount);
+
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_deposits, amount);
+    assert_eq!(stats.total_shares, amount);
+    assert_eq!(te.pool.balance(&te.lp), amount as i128);
+
+    // The lying values are still what the token reports; the pool simply never
+    // consumed them.
+    assert_eq!(token.balance(&te.lp), i128::MIN);
+    assert_eq!(token.balance(&te.pool_id), i128::MAX);
+}
+
+#[test]
+fn test_hostile_token_fund_invoice_lock_failure_rolls_back_funding() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    let token = MockTokenClient::new(&te.env, &te.usdc_id);
+    let escrow = RealEscrowClient::new(&te.env, &te.escrow_id);
+
+    let stats_before = te.pool.get_stats();
+    let status_before = te.invoice.get_status(&invoice_id);
+    let funded_before = te.pool.get_funded_amount(&invoice_id);
+    let locked_before = escrow.get_locked(&invoice_id);
+    let history_before = escrow.get_history(&invoice_id).len();
+    let lp_token_before = token.balance(&te.lp);
+    let pool_token_before = token.balance(&te.pool_id);
+    let escrow_token_before = token.balance(&te.escrow_id);
+    let events_before = te.env.events().all().len();
+
+    token.set_fail_transfers(&true);
+    let result = te.pool.try_fund_invoice(&invoice_id);
+    assert!(
+        result.is_err(),
+        "a failed pool -> escrow SAC transfer must abort funding"
+    );
+
+    // Pool-side writes happen before the cross-contract calls (CEI), but a
+    // panic still unwinds the entire invocation: funded counters, the
+    // FundedInvoice entry, and the invoice status roll back together.
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    assert_eq!(
+        stats_after.active_invoice_count,
+        stats_before.active_invoice_count
+    );
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), funded_before);
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+    assert_eq!(te.invoice.get_status(&invoice_id), status_before);
+    assert_eq!(te.invoice.get_status(&invoice_id), 1); // still Listed
+
+    assert_eq!(escrow.get_locked(&invoice_id), locked_before);
+    assert_eq!(escrow.get_locked(&invoice_id), 0);
+    assert_eq!(escrow.get_history(&invoice_id).len(), history_before);
+    assert_eq!(token.balance(&te.lp), lp_token_before);
+    assert_eq!(token.balance(&te.pool_id), pool_token_before);
+    assert_eq!(token.balance(&te.escrow_id), escrow_token_before);
+    assert_eq!(te.env.events().all().len(), events_before);
+}
+
+#[test]
+fn test_hostile_token_fund_invoice_recovers_and_rejects_replay() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    let token = MockTokenClient::new(&te.env, &te.usdc_id);
+
+    token.set_fail_transfers(&true);
+    assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+
+    // The failed attempt left no poisoned FundedInvoice entry: clearing the
+    // token failure allows the same invoice to be funded exactly once.
+    token.set_fail_transfers(&false);
+    assert!(te.pool.fund_invoice(&invoice_id));
+
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_funded, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(stats.active_invoice_count, 1);
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT)
+    );
+
+    // Replay is rejected by the pool's own idempotency guard, and the second
+    // call leaves the committed funding untouched.
+    assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    let stats_after_replay = te.pool.get_stats();
+    assert_eq!(stats_after_replay.total_funded, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(stats_after_replay.active_invoice_count, 1);
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT)
+    );
 }

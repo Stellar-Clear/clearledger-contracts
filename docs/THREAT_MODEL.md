@@ -223,6 +223,38 @@ gas or storage.
 **Mitigation:** `batch_register_issuers` limits entries to `≤ 50` and
 panics with `RegistryError::BatchSizeExceeded` otherwise.
 
+### 9. Hostile or Non-Conforming Funding Asset
+
+**Risk:** A pool's configured funding asset is an external SAC contract. If
+its `transfer` fails, or if a caller supplies an amount outside the token's
+signed `i128` range, a careless pool could commit accounting before the token
+call, mint shares without receiving funds, or hand the token a negative amount
+through a truncating `as i128` cast.
+
+**Mitigation:**
+- `deposit` calls the funding asset's `transfer` before writing shares or
+  totals. A failed SAC call reverts the whole invocation, so no shares are
+  minted and no accounting changes survive.
+- `fund_invoice` writes pool state before its cross-contract calls
+  (checks-effects-interactions), but a failed `escrow::lock` transfer reverts
+  the entire invocation together with the `FundedInvoice` entry, counters, and
+  invoice status. A failed attempt can be retried; a successful one is still
+  protected by the `AlreadyFunded` replay guard.
+- Every amount passed to a funding-asset `transfer` is checked against
+  `i128::MAX` first and rejected with `PoolError::Overflow` rather than being
+  truncated to a negative value.
+- The pool never reads the funding asset's `balance()`. Accounting is derived
+  from the token transfer's success and the pool's own totals, so a malformed
+  or lying `balance()` response cannot influence shares, deposits, or funded
+  state.
+
+**Trust boundary:** The configured funding asset is assumed to implement SAC /
+SEP-41 semantics and to move exactly the requested amount when `transfer`
+returns successfully. A token that returns success without moving funds is
+outside the pool's ability to detect; the pool deliberately does not add a
+post-transfer balance check because that would introduce a new untrusted
+read on the hot path.
+
 ---
 
 ## Centralization Risks

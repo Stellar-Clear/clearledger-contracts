@@ -1,10 +1,10 @@
 #![no_std]
 
+use clearledger_pause::{require_not_paused, set_paused};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, BytesN, Env, IntoVal, String, Symbol,
     Vec,
 };
-use clearledger_pause::{require_not_paused, set_paused};
 
 mod constants;
 mod errors;
@@ -553,7 +553,14 @@ impl PoolContract {
     /// * `MinimumDeposit` if the deposit is too small to mint at least 1 share
     ///   at the current share price (prevents 0-share dust deposits).
     /// * `Overflow` if `usdc_amount * total_shares` would overflow `u128`
-    ///   while computing the proportional share price.
+    ///   while computing the proportional share price, or if `usdc_amount`
+    ///   exceeds the funding asset's `i128` transfer range.
+    ///
+    /// # Token failure
+    /// The funding asset's `transfer` runs before any share or total write. If
+    /// the SAC call fails, the whole invocation reverts: no shares are minted
+    /// and pool totals stay unchanged. The pool does not read token balances,
+    /// so a malformed `balance()` response is never part of its accounting.
     ///
     /// # Returns
     /// * `u128` - The number of shares issued.
@@ -571,7 +578,11 @@ impl PoolContract {
 
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
-        usdc.transfer(&lp, &env.current_contract_address(), &(usdc_amount as i128));
+        usdc.transfer(
+            &lp,
+            &env.current_contract_address(),
+            &Self::token_amount(&env, usdc_amount),
+        );
 
         Self::_mint(&env, &lp, shares_to_issue);
         env.storage()
@@ -711,7 +722,7 @@ impl PoolContract {
         usdc.transfer(
             &env.current_contract_address(),
             &lp,
-            &(usdc_to_return as i128),
+            &Self::token_amount(&env, usdc_to_return),
         );
 
         let remaining_shares = Self::_burn(&env, &lp, shares);
@@ -1135,8 +1146,17 @@ impl PoolContract {
     /// * `InvalidAmount` if the computed funded amount is zero.
     /// * `InsufficientLiquidity` if the pool does not have enough funds.
     /// * `UtilizationCapExceeded` if funding would push utilization above the cap.
-    /// * `Overflow` if `face_value * (10000 - discount_bps)` or the resulting
-    ///   utilization calculation overflows `u128`.
+    /// * `Overflow` if `face_value * (10000 - discount_bps)`, the resulting
+    ///   utilization calculation, or the funded amount's conversion to the
+    ///   funding asset's `i128` transfer range overflows `u128`.
+    ///
+    /// # Token failure
+    /// Pool accounting is written before the escrow/invoice interactions
+    /// (checks-effects-interactions), but Soroban reverts the whole invocation
+    /// if `escrow::lock`'s SAC transfer fails. The `FundedInvoice` entry,
+    /// counters, and invoice status therefore roll back together; a failed
+    /// call can simply be retried and a successful one still hits
+    /// `AlreadyFunded` on replay.
     ///
     /// # Returns
     /// * `bool` - `true` when the invoice is funded.
@@ -1233,6 +1253,11 @@ impl PoolContract {
         if funded_amount == 0 {
             panic_with_error!(&env, PoolError::InvalidAmount);
         }
+        // The funding asset's SEP-41 `transfer` takes i128. Validate the
+        // cross-contract face value before committing pool state / calling
+        // escrow, so a malformed invoice cannot hand escrow an amount it can
+        // only represent as a negative transfer.
+        Self::token_amount(&env, funded_amount);
 
         let totals = Self::totals(&env);
         let total_deposits = totals.deposits;
@@ -1468,7 +1493,11 @@ impl PoolContract {
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
         if refund > 0 {
-            usdc.transfer(&env.current_contract_address(), &buyer, &(refund as i128));
+            usdc.transfer(
+                &env.current_contract_address(),
+                &buyer,
+                &Self::token_amount(&env, refund),
+            );
         }
 
         true
@@ -2224,7 +2253,7 @@ impl PoolContract {
                 usdc.transfer(
                     &env.current_contract_address(),
                     &treasury,
-                    &(protocol_cut as i128),
+                    &Self::token_amount(env, protocol_cut),
                 );
             }
         }
@@ -2263,6 +2292,23 @@ impl PoolContract {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Converts a pool `u128` amount into the `i128` expected by the SEP-41
+    /// funding-asset `transfer` interface.
+    ///
+    /// `as i128` is a truncating cast: values above `i128::MAX` become
+    /// negative, which a non-conforming token could interpret as a credit
+    /// instead of a debit. The pool rejects them with the typed
+    /// `PoolError::Overflow` before any token call or state write.
+    ///
+    /// Trust boundary: the configured funding asset is assumed to be a SAC
+    /// that honours SEP-41 transfer semantics. The pool does not read
+    /// `balance()` to verify transfers, and a token that reports malformed
+    /// balances cannot influence accounting because those responses are never
+    /// consumed.
+    fn token_amount(env: &Env, amount: u128) -> i128 {
+        i128::try_from(amount).unwrap_or_else(|_| panic_with_error!(env, PoolError::Overflow))
     }
 
     /// Internal helper to mint LP shares (scoped for SEP-41 share issuance).
