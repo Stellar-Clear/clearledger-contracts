@@ -6839,7 +6839,10 @@ fn config_v1_matches_getters_and_tracks_admin_updates_while_paused() {
     assert_eq!(config.protocol_fee_bps, te.pool.get_protocol_fee_bps());
     assert_eq!(config.initialization_fee_bps, te.pool.get_fee_bps());
     assert_eq!(config.min_initial_deposit, DEFAULT_MIN_INITIAL_DEPOSIT);
-    assert_eq!(config.max_utilization_bps, te.pool.get_stats().max_utilization_bps);
+    assert_eq!(
+        config.max_utilization_bps,
+        te.pool.get_stats().max_utilization_bps
+    );
     assert_eq!(config.max_batch_size, MAX_BATCH_SIZE);
     assert_eq!(config.max_protocol_fee_bps, MAX_PROTOCOL_FEE_BPS);
     assert!(!config.paused);
