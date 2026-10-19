@@ -6156,6 +6156,8 @@ enum FundStep {
     Repay(u128),
     Default,
     Withdraw(u128),
+    Transfer(u128),
+    SetFee(u32),
     SetCap(u32),
 }
 
@@ -6170,7 +6172,12 @@ fn fund_step_strategy() -> impl Strategy<Value = FundStep> {
     ]
 }
 
-fn run_fund_step(te: &TestEnv, invoices: &[BytesN<32>; 3], step: &FundStep) -> StepOutcome {
+fn run_fund_step(
+    te: &TestEnv,
+    other_lp: &Address,
+    invoices: &[BytesN<32>; 3],
+    step: &FundStep,
+) -> StepOutcome {
     match step {
         FundStep::Deposit(amount) => classify(te.pool.try_deposit(&te.lp, amount)),
         FundStep::Fund(index) => {
@@ -6185,6 +6192,13 @@ fn run_fund_step(te: &TestEnv, invoices: &[BytesN<32>; 3], step: &FundStep) -> S
         FundStep::Withdraw(shares) => classify(te.pool.try_withdraw(&te.lp, shares)),
         FundStep::SetCap(bps) => classify(te.pool.try_set_max_utilization(&te.admin, bps)),
     }
+        FundStep::Transfer(shares) => {
+            classify(te.pool.try_transfer(&te.lp, other_lp, &(*shares as i128)))
+        }
+        FundStep::SetFee(bps) => {
+            let treasury = te.pool.get_treasury();
+            classify(te.pool.try_set_protocol_fee(bps, &treasury))
+        }
 }
 
 /// `(total_deposits, total_funded, available_liquidity, max_utilization_bps)`.
@@ -6236,6 +6250,13 @@ fn prop_utilization_cap_and_funding_accounting_hold_across_op_sequences() {
                 let te = setup();
                 te.pool.set_max_utilization(&te.admin, &cap_bps);
 
+                let other_lp = Address::generate(&te.env);
+                te.env.as_contract(&te.usdc_id, || {
+                    te.env.storage().persistent().set(
+                        &TKey(other_lp.clone()),
+                        &100_000_000_000_000i128,
+                    );
+                });
                 // A small set of fundable invoices plus enough LP liquidity.
                 let invoices = [
                     create_and_list(&te, &te.usdc_id),
@@ -6249,11 +6270,16 @@ fn prop_utilization_cap_and_funding_accounting_hold_across_op_sequences() {
 
                 for (index, step) in steps.iter().enumerate() {
                     let before = fund_snapshot(&te);
-                    let outcome = run_fund_step(&te, &invoices, step);
+                    let outcome = run_fund_step(&te, &other_lp, &invoices, step);
 
                     // The core invariants hold after every step.
                     check_fund_invariants(&te)?;
 
+                    prop_assert_eq!(
+                        (te.pool.balance(&te.lp) + te.pool.balance(&other_lp)) as u128,
+                        te.pool.get_stats().total_shares,
+                        "LP balances must conserve total share supply after every operation"
+                    );
                     match outcome {
                         StepOutcome::Succeeded => {
                             accepted_steps.set(accepted_steps.get() + 1);
@@ -6827,3 +6853,80 @@ fn test_get_funded_amount_returns_none_after_default() {
 
     assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
 }
+// Issue #37 initial state-machine scope: LP operations plus fee configuration.
+// Cross-contract settlement/default sequences remain a separate follow-up.
+#[test]
+fn prop_lp_operation_sequences_conserve_shares_and_deposits() {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(
+            &proptest::collection::vec((0u8..5, 1u32..1000), 1..20),
+            |operations| {
+                let te = setup();
+                let other = Address::generate(&te.env);
+                te.env.as_contract(&te.usdc_id, || {
+                    te.env
+                        .storage()
+                        .persistent()
+                        .set(&TKey(other.clone()), &100_000_000_000_000i128);
+                });
+                let token = MockTokenClient::new(&te.env, &te.usdc_id);
+                let initial_tokens = token.balance(&te.lp) + token.balance(&other);
+                let mut deposits = DEFAULT_MIN_INITIAL_DEPOSIT * 10;
+                te.pool.deposit(&te.lp, &deposits);
+                for (operation, amount) in operations {
+                    let amount = amount as u128;
+                    match operation {
+                        0 | 1 => {
+                            let actor = if operation == 0 { &te.lp } else { &other };
+                            te.pool.deposit(actor, &amount);
+                            deposits += amount;
+                        }
+                        2 => {
+                            let balance = te.pool.balance(&te.lp) as u128;
+                            let moved = amount.min(balance);
+                            if moved > 0 {
+                                te.pool.transfer(&te.lp, &other, &(moved as i128));
+                            }
+                        }
+                        3 => {
+                            let balance = te.pool.balance(&other) as u128;
+                            let burned = amount.min(balance);
+                            if burned > 0 {
+                                let paid = te.pool.withdraw(&other, &burned);
+                                deposits -= paid;
+                            }
+                        }
+                        _ => {
+                            let fee = (amount as u32) % (MAX_PROTOCOL_FEE_BPS + 1);
+                            te.pool.set_protocol_fee(&fee, &te.admin);
+                        }
+                    }
+                    let stats = te.pool.get_stats();
+                    let shares = te.pool.balance(&te.lp) + te.pool.balance(&other);
+                    prop_assert_eq!(stats.total_shares, shares as u128);
+                    prop_assert_eq!(stats.total_deposits, deposits);
+                    prop_assert_eq!(stats.total_funded, 0);
+                    prop_assert_eq!(stats.total_shares, stats.total_deposits);
+                    prop_assert_eq!(stats.available_liquidity, deposits);
+                    prop_assert_eq!(token.balance(&te.pool_id), deposits as i128);
+                    prop_assert_eq!(
+                        token.balance(&te.lp) + token.balance(&other) + token.balance(&te.pool_id),
+                        initial_tokens
+                    );
+
+                    // A malformed movement must fail without changing supply
+                    // or either participant's balance at every sequence prefix.
+                    let lp_before = te.pool.balance(&te.lp);
+                    let other_before = te.pool.balance(&other);
+                    prop_assert!(te.pool.try_transfer(&te.lp, &other, &-1).is_err());
+                    prop_assert_eq!(te.pool.balance(&te.lp), lp_before);
+                    prop_assert_eq!(te.pool.balance(&other), other_before);
+                    prop_assert_eq!(te.pool.get_stats().total_shares, stats.total_shares);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
