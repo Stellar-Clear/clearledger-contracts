@@ -307,6 +307,56 @@ fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     client.submit_attestation(invoice_id, &payload_bytes, &signature);
 }
 
+/// Registers the shared test secp256k1 key as an active agent and points
+/// `client` at the fresh mock registry.
+fn register_test_agent(env: &Env, client: &InvoiceContractClient) -> Symbol {
+    let agent_id = Symbol::new(env, "test_agent");
+    let registry_id = env.register_contract(None, MockAgentRegistry);
+    let registry_client = MockAgentRegistryClient::new(env, &registry_id);
+    registry_client.register_agent(
+        &agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(env),
+        },
+    );
+    client.set_agent_registry_contract(&registry_id);
+    agent_id
+}
+
+/// Signs `payload` exactly as an off-chain agent would: keccak256 over the
+/// XDR bytes, then a recoverable secp256k1 signature over that digest.
+fn sign_attestation(
+    env: &Env,
+    payload: &crate::AttestationPayload,
+) -> (soroban_sdk::Bytes, BytesN<65>) {
+    let payload_bytes = payload.to_xdr(env);
+    let digest = env.crypto().keccak256(&payload_bytes).to_array();
+    let (sig, recid) = test_agent_signing_key()
+        .sign_prehash_recoverable(&digest)
+        .unwrap();
+    let mut sig_bytes = [0u8; 65];
+    sig_bytes[..64].copy_from_slice(&sig.to_bytes());
+    sig_bytes[64] = recid.to_byte();
+    (payload_bytes, BytesN::from_array(env, &sig_bytes))
+}
+
+fn test_payload(
+    env: &Env,
+    invoice_id: &BytesN<32>,
+    agent_id: &Symbol,
+    nonce: u64,
+) -> crate::AttestationPayload {
+    crate::AttestationPayload {
+        domain_separator: BytesN::from_array(env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        invoice_id: invoice_id.clone(),
+        risk_score: 5000,
+        evidence_hash: BytesN::from_array(env, &[9u8; 32]),
+        agent_id: agent_id.clone(),
+        nonce,
+    }
+}
+
 // ============== FAILURE-PATH TESTS FOR submit_attestation ==============
 
 #[test]
@@ -563,6 +613,119 @@ fn test_submit_attestation_invoice_id_mismatch() {
     let signature = BytesN::from_array(&env, &sig_bytes);
 
     client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_submit_attestation_same_signature_cannot_be_replayed() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    // Byte-for-byte replay of the accepted submission.
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_invoices() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_a = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let invoice_b = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Signature covers invoice A; attempt to spend it on invoice B.
+    let payload = test_payload(&env, &invoice_a, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_b, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_domains() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Simulate a signature produced for another protocol/network domain.
+    let mut payload = test_payload(&env, &invoice_id, &agent_id, 1);
+    payload.domain_separator =
+        BytesN::from_array(&env, b"ClearLedger.OtherDomain.v1______");
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_wrong_contract_domain_separator() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // A separator from a different ClearLedger contract must not validate.
+    let mut payload = test_payload(&env, &invoice_id, &agent_id, 1);
+    payload.domain_separator =
+        BytesN::from_array(&env, b"ClearLedger.EscrowAttest.v1_____");
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_not_reusable_with_wrong_nonce() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let signed_payload = test_payload(&env, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    // Reuse the nonce-1 signature after mutating the payload's nonce.
+    let tampered_payload = test_payload(&env, &invoice_id, &agent_id, 2);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_bound_to_agent_identity() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+    let other_agent_id = Symbol::new(&env, "other_agent");
+
+    let registry_id = client.get_agent_registry_contract().unwrap();
+    let registry_client = MockAgentRegistryClient::new(&env, &registry_id);
+    registry_client.register_agent(
+        &other_agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(&env),
+        },
+    );
+
+    let signed_payload = test_payload(&env, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    // Same key, valid agent, but the signed identity names another agent.
+    let tampered_payload = test_payload(&env, &invoice_id, &other_agent_id, 1);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
 }
 
 #[test]

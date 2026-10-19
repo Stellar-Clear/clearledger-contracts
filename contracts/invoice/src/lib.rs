@@ -1184,6 +1184,15 @@ impl InvoiceContract {
     /// Trust comes entirely from the signature recovering to an active
     /// agent's registered pubkey, not from who relays the transaction.
     ///
+    /// # Replay / domain binding
+    /// The signature is over the exact XDR `payload`, so any change to
+    /// `domain_separator`, `invoice_id`, `agent_id`, or `nonce` invalidates
+    /// it. The fixed [`ATTESTATION_DOMAIN_SEPARATOR`] separates this scheme
+    /// from other contracts/protocols, and the one-attestation-per-invoice
+    /// storage guard is the on-chain replay guard. There is deliberately no
+    /// separate nonce ledger: distinct nonces do not permit a second
+    /// attestation for the same invoice.
+    ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the invoice does not exist, or if the
     ///   agent-registry contract has not been configured via
