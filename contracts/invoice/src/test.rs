@@ -189,6 +189,25 @@ fn assert_wiring_setter_rejects(
     assert!(result.is_err(), "{method} accepted a conflicting address");
 }
 
+fn assert_admin_auth_rejected(env: &Env, client: &InvoiceContractClient, method: &str, args: Vec<soroban_sdk::Val>) {
+    let non_admin = Address::generate(env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: method,
+            args: &args,
+            sub_invokes: &[],
+        },
+    }]);
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &client.address,
+        &Symbol::new(env, method),
+        args,
+    );
+    assert!(result.is_err(), "{method} accepted a non-admin caller");
+}
+
 #[allow(dead_code)]
 type SetupWithAdmin = (
     Env,
@@ -2101,6 +2120,49 @@ fn test_set_agent_registry_contract_rejects_conflicting_addresses() {
     for candidate in [admin, client.address.clone(), registry, pool, escrow] {
         assert_wiring_setter_rejects(&env, &client, "set_agent_registry_contract", &candidate);
     }
+}
+
+#[test]
+fn test_invoice_admin_configuration_auth_matrix_rejects_non_admins() {
+    let (env, client, _, _, _, asset) = setup();
+    let address = Address::generate(&env);
+
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_pool_contract",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_escrow_contract",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_agent_registry_contract",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "add_supported_asset",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "remove_supported_asset",
+        (asset,).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_expiry_window",
+        (3600u64,).into_val(&env),
+    );
 }
 
 #[test]

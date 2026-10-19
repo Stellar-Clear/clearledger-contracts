@@ -263,6 +263,48 @@ Integrators and contributors should:
 2. Regularly pull the latest changes from the `main` branch to synchronize with the current testnet environment.
 3. Check `README.md` for the current canonical testnet addresses rather than hardcoding them in local environments.
 
+### Safe Testnet Address Rotation Checklist
+
+The bundled deployment scripts support Testnet only. Keep `STELLAR_NETWORK=testnet`
+and use Testnet RPC, Horizon, and explorer endpoints; a configured `USDC_ISSUER`
+must be the Testnet issuer/address, not a Mainnet asset. Validate the deployment
+configuration without building or submitting transactions:
+
+```bash
+bash scripts/deploy.sh --validate-env
+```
+
+On Windows, use `powershell ./scripts/deploy.ps1 -ValidateEnv`. The preflight
+checks the network, deployer key alias, Stellar StrKey formats, and the
+experimental XLM opt-in/asset pair. `XLM_ASSET` is required only when
+`DEPLOY_XLM=true`; XLM contracts remain experimental and are not supported by
+the frontend.
+
+For a full address rotation, run `bash scripts/deploy.sh --fresh` or
+`powershell ./scripts/deploy.ps1 -Fresh`. For a single-contract replacement,
+use `--only <contract>` with the Bash script. After deployment:
+
+1. Review `.deployed-addresses`, `deployments.json`, and `.env.deployed`; ensure
+   all IDs are Testnet contract StrKeys (`C...`) and the issuer remains the
+   intended Testnet account/asset.
+2. Refresh the checked-in README address table with
+   `scripts/maintainer/update-readme-addresses.sh` after the deployment outputs
+   are current.
+3. Update the frontend's `clearledger-app/.env.local` contract ID settings to
+   match the corresponding `*_CONTRACT_ID` entries in `.env.example`. Restart
+   the frontend after changing its environment.
+4. Update the indexer's deployment environment in its own service/repository
+   with the same Testnet contract IDs and Testnet RPC endpoint. This repository
+   does not define indexer environment-variable names or manage indexer config;
+   do not copy Mainnet IDs or infer that README updates propagate downstream.
+5. Check deployment references in the application, indexer, README, and
+   operator environment for old contract IDs. Verify new contracts on
+   [Stellar Expert Testnet](https://stellar.expert/explorer/testnet) using
+   `https://stellar.expert/explorer/testnet/contract/<CONTRACT_ID>`.
+
+Do not treat Testnet deployment, test assets, or explorer visibility as evidence
+of Mainnet readiness or financial performance.
+
 ## Rollback
 
 There is no automated rollback. To redeploy from scratch:

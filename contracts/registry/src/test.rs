@@ -80,6 +80,63 @@ fn test_register_buyer() {
 }
 
 #[test]
+fn test_profile_registration_rejects_untrusted_signers() {
+    let (env, client) = setup();
+    let issuer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let untrusted = Address::generate(&env);
+    let metadata = map![&env];
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "register_issuer",
+            args: (issuer.clone(), metadata.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_register_issuer(&issuer, &metadata).is_err());
+    assert!(client.try_get_profile(&issuer).is_err());
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "register_buyer",
+            args: (buyer.clone(), metadata.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_register_buyer(&buyer, &metadata).is_err());
+    assert!(client.try_get_profile(&buyer).is_err());
+
+    let issuer_batch = vec![&env, (Address::generate(&env), metadata.clone())];
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "batch_register_issuers",
+            args: (issuer_batch.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_batch_register_issuers(&issuer_batch).is_err());
+
+    let buyer_batch = vec![&env, (Address::generate(&env), metadata)];
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "batch_register_buyers",
+            args: (buyer_batch.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_batch_register_buyers(&buyer_batch).is_err());
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_register_issuer_before_initialize_panics() {
     let (env, client) = setup();
@@ -1325,6 +1382,32 @@ fn test_registry_transfer_ownership_requires_both_auths() {
     client.initialize(&admin);
     env.set_auths(&[]);
     client.transfer_ownership(&new_admin);
+}
+
+#[test]
+fn test_registry_rejected_ownership_transfer_preserves_admin_access() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.initialize(&admin);
+    client.register_issuer(&issuer, &map![&env]);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "transfer_ownership",
+            args: (new_admin.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+
+    env.mock_all_auths();
+    assert!(client.verify_profile(&issuer, &true));
+    assert!(client.is_verified(&issuer));
 }
 
 // ============== PROPERTY-BASED INVARIANT TESTS ==============

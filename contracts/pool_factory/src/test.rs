@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     xdr::ToXdr,
-    Address, Bytes, BytesN, Env, Map, String, Symbol, TryFromVal,
+    Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal,
 };
 use clearledger_escrow::EscrowContractClient;
 use clearledger_invoice::InvoiceContractClient;
@@ -82,6 +82,26 @@ fn setup() -> TestEnv {
         registry_id,
         pool_wasm_hash,
     }
+}
+
+#[test]
+fn test_initialize_rejects_untrusted_admin_signer() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let factory = PoolFactoryContractClient::new(&env, &factory_id);
+    let admin = Address::generate(&env);
+    let untrusted = Address::generate(&env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &factory_id,
+            fn_name: "initialize",
+            args: (admin.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(factory.try_initialize(&admin).is_err());
 }
 
 /// Deploys and initializes an escrow contract for `asset`.
@@ -378,6 +398,27 @@ fn test_register_asset_without_admin_auth_panics() {
     // register an asset and have the factory deploy a pool on its behalf.
     te.env.set_auths(&[]);
     register_asset(&te, &te.asset.clone());
+}
+
+#[test]
+fn test_register_existing_pool_rejects_untrusted_admin_signer() {
+    let te = setup();
+    let pool_address = Address::generate(&te.env);
+    let untrusted = Address::generate(&te.env);
+
+    te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &te.factory_id,
+            fn_name: "register_existing_pool",
+            args: (te.asset.clone(), pool_address.clone()).into_val(&te.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(te
+        .factory
+        .try_register_existing_pool(&te.asset, &pool_address)
+        .is_err());
 }
 
 #[test]

@@ -7,6 +7,7 @@
 #   ./scripts/deploy.sh --fresh                 # Ignore saved addresses and redeploy everything
 #   ./scripts/deploy.sh --dry-run               # Show what would be deployed without actually deploying
 #   ./scripts/deploy.sh --only <contract>       # Redeploy a single contract (hotfix mode)
+#   ./scripts/deploy.sh --validate-env           # Validate configuration without deploying
 #   ./scripts/deploy.sh --help                  # Show this help
 #
 # <contract> for --only must be one of:
@@ -72,6 +73,7 @@ fi
 FRESH=false
 RESUME=false
 DRY_RUN=false
+VALIDATE_ENV=false
 ONLY_CONTRACT=""
 
 # Parse arguments, handling --only which consumes the next argument
@@ -83,6 +85,7 @@ while [ $_i -lt ${#_args[@]} ]; do
     --fresh)   FRESH=true ;;
     --resume)  RESUME=true ;;
     --dry-run) DRY_RUN=true ;;
+    --validate-env) VALIDATE_ENV=true ;;
     --only)
       _i=$((_i + 1))
       if [ $_i -ge ${#_args[@]} ]; then
@@ -143,6 +146,11 @@ else
   load_env .env.example
 fi
 
+STELLAR_NETWORK="${STELLAR_NETWORK:-testnet}"
+if [ "$ONLY_CONTRACT" = "escrow_xlm" ] || [ "$ONLY_CONTRACT" = "pool_xlm" ]; then
+  DEPLOY_XLM=true
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Address persistence helpers
 # ---------------------------------------------------------------------------
@@ -193,7 +201,7 @@ wait_for_contract() {
   while [ $attempt -lt $max_attempts ]; do
     if "$STELLAR" contract fetch \
         --id "$contract_id" \
-        --network testnet > /dev/null 2>&1; then
+        --network "$STELLAR_NETWORK" > /dev/null 2>&1; then
       echo "  Confirmed."
       return 0
     fi
@@ -246,7 +254,7 @@ deploy_contract() {
   if ! deploy_output=$("$STELLAR" contract deploy \
       --wasm "$wasm" \
       --source "$DEPLOYER_ACCOUNT" \
-      --network testnet 2>&1); then
+      --network "$STELLAR_NETWORK" 2>&1); then
     echo "ERROR: Deploy failed for $key:" >&2
     echo "  $deploy_output" >&2
     echo "  Fix the error above and rerun — already-deployed contracts will be skipped." >&2
@@ -326,18 +334,42 @@ echo ""
 echo "=== Pre-flight checks ==="
 
 if [ -z "${DEPLOYER_ACCOUNT:-}" ]; then
-  echo "ERROR: DEPLOYER_ACCOUNT is not set.  Check your .env file."
+  echo "ERROR: DEPLOYER_ACCOUNT is required. Set it to an existing Stellar CLI key alias in .env."
   exit 1
 fi
+if [[ ! "$DEPLOYER_ACCOUNT" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then
+  echo "ERROR: DEPLOYER_ACCOUNT '$DEPLOYER_ACCOUNT' is not a valid key alias; use letters, digits, '_' or '-'."
+  exit 1
+fi
+
+if [ "$STELLAR_NETWORK" != "testnet" ]; then
+  echo "ERROR: Unsupported STELLAR_NETWORK '$STELLAR_NETWORK'. This deployment script only supports testnet."
+  exit 1
+fi
+
+case "$DEPLOY_XLM" in
+  true|false) ;;
+  *) echo "ERROR: DEPLOY_XLM must be 'true' or 'false'; set it explicitly in .env."; exit 1 ;;
+esac
 
 if [ -z "${USDC_ISSUER:-}" ]; then
-  echo "ERROR: USDC_ISSUER is not set.  Check your .env file."
+  echo "ERROR: USDC_ISSUER is required. Set it to the Testnet USDC Stellar address in .env."
+  exit 1
+fi
+if [[ ! "$USDC_ISSUER" =~ ^[GC][A-Z2-7]{55}$ ]]; then
+  echo "ERROR: USDC_ISSUER must use the 56-character Stellar G... account or C... contract StrKey format."
   exit 1
 fi
 
-if [ "$DEPLOY_XLM" = true ] && [ -z "${XLM_ASSET:-}" ]; then
-  echo "ERROR: XLM_ASSET is not set.  Check your .env file."
-  exit 1
+if [ "$DEPLOY_XLM" = true ]; then
+  if [ -z "${XLM_ASSET:-}" ]; then
+    echo "ERROR: XLM_ASSET is required when DEPLOY_XLM=true. Set the experimental Testnet asset contract address in .env."
+    exit 1
+  fi
+  if [[ ! "$XLM_ASSET" =~ ^[GC][A-Z2-7]{55}$ ]]; then
+    echo "ERROR: XLM_ASSET must use the 56-character Stellar G... account or C... contract StrKey format when DEPLOY_XLM=true."
+    exit 1
+  fi
 fi
 
 DEPLOYER_ADDRESS=$("$STELLAR" keys address "$DEPLOYER_ACCOUNT" 2>&1) || {
@@ -345,6 +377,10 @@ DEPLOYER_ADDRESS=$("$STELLAR" keys address "$DEPLOYER_ACCOUNT" 2>&1) || {
   echo "       Run scripts/setup-testnet.sh first."
   exit 1
 }
+if [[ ! "$DEPLOYER_ADDRESS" =~ ^[GC][A-Z2-7]{55}$ ]]; then
+  echo "ERROR: Stellar CLI returned an invalid address for key '$DEPLOYER_ACCOUNT'."
+  exit 1
+fi
 echo "  Deployer address : $DEPLOYER_ADDRESS"
 echo "  Addresses file   : $ADDRESSES_FILE"
 echo "  Fresh deploy     : $FRESH"
@@ -352,6 +388,11 @@ echo "  Dry-run mode     : $DRY_RUN"
 echo "  Deploy XLM       : $DEPLOY_XLM"
 if [ -n "$ONLY_CONTRACT" ]; then echo "  Only deploying   : $ONLY_CONTRACT"; fi
 echo ""
+
+if [ "$VALIDATE_ENV" = true ]; then
+  echo "Environment configuration is valid; deployment skipped."
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Build
