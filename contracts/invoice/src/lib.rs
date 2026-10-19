@@ -1,11 +1,11 @@
 #![no_std]
 
+use clearledger_pause::{require_not_paused, set_paused};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token,
     xdr::{FromXdr, ToXdr},
     Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, Vec,
 };
-use clearledger_pause::{require_not_paused, set_paused};
 
 mod constants;
 mod errors;
@@ -38,6 +38,14 @@ pub const MAX_INVOICE_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 /// contract's attestation scheme specifically, so it can't be replayed
 /// against an unrelated contract or message format.
 pub const ATTESTATION_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceAttest.v1____";
+
+/// Fixed 32-byte domain separator prefixed to the [`InvoiceContract::duplicate_terms_key`]
+/// digest input.
+///
+/// Binding the digest to this scheme prevents it from colliding with any other
+/// hash computed over an invoice's terms (for example the counter-based
+/// [`Invoice::id`]) and makes the `v1` composition explicit and upgradeable.
+pub const DUPLICATE_TERMS_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceDupTerms.v1__";
 
 /// Maximum number of invoices a single paginated `get_by_*` query may return.
 ///
@@ -616,6 +624,100 @@ impl InvoiceContract {
             .instance()
             .get(&DataKey::SupportedAssetCount)
             .unwrap_or(0)
+    }
+
+    /// Returns a deterministic digest of an invoice's issuer, buyer, and
+    /// commercial terms, for off-chain duplicate warnings.
+    ///
+    /// This is an advisory, read-only key. It performs no storage reads, needs
+    /// no authorization, and does **not** reject or alter [`Self::create`]:
+    /// two invoices with identical terms still get distinct invoice IDs (the
+    /// generated ID includes the monotonically increasing counter) and are
+    /// both persisted. Indexers can compare this key across invoices and warn
+    /// about re-submitted commercial terms without treating the result as a
+    /// uniqueness constraint.
+    ///
+    /// # Digest composition (`v1`)
+    ///
+    /// The returned value is
+    /// `SHA-256(DUPLICATE_TERMS_DOMAIN_SEPARATOR || fields)`, where `fields`
+    /// is, in order:
+    ///
+    /// 1. `u32` big-endian length + canonical Soroban XDR encoding of `issuer`
+    /// 2. `u32` big-endian length + canonical Soroban XDR encoding of `buyer`
+    /// 3. `face_value` as 16-byte big-endian (USDC stroops, 7 decimals; never a
+    ///    float)
+    /// 4. `due_date` as 8-byte big-endian (Unix seconds from the Stellar
+    ///    ledger clock)
+    /// 5. `u32` big-endian length + canonical Soroban XDR encoding of
+    ///    `funding_asset`
+    ///
+    /// Length-prefixing the variable-width address encodings and fixing the
+    /// scalar widths makes the concatenation unambiguous. The domain
+    /// separator ([`DUPLICATE_TERMS_DOMAIN_SEPARATOR`]) keeps the digest
+    /// distinct from the invoice ID and any other hash scheme. The current
+    /// invoice model has no description or metadata fields, so none are
+    /// included; if those fields are added, this composition must be revised
+    /// and the domain separator version bumped.
+    ///
+    /// The digest deliberately does **not** validate `due_date` against the
+    /// current ledger time, so the same inputs always produce the same key
+    /// regardless of when it is queried. It is also independent of the
+    /// counter and of later mutable financing terms such as `discount_bps`, so
+    /// the key remains stable across the invoice lifecycle.
+    ///
+    /// # Off-chain usage
+    ///
+    /// Clients can query this method through a Soroban RPC read/simulation
+    /// against the deployed (Testnet) invoice contract, or reproduce the
+    /// composition locally from the fields returned by [`Self::get`]. Soroban
+    /// `Address` values are canonical XDR encodings of the Stellar StrKey
+    /// address bytes, and amounts must be passed in stroops at 7-decimal asset
+    /// precision.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The invoice issuer address.
+    /// * `buyer` - The invoice buyer address.
+    /// * `face_value` - The face value in USDC stroops.
+    /// * `due_date` - The due date as Unix seconds.
+    /// * `funding_asset` - The funding asset (token contract) address.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `InvoiceError::InvalidParticipants` if `issuer == buyer`, matching
+    ///   [`Self::create`]'s participant check.
+    /// * `InvoiceError::InvalidFaceValue` if `face_value` is zero.
+    /// * `InvoiceError::InvalidAmount` if `face_value` exceeds
+    ///   [`MAX_FACE_VALUE`].
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The deterministic duplicate-terms key.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let key = client.duplicate_terms_key(&issuer, &buyer, &1_000, &due, &usdc);
+    /// ```
+    pub fn duplicate_terms_key(
+        env: Env,
+        issuer: Address,
+        buyer: Address,
+        face_value: u128,
+        due_date: u64,
+        funding_asset: Address,
+    ) -> BytesN<32> {
+        if issuer == buyer {
+            panic_with_error!(&env, InvoiceError::InvalidParticipants);
+        }
+        if face_value == 0 {
+            panic_with_error!(&env, InvoiceError::InvalidFaceValue);
+        }
+        if face_value > MAX_FACE_VALUE {
+            panic_with_error!(&env, InvoiceError::InvalidAmount);
+        }
+        duplicate_terms_digest(&env, &issuer, &buyer, face_value, due_date, &funding_asset)
     }
 
     /// Creates a new invoice with the given issuer, buyer, and terms.
@@ -2740,6 +2842,54 @@ impl InvoiceContract {
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
     }
+}
+
+/// Appends a big-endian `u32` byte length followed by the bytes themselves.
+///
+/// Used by [`duplicate_terms_digest`] so variable-width XDR-encoded addresses
+/// cannot be confused with one another or with adjacent fixed-width fields.
+fn append_length_prefixed(input: &mut Bytes, value: &Bytes) {
+    for b in value.len().to_be_bytes() {
+        input.push_back(b);
+    }
+    for b in value.iter() {
+        input.push_back(b);
+    }
+}
+
+/// Builds the deterministic `v1` duplicate-terms digest documented on
+/// [`InvoiceContract::duplicate_terms_key`].
+///
+/// Kept separate from the public entry point so the composition can be
+/// exercised directly and reused if another view needs the same warning key.
+fn duplicate_terms_digest(
+    env: &Env,
+    issuer: &Address,
+    buyer: &Address,
+    face_value: u128,
+    due_date: u64,
+    funding_asset: &Address,
+) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    for b in DUPLICATE_TERMS_DOMAIN_SEPARATOR.iter() {
+        input.push_back(*b);
+    }
+
+    let issuer_xdr = issuer.clone().to_xdr(env);
+    let buyer_xdr = buyer.clone().to_xdr(env);
+    let asset_xdr = funding_asset.clone().to_xdr(env);
+
+    append_length_prefixed(&mut input, &issuer_xdr);
+    append_length_prefixed(&mut input, &buyer_xdr);
+    for b in face_value.to_be_bytes() {
+        input.push_back(b);
+    }
+    for b in due_date.to_be_bytes() {
+        input.push_back(b);
+    }
+    append_length_prefixed(&mut input, &asset_xdr);
+
+    env.crypto().sha256(&input).into()
 }
 
 /// Checks that an address is verified in the registry, panicking with the

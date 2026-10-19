@@ -216,13 +216,41 @@ exposed as per-field view functions (one storage read each), there is no
 dedicated `get_funded_amount` accessor. Callers currently read the full
 `Invoice` struct via `get()`.
 
-### No Duplicate Invoice Detection
+### Duplicate Invoice Detection Is Advisory Only
 
 The `create` function generates an invoice ID from a SHA-256 hash of
 (issuer, buyer, face_value, due_date, counter, asset). The counter
-guarantees uniqueness even for otherwise identical invoices, but there is
-no user-visible warning when an issuer re-submits the same commercial
-terms.
+guarantees uniqueness even for otherwise identical invoices, so `create`
+never rejects a re-submitted set of commercial terms.
+
+For off-chain warnings, the invoice contract exposes
+`duplicate_terms_key(issuer, buyer, face_value, due_date, funding_asset)`
+as an unauthenticated, storage-free read. It returns
+`SHA-256(DUPLICATE_TERMS_DOMAIN_SEPARATOR || fields)`, where `fields` are:
+
+1. `u32` big-endian length + canonical Soroban XDR encoding of `issuer`
+2. `u32` big-endian length + canonical Soroban XDR encoding of `buyer`
+3. `face_value` as 16-byte big-endian (USDC stroops, 7 decimals)
+4. `due_date` as 8-byte big-endian (Unix seconds)
+5. `u32` big-endian length + canonical Soroban XDR encoding of
+   `funding_asset`
+
+The domain separator is
+`"ClearLedger.InvoiceDupTerms.v1__"`. Length prefixes and fixed-width scalars
+make the encoding unambiguous. The key is stable across ledger time and the
+invoice lifecycle (it excludes the counter, status, and mutable financing
+terms such as `discount_bps`), and it is distinct from the counter-based
+invoice ID. It panics with `InvalidParticipants` for a self-invoiced
+`issuer == buyer`, `InvalidFaceValue` for a zero amount, and `InvalidAmount`
+above `MAX_FACE_VALUE`.
+
+Clients on Stellar Testnet can query it through Soroban RPC
+read/simulation against the deployed invoice contract, or reproduce it
+off-chain from `get(invoice_id)` using canonical Address XDR and stroop
+amounts. It is a warning signal only: indexers should not treat it as a
+uniqueness constraint or use it to reject otherwise valid invoices. The
+current invoice model has no description or metadata fields; adding them
+would require bumping the `v1` domain separator.
 
 ---
 

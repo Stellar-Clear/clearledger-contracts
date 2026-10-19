@@ -2399,6 +2399,154 @@ fn test_invoice_ids_unique_for_different_face_values() {
     assert_ne!(id1, id2);
 }
 
+// ============== Duplicate-terms warning key ==============
+//
+// `duplicate_terms_key` is an advisory digest for off-chain indexers. It must
+// be stable for identical issuer/buyer/terms, change when any field changes,
+// and never act as an on-chain uniqueness constraint.
+
+#[test]
+fn test_duplicate_terms_key_is_deterministic() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let key1 = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let key2 = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    assert_eq!(key1, key2);
+
+    // The key purposely does not depend on ledger time.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + DEFAULT_DUE_OFFSET);
+    let key_later =
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_eq!(key1, key_later);
+}
+
+#[test]
+fn test_duplicate_terms_key_changes_with_each_field() {
+    let (env, client, issuer, buyer, registry, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let base = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let other_issuer = Address::generate(&env);
+    registry.register(&other_issuer);
+    let other_buyer = Address::generate(&env);
+    registry.register(&other_buyer);
+    let other_asset = env.register_contract(None, MockToken);
+
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&other_issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &other_buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &buyer, &2_000_000_000, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &(due_date + 1), &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(
+            &issuer,
+            &buyer,
+            &DEFAULT_FACE_VALUE,
+            &due_date,
+            &other_asset
+        )
+    );
+}
+
+#[test]
+fn test_duplicate_terms_key_matches_real_invoice_and_does_not_block_create() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    // Querying before creation is allowed and needs no initialization state.
+    let key_before =
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    // Two invoices with identical commercial terms are still both created;
+    // the key is advisory and is not asserted as a uniqueness constraint.
+    let id1 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let id2 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_ne!(id1, id2);
+    assert_eq!(client.get_status(&id1), InvoiceStatus::Created as u32);
+    assert_eq!(client.get_status(&id2), InvoiceStatus::Created as u32);
+
+    // Recomputing from the persisted invoice terms yields the same key, and
+    // it differs from the counter-based invoice ID.
+    let inv = client.get(&id1);
+    let key_after = client.duplicate_terms_key(
+        &inv.issuer,
+        &inv.buyer,
+        &inv.face_value,
+        &inv.due_date,
+        &inv.funding_asset,
+    );
+    assert_eq!(key_before, key_after);
+    assert_ne!(key_after, inv.id);
+
+    let inv2 = client.get(&id2);
+    assert_eq!(
+        key_after,
+        client.duplicate_terms_key(
+            &inv2.issuer,
+            &inv2.buyer,
+            &inv2.face_value,
+            &inv2.due_date,
+            &inv2.funding_asset,
+        )
+    );
+}
+
+#[test]
+fn test_duplicate_terms_key_boundary_values() {
+    let (_env, client, issuer, buyer, _, usdc) = setup();
+
+    // Smallest accepted face value and the maximum create accepts.
+    let min_key = client.duplicate_terms_key(&issuer, &buyer, &1, &0, &usdc);
+    let max_key = client.duplicate_terms_key(&issuer, &buyer, &MAX_FACE_VALUE, &u64::MAX, &usdc);
+    assert_ne!(min_key, max_key);
+
+    // Same boundary inputs remain stable.
+    assert_eq!(
+        max_key,
+        client.duplicate_terms_key(&issuer, &buyer, &MAX_FACE_VALUE, &u64::MAX, &usdc)
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_duplicate_terms_key_rejects_self_invoicing() {
+    let (env, client, issuer, _, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    client.duplicate_terms_key(&issuer, &issuer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_duplicate_terms_key_rejects_zero_face_value() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    client.duplicate_terms_key(&issuer, &buyer, &0, &due_date, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_duplicate_terms_key_rejects_face_value_above_max() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let above_max = MAX_FACE_VALUE.checked_add(1).unwrap();
+    client.duplicate_terms_key(&issuer, &buyer, &above_max, &due_date, &usdc);
+}
+
 // ── Issue #196: repay from Funded, Active, or Confirmed ─────────────────────────
 
 fn mint_tokens(env: &Env, token: &Address, to: &Address, amount: i128) {
