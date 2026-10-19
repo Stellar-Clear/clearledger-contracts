@@ -1606,6 +1606,8 @@ impl InvoiceContract {
             let discount = face_value.saturating_sub(funded_amount);
             let term = invoice.due_date.saturating_sub(funded_at);
             let elapsed = now.saturating_sub(funded_at);
+            // Floor proportional discount accrual; the buyer receives the
+            // remainder so earned amount plus refund equals the full discount.
             let earned_by_pool = if term == 0 {
                 discount
             } else {
@@ -1736,6 +1738,8 @@ impl InvoiceContract {
         let term = invoice.due_date.saturating_sub(funded_at);
         let elapsed = now.saturating_sub(funded_at);
 
+        // Floor proportional discount accrual; the buyer receives the
+        // remainder so earned amount plus refund equals the full discount.
         let earned_by_pool = if term == 0 {
             discount
         } else {

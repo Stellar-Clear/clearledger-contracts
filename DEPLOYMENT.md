@@ -27,6 +27,18 @@ Copy `.env.example` to `.env` and fill in:
 | `XLM_ASSET` | XLM asset contract address (or native) - EXPERIMENTAL/INCOMPLETE |
 | `DEPLOY_XLM` | Set to `true` to opt in to experimental XLM contracts; defaults to the supported USDC workflow |
 
+### Signing-Key and Log Handling
+
+The scripts accept a Stellar CLI key alias in `DEPLOYER_ACCOUNT`; they do not
+accept or write secret seeds. Keep signing keys in the Stellar CLI key store,
+never in `.env`, deployment metadata, or command-line arguments. The Bash
+scripts use a restrictive `umask` for generated local state and neither script
+variant enables command tracing. On CLI deployment or initialization failures,
+raw CLI output is withheld because it can contain signed transaction material;
+the scripts print a safe failure summary instead. Do not enable PowerShell
+transcription or shell tracing in environments that capture private command
+input.
+
 ## Testnet Deployment
 
 ### 1. Create and Fund Deployer
@@ -253,7 +265,7 @@ pool_xlm=<CONTRACT_ID> (EXPERIMENTAL)
 
 ### Integrator Expectations
 
-The automated update of `README.md` with live testnet addresses only occurs when the full `deploy.sh` pipeline is run to completion by an operator with valid deployer credentials and an active Stellar CLI session. It relies on the local, gitignored `deployments.json` and does not run automatically on every address change or in CI.
+The deployment scripts write local, gitignored `deployments.json` metadata. The Bash deployment pipeline passes that metadata to `scripts/maintainer/update-readme-addresses.sh`, which refreshes both each contract ID and its individual Stellar Expert Testnet link in `README.md`. The PowerShell deployment also refreshes the README from its deployment metadata. These links target Testnet and do not imply Mainnet support.
 
 > [!NOTE]
 > **Single-Contract Hotfix Redeploys:** Use `bash scripts/deploy.sh --only <contract>` (e.g. `--only invoice`) to redeploy a single contract without re-running the full pipeline. The script will automatically update `deployments.json` and `README.md` with the new address. See the [Single-Contract Hotfix](#single-contract-hotfix-redeploys) section under **Flags** above for full details.

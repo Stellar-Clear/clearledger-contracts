@@ -895,6 +895,18 @@ fn test_fund_invoice_allows_boundary_amount_of_one() {
 }
 
 #[test]
+fn test_fund_invoice_discount_rounds_funded_amount_down() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    // 3 * (10_000 - 1) / 10_000 = 2.9997, floored to 2 stroops.
+    let invoice_id = create_and_list_with_params(&te, &te.usdc_id, 3, 1);
+
+    assert!(te.pool.fund_invoice(&invoice_id));
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), Some(2));
+    assert_eq!(te.pool.get_stats().total_funded, 2);
+}
+
+#[test]
 fn test_fund_invoice_succeeds_for_normal_amount() {
     let te = setup();
     te.pool.deposit(&te.lp, &100_000_000_000);
@@ -1674,6 +1686,33 @@ fn test_repay_early_against_real_pool_and_escrow() {
     assert_eq!(escrow_client.get_locked(&invoice_id), 0);
 
     assert_eq!(te.invoice.get_status(&invoice_id), 5); // Repaid
+}
+
+#[test]
+fn test_early_repayment_rounds_one_unit_discount_accrual_down() {
+    let te = setup();
+    let deposit = 100_000_000_000u128;
+    te.pool.deposit(&te.lp, &deposit);
+    let invoice_id =
+        create_and_list_with_params_and_term(&te, &te.usdc_id, 5, 2000, 86_400);
+    te.pool.fund_invoice(&invoice_id);
+    te.invoice.mark_shipped(&invoice_id);
+    te.invoice.confirm_delivery(&invoice_id, &te.issuer);
+    te.invoice.confirm_delivery(&invoice_id, &te.buyer);
+
+    // The one-stroop discount accrued halfway through the term floors to 0.
+    te.env
+        .ledger()
+        .set_timestamp(te.env.ledger().timestamp() + 43_200);
+    let buyer_before = MockTokenClient::new(&te.env, &te.usdc_id).balance(&te.buyer);
+
+    assert!(te.invoice.repay_early(&invoice_id));
+
+    let buyer_after = MockTokenClient::new(&te.env, &te.usdc_id).balance(&te.buyer);
+    assert_eq!(buyer_after, buyer_before - 4);
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_deposits, deposit);
+    assert_eq!(stats.total_yield_distributed, 0);
 }
 
 // Issue #876: nonzero protocol fees must also flow through the real early
@@ -4653,6 +4692,25 @@ fn test_nonzero_protocol_fee_splits_receive_repayment_with_refund() {
         after_stats.total_deposits - before_stats.total_deposits,
         expected_lp_yield
     );
+}
+
+#[test]
+fn test_protocol_fee_rounding_assigns_fractional_remainder_to_lps() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list_with_params(&te, &te.usdc_id, 5, 2000);
+    te.pool.fund_invoice(&invoice_id);
+
+    let treasury = Address::generate(&te.env);
+    te.pool.set_protocol_fee(&2000, &treasury);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let treasury_before = usdc.balance(&treasury);
+
+    // A one-unit surplus at 20% floors the protocol cut to zero.
+    assert!(te.pool.receive_repayment(&invoice_id, &5));
+
+    assert_eq!(usdc.balance(&treasury), treasury_before);
+    assert_eq!(te.pool.get_stats().total_yield_distributed, 1);
 }
 
 //  ISSUE #846: PROPT — FEE SPLIT CONSERVES YIELD

@@ -13,6 +13,7 @@ yet handled.
 
 - [Testnet Limitations](#testnet-limitations)
 - [Gas & Budget](#gas--budget)
+- [Integer Arithmetic and Rounding](#integer-arithmetic-and-rounding)
 - [Known Gaps](#known-gaps)
 - [Unhandled Edge Cases](#unhandled-edge-cases)
 - [Planned But Not Implemented](#planned-but-not-implemented)
@@ -168,6 +169,25 @@ capacity stop skipped.
 `DataKey::History(invoice_id)`. Each event adds an element without
 compaction. For heavily-used contracts, this vector may grow large enough
 to exceed the per-entry size limit (~100 KB in practice).
+
+## Integer Arithmetic and Rounding
+
+Contract amounts use integer stroops and basis points; division truncates
+toward zero (equivalent to floor for these non-negative values). The current
+calculation policy is:
+
+| Calculation | Rounding direction | Boundary behavior |
+| --- | --- | --- |
+| Invoice funding: `face_value * (10_000 - discount_bps) / 10_000` | Down | Fractional stroops are not funded and remain in the buyer's discount. |
+| Protocol fee: `yield * fee_bps / 10_000` | Down | The unallocated whole-stroop remainder is credited to LP yield; treasury plus LPs conserve the yield. |
+| Deposit shares: `amount * total_shares / total_deposits` | Down | A result of zero is rejected with `MinimumDeposit`; the smallest accepted amount mints at least one share. |
+| Redemption and position value: `shares * total_deposits / total_shares` | Down | A zero-valued withdrawal is rejected; read-only position values may omit a fractional stroop. |
+| Early repayment: `discount * elapsed / term` | Down | The buyer receives `discount - earned_by_pool`; fractional accrual is not overpaid to the pool. Partial installments do not separately accrue this discount. |
+| Default recovery | No proportional split | Escrow returns the full locked principal; the pool records the full funded amount as realised loss while leaving LP deposits and share value unchanged. |
+
+These are deliberate economic choices, not precision guarantees: callers should
+expect at most a small whole-stroop difference from exact rational arithmetic.
+Boundary regressions live alongside the pool and invoice contract tests.
 
 ---
 

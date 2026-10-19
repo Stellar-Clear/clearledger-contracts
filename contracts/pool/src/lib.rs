@@ -1229,6 +1229,8 @@ impl PoolContract {
         let funded_amount = face_value
             .checked_mul(10000 - discount_bps as u128)
             .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow))
+            // Integer division floors; any fractional stroop is excluded from
+            // the funded principal and remains part of the invoice discount.
             / 10000;
         if funded_amount == 0 {
             panic_with_error!(&env, PoolError::InvalidAmount);
@@ -2202,6 +2204,8 @@ impl PoolContract {
             yield_amount
                 .checked_mul(fee_bps as u128)
                 .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow))
+                // Floor the treasury share; the fractional remainder stays
+                // with LPs so the split conserves every whole stroop.
                 / 10_000
         } else {
             0

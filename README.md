@@ -32,15 +32,13 @@ Participant verification and invoice status are checked on-chain at relevant tra
 ClearLedger’s USDC contracts are live on Stellar Testnet. These Soroban contract IDs connect the application stack to Stellar’s test network; addresses may change when contracts are redeployed. See the [deployment guide](DEPLOYMENT.md) for address lifecycle details.
 
 <!-- START_DEPLOYED_ADDRESSES -->
-| Contract | Address |
-|----------|---------|
-| registry_contract | `CCGHK4XJA23BVPTADPCOUV76G2KYAAAKQIKPF35FN5RFP2TT47TXWQNT` |
-| invoice_contract | `CCZN4GM5O7D6RGI4P4FCKIB5HMRKDWOWY7M3YZ637XZFCGM7SXGIVAZ6` |
-| escrow_contract | `CC3EDR7B64Y5KZEJETATNVUWYGPHGUAR2V2QYTUCDOZJMYY3XEVAIGQB` |
-| pool_contract | `CDBJEGCV3IENZJKCK3LYYOSA7B5NZSPELBE7FPFHUKLG74LRJTCQIZ45` |
+| Contract | Address | Stellar Expert |
+|----------|---------|---------------|
+| registry_contract | `CCGHK4XJA23BVPTADPCOUV76G2KYAAAKQIKPF35FN5RFP2TT47TXWQNT` | [View](https://stellar.expert/explorer/testnet/contract/CCGHK4XJA23BVPTADPCOUV76G2KYAAAKQIKPF35FN5RFP2TT47TXWQNT) |
+| invoice_contract | `CCZN4GM5O7D6RGI4P4FCKIB5HMRKDWOWY7M3YZ637XZFCGM7SXGIVAZ6` | [View](https://stellar.expert/explorer/testnet/contract/CCZN4GM5O7D6RGI4P4FCKIB5HMRKDWOWY7M3YZ637XZFCGM7SXGIVAZ6) |
+| escrow_contract | `CC3EDR7B64Y5KZEJETATNVUWYGPHGUAR2V2QYTUCDOZJMYY3XEVAIGQB` | [View](https://stellar.expert/explorer/testnet/contract/CC3EDR7B64Y5KZEJETATNVUWYGPHGUAR2V2QYTUCDOZJMYY3XEVAIGQB) |
+| pool_contract | `CDBJEGCV3IENZJKCK3LYYOSA7B5NZSPELBE7FPFHUKLG74LRJTCQIZ45` | [View](https://stellar.expert/explorer/testnet/contract/CDBJEGCV3IENZJKCK3LYYOSA7B5NZSPELBE7FPFHUKLG74LRJTCQIZ45) |
 <!-- END_DEPLOYED_ADDRESSES -->
-
-**Inspect on Stellar Expert:** [Registry](https://stellar.expert/explorer/testnet/contract/CCGHK4XJA23BVPTADPCOUV76G2KYAAAKQIKPF35FN5RFP2TT47TXWQNT) · [Invoice](https://stellar.expert/explorer/testnet/contract/CCZN4GM5O7D6RGI4P4FCKIB5HMRKDWOWY7M3YZ637XZFCGM7SXGIVAZ6) · [Escrow](https://stellar.expert/explorer/testnet/contract/CC3EDR7B64Y5KZEJETATNVUWYGPHGUAR2V2QYTUCDOZJMYY3XEVAIGQB) · [Pool](https://stellar.expert/explorer/testnet/contract/CDBJEGCV3IENZJKCK3LYYOSA7B5NZSPELBE7FPFHUKLG74LRJTCQIZ45)
 
 ## Build and contribute
 

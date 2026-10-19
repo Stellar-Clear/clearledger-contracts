@@ -18,6 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Deployment script smoke tests
+        run: bash scripts/test-deploy.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
