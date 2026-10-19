@@ -4847,3 +4847,86 @@ fn test_move_status_index_compacts_storage() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed.get(0).unwrap().id, id2);
 }
+
+#[test]
+fn test_replayed_and_repeated_status_moves_keep_storage_bounded() {
+    let (env, client, _, _, _, _) = setup();
+    env.budget().reset_unlimited();
+    let id = BytesN::from_array(&env, &[92; 32]);
+    env.as_contract(&client.address, || {
+        crate::extend_status_index(&env, InvoiceStatus::Created, &id);
+        crate::increment_status_count(&env, InvoiceStatus::Created);
+        for _ in 0..20 {
+            for (from, to) in [
+                (InvoiceStatus::Created, InvoiceStatus::Listed),
+                (InvoiceStatus::Listed, InvoiceStatus::Created),
+            ] {
+                crate::move_status_index(&env, &id, from, to);
+                crate::move_status_index(&env, &id, from, to);
+                assert_eq!(crate::read_status_count(&env, from), 0);
+                assert_eq!(crate::read_status_count(&env, to), 1);
+                assert!(!crate::read_status_membership(&env, from, &id));
+                assert!(crate::read_status_membership(&env, to, &id));
+                assert_eq!(
+                    env.storage()
+                        .persistent()
+                        .get::<_, u32>(&crate::DataKey::StatusIndexCount(from as u32)),
+                    Some(0)
+                );
+                assert_eq!(
+                    env.storage()
+                        .persistent()
+                        .get::<_, u32>(&crate::DataKey::StatusIndexCount(to as u32)),
+                    Some(1)
+                );
+                assert!(!env
+                    .storage()
+                    .persistent()
+                    .has(&crate::DataKey::StatusIndexEntry(from as u32, 0)));
+                assert_eq!(
+                    env.storage()
+                        .persistent()
+                        .get::<_, BytesN<32>>(&crate::DataKey::StatusIndexEntry(to as u32, 0)),
+                    Some(id.clone())
+                );
+                assert!(!env
+                    .storage()
+                    .persistent()
+                    .has(&crate::DataKey::StatusIndexEntry(to as u32, 1)));
+            }
+        }
+    });
+}
+
+#[test]
+fn test_status_page_boundaries_after_swap_and_pop() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let first = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due, &usdc);
+    let middle = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due, &usdc);
+    let last = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due, &usdc);
+    attest(&env, &client, &middle);
+    client.list_for_financing(&middle, &DEFAULT_DISCOUNT_BPS);
+    assert_eq!(
+        client
+            .get_by_status(&InvoiceStatus::Created, &0, &1)
+            .get(0)
+            .unwrap()
+            .id,
+        first
+    );
+    assert_eq!(
+        client
+            .get_by_status(&InvoiceStatus::Created, &1, &1)
+            .get(0)
+            .unwrap()
+            .id,
+        last
+    );
+    assert!(client
+        .get_by_status(&InvoiceStatus::Created, &2, &1)
+        .is_empty());
+    assert!(client
+        .get_by_status(&InvoiceStatus::Created, &u32::MAX, &MAX_PAGE_SIZE)
+        .is_empty());
+}
