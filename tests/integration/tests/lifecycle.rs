@@ -187,7 +187,10 @@ fn assert_fee_settlement(lifecycle: &FeeLifecycle, expected: FeeSettlementExpect
     assert_eq!(token.balance(&lifecycle.escrow_id), 9_800_000_000);
 }
 
-fn expected_repayment_split(invoice: &clearledger_invoice::Invoice, repaid_at: u64) -> (u128, u128) {
+fn expected_repayment_split(
+    invoice: &clearledger_invoice::Invoice,
+    repaid_at: u64,
+) -> (u128, u128) {
     let funded_at = invoice
         .funded_at
         .expect("funded invoice should record its funding timestamp");

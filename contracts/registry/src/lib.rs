@@ -1,7 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 use clearledger_pause::{require_not_paused, set_paused};
+use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 
 mod constants;
 mod errors;
