@@ -521,8 +521,12 @@ Emitted when locked funds are released to the issuer.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"released_to_issuer"` |
 | `topic[1]` | `BytesN<32>` | Invoice ID |
-| `topic[2]` | `Address` | Issuer address |
+| `topic[2]` | `Address` | Issuer recorded at lock time |
 | **Data** | `u128` | Released amount |
+
+`topic[2]` is always the issuer recorded in the escrow lock. A caller-supplied
+address that does not match it is rejected with `InvalidRecipient` before any
+transfer or event is emitted.
 
 **Emitted by:** `release_to_issuer()` in `contracts/escrow/src/lib.rs:184`
 

@@ -23,8 +23,10 @@ pub struct EscrowRecord {
     /// a [`default`](EscrowAction::DefaultHandled) can be triggered.
     pub locked_at: u64,
     /// The invoice issuer address that is authorized to receive released funds.
-    /// Set from the `issuer` argument of [`EscrowContract::lock`] and validated
-    /// in [`EscrowContract::release_to_issuer`].
+    /// Set from the `issuer` argument of [`EscrowContract::lock`] and treated as
+    /// the sole source of truth by [`EscrowContract::release_to_issuer`]: a
+    /// caller-supplied address must match this value, and the release transfer
+    /// always uses this stored value.
     pub issuer: soroban_sdk::Address,
 }
 

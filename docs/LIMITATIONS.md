@@ -200,7 +200,9 @@ released to the issuer via `escrow.release_to_issuer()`. This call is
 Issue #56.
 **Status:** Unresolved. This is the highest-priority gap before mainnet.
 **Workaround:** An admin or automated off-chain bot must call
-`escrow.release_to_issuer(invoice_id, issuer)` separately after funding.
+`escrow.release_to_issuer(invoice_id, issuer)` separately after funding, using
+the exact issuer address recorded by `escrow.lock()`. Any other address is
+rejected with `InvalidRecipient`.
 
 ### No Early Repayment Incentive Logic
 

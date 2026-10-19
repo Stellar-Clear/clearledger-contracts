@@ -523,6 +523,115 @@ fn test_release_to_issuer_unknown_invoice_id_panics() {
     client.release_to_issuer(&unknown_id, &issuer);
 }
 
+#[test]
+fn test_release_to_issuer_transfers_to_stored_issuer() {
+    let (env, client, _admin, pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 52);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), amount as i128);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), 0);
+
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), amount as i128);
+    assert_eq!(
+        get_balance(&env, &usdc_id, &pool),
+        10_000_000_000_000i128 - amount as i128
+    );
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked_at(&invoice_id), 0);
+    assert_last_event_three(
+        &env,
+        "released_to_issuer",
+        invoice_id.clone(),
+        issuer.clone(),
+        amount,
+    );
+}
+
+#[test]
+fn test_release_to_issuer_rejects_mismatch_without_moving_funds() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 53);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    let locked_at = client.get_locked_at(&invoice_id);
+    let history_len = client.get_history(&invoice_id).len();
+    let wrong_issuer = Address::generate(&env);
+
+    assert!(client
+        .try_release_to_issuer(&invoice_id, &wrong_issuer)
+        .is_err());
+
+    assert_eq!(client.get_locked(&invoice_id), amount);
+    assert_eq!(client.get_locked_at(&invoice_id), locked_at);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), amount as i128);
+    assert_eq!(get_balance(&env, &usdc_id, &wrong_issuer), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), 0);
+
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), amount as i128);
+}
+
+#[test]
+fn test_release_to_issuer_unknown_invoice_does_not_move_funds() {
+    let (env, client, _admin, _pool, _issuer, usdc_id) = setup();
+    let unknown_id = generate_invoice_id(&env, 998);
+    let caller_supplied = Address::generate(&env);
+
+    assert!(client
+        .try_release_to_issuer(&unknown_id, &caller_supplied)
+        .is_err());
+
+    assert_eq!(client.get_locked(&unknown_id), 0);
+    assert_eq!(client.get_locked_at(&unknown_id), 0);
+    assert_eq!(client.get_history(&unknown_id).len(), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &caller_supplied), 0);
+}
+
+#[test]
+fn test_release_to_issuer_unauthorized_does_not_move_funds() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 54);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    let history_len = client.get_history(&invoice_id).len();
+    env.set_auths(&[]);
+
+    assert!(client.try_release_to_issuer(&invoice_id, &issuer).is_err());
+
+    assert_eq!(client.get_locked(&invoice_id), amount);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), amount as i128);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), 0);
+}
+
+#[test]
+fn test_release_to_issuer_replay_does_not_move_funds() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 55);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    let history_len = client.get_history(&invoice_id).len();
+    let issuer_balance = get_balance(&env, &usdc_id, &issuer);
+
+    assert!(client.try_release_to_issuer(&invoice_id, &issuer).is_err());
+
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), issuer_balance);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), 0);
+}
+
 // ============================================================================
 // Release to Pool Tests
 // ============================================================================

@@ -106,7 +106,7 @@ One contract authenticates as the caller of another contract's function.
 | `receive_repayment_with_refund` | Pool | The invoice contract | Same as above |
 | `handle_default` | Pool | The invoice contract | Prevents premature default recovery |
 | `lock` | Escrow | The pool contract | Only the pool can lock funds |
-| `release_to_issuer` | Escrow | The pool contract | Only the pool can release to issuer |
+| `release_to_issuer` | Escrow | The pool contract | Only the pool can release, and the recipient must match the issuer recorded at lock time |
 | `release_to_pool` | Escrow | The pool contract | Only the pool can reclaim escrowed funds |
 
 ### Pattern D — Dual-Auth (two `require_auth()` calls)
@@ -259,6 +259,16 @@ If the admin key is compromised or malicious:
 - **Pool** manages accounting but does not hold USDC directly (it holds a
   balance from deposits, but escrow holds funded amounts).
 - **Invoice** is a pure state machine with no fund custody.
+
+### Issuer Provenance on Release
+
+`lock()` records the issuer alongside the locked amount, and
+`release_to_issuer()` treats that stored address as the source of truth. The
+caller-supplied `issuer` parameter is only an assertion checked for equality;
+the token transfer and `released_to_issuer` event always use the stored
+address. A mismatch reverts with `InvalidRecipient` before any token transfer
+or storage mutation, so the pool cannot redirect escrowed funds to an
+arbitrary recipient and a replayed release finds no lock record.
 
 ### TTL Management
 
