@@ -1,11 +1,11 @@
 #![no_std]
 
+use clearledger_pause::{require_not_paused, set_paused};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token,
     xdr::{FromXdr, ToXdr},
     Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, Vec,
 };
-use clearledger_pause::{require_not_paused, set_paused};
 
 mod constants;
 mod errors;
