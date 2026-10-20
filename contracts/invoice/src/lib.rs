@@ -2181,6 +2181,41 @@ impl InvoiceContract {
         Self::get_invoice(&env, invoice_id).face_value
     }
 
+    /// Returns the amount committed when an invoice was funded.
+    ///
+    /// This is the value `mark_funded` recorded in [`Invoice::funded_amount`],
+    /// denominated in USDC stroops. The accessor is read-only: it requires no
+    /// authorization, writes no state, and does not extend TTL.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `invoice_id` - The invoice to query.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `InvoiceError::NotInitialized` if the contract has not been initialized.
+    /// * `InvoiceError::NotFound` if the invoice cannot be found.
+    /// * `InvoiceError::NotFunded` if the invoice exists but has not been
+    ///   funded yet. An invoice that has never been funded has no committed
+    ///   amount, so this is reported explicitly rather than as `0`.
+    ///
+    /// # Returns
+    /// * `u128` - The amount committed at funding, in USDC stroops.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let funded_amount = client.get_funded_amount(&invoice_id);
+    /// ```
+    pub fn get_funded_amount(env: Env, invoice_id: BytesN<32>) -> u128 {
+        let invoice = Self::get_invoice(&env, invoice_id);
+        if invoice.funded_at.is_none() {
+            panic_with_error!(&env, InvoiceError::NotFunded);
+        }
+        invoice.funded_amount
+    }
+
     /// Returns the remaining balance to be repaid on an invoice.
     pub fn get_remaining_balance(env: Env, invoice_id: BytesN<32>) -> u128 {
         Self::get_invoice(&env, invoice_id).remaining_balance

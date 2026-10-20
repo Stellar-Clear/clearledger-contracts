@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `invoice`: `get_funded_amount(invoice_id)` read-only view returning the
+  amount committed by `mark_funded`. Unknown invoices panic with
+  `InvoiceError::NotFound`; existing but unfunded invoices panic with the new
+  `InvoiceError::NotFunded` (#21)
 - `registry`: `get_profile_count(role)` view, returning how many profiles are
   registered for `Role::Issuer` / `Role::Buyer` in O(1) from a single stored
   counter (#841)

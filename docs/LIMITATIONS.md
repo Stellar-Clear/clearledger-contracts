@@ -209,13 +209,6 @@ repayment occurs. The buyer pays the full `face_value` regardless of how
 early they repay, so there is no on-chain rebate proportional to the time
 remaining on the invoice.
 
-### No Accessor for `funded_amount` on Invoice Contract
-
-While `get_face_value`, `get_discount_bps`, and `get_funding_asset` are
-exposed as per-field view functions (one storage read each), there is no
-dedicated `get_funded_amount` accessor. Callers currently read the full
-`Invoice` struct via `get()`.
-
 ### No Duplicate Invoice Detection
 
 The `create` function generates an invoice ID from a SHA-256 hash of

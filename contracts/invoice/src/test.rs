@@ -243,6 +243,27 @@ fn mock_pool_with_asset(env: &Env, asset: &Address) -> Address {
     pool_id
 }
 
+/// Creates an invoice, lists it, and funds it through a mock pool, returning
+/// the invoice id. Keeps the `get_funded_amount` boundary tests focused on the
+/// amount under test rather than repeating the funding setup each time.
+fn funded_invoice(
+    env: &Env,
+    client: &InvoiceContractClient,
+    issuer: &Address,
+    buyer: &Address,
+    usdc: &Address,
+    funded_amount: u128,
+) -> BytesN<32> {
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(issuer, buyer, &DEFAULT_FACE_VALUE, &due_date, usdc);
+    attest(env, client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let pool = mock_pool_with_asset(env, usdc);
+    client.set_pool_contract(&pool);
+    client.mark_funded(&invoice_id, &pool, usdc, &funded_amount);
+    invoice_id
+}
+
 // --------------- Mock Agent Registry (Underwrite) ---------------
 //
 // Stands in for the agent-registry contract from the separate
@@ -1896,6 +1917,144 @@ fn test_get_funding_terms_returns_correct_values() {
     assert_eq!(status, 1, "status should be 1 (Listed)");
     assert_eq!(face_value, 1_000_000_000);
     assert_eq!(discount_bps, 200);
+}
+
+// ============================================================================
+// Funded Amount Accessor Tests (Issue #21)
+// ============================================================================
+
+#[test]
+fn test_get_funded_amount_returns_committed_amount() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, DEFAULT_FUNDED_AMOUNT);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(client.get(&invoice_id).funded_amount, DEFAULT_FUNDED_AMOUNT);
+}
+
+#[test]
+fn test_get_funded_amount_partial_funding_boundary() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let partial = DEFAULT_FACE_VALUE / 3;
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, partial);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), partial);
+}
+
+#[test]
+fn test_get_funded_amount_smallest_non_zero_amount() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, 1);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), 1);
+}
+
+#[test]
+fn test_get_funded_amount_full_face_value() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, DEFAULT_FACE_VALUE);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FACE_VALUE);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_get_funded_amount_unfunded_invoice_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    client.get_funded_amount(&invoice_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_get_funded_amount_listed_but_unfunded_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    client.get_funded_amount(&invoice_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_get_funded_amount_unknown_invoice_panics() {
+    let (env, client, _, _, _, _) = setup();
+    let fake_id = BytesN::from_array(&env, &[0u8; 32]);
+
+    client.get_funded_amount(&fake_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_get_funded_amount_uninitialized_panics() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, InvoiceContract);
+    let client = InvoiceContractClient::new(&env, &contract_id);
+    let fake_id = BytesN::from_array(&env, &[0u8; 32]);
+
+    client.get_funded_amount(&fake_id);
+}
+
+#[test]
+fn test_get_funded_amount_rejected_zero_funding_stays_unfunded() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+
+    // `mark_funded` rejects a zero commitment, so no invoice can legitimately
+    // report 0 through the accessor.
+    let result = env.try_invoke_contract::<bool, InvoiceError>(
+        &client.address,
+        &Symbol::new(&env, "mark_funded"),
+        (invoice_id.clone(), pool.clone(), usdc.clone(), 0u128).into_val(&env),
+    );
+    assert_eq!(result.err().and_then(|e| e.ok()), Some(InvoiceError::InvalidAmount));
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Listed);
+    assert_eq!(invoice.funded_amount, 0);
+    assert!(invoice.funded_at.is_none());
+
+    let view = env.try_invoke_contract::<u128, InvoiceError>(
+        &client.address,
+        &Symbol::new(&env, "get_funded_amount"),
+        (invoice_id.clone(),).into_val(&env),
+    );
+    assert_eq!(view.err().and_then(|e| e.ok()), Some(InvoiceError::NotFunded));
+}
+
+#[test]
+fn test_get_funded_amount_is_read_only() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, DEFAULT_FUNDED_AMOUNT);
+    let invoice_key = crate::DataKey::Invoice(invoice_id.clone());
+    let ttl_before = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&invoice_key)
+    });
+    let invoice_before = client.get(&invoice_id).to_xdr(&env);
+    let events_before = env.events().all().len();
+
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FUNDED_AMOUNT);
+
+    let ttl_after = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&invoice_key)
+    });
+    assert_eq!(ttl_after, ttl_before, "accessor must not extend TTL");
+    assert_eq!(
+        client.get(&invoice_id).to_xdr(&env),
+        invoice_before,
+        "accessor must not mutate invoice state"
+    );
+    assert_eq!(env.events().all().len(), events_before, "accessor must not emit events");
 }
 
 #[test]
