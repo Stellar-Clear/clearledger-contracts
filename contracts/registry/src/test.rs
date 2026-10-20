@@ -2446,6 +2446,11 @@ fn test_pause_requires_admin_authorization() {
         },
     }]);
     assert!(client.try_pause().is_err());
+
+    // The rejected call must not have engaged the breaker: with valid auth the
+    // registry still accepts state-changing calls.
+    env.mock_all_auths();
+    assert!(client.register_issuer(&Address::generate(&env), &map![&env]));
 }
 
 /// Negative auth for disengaging: a non-admin cannot unpause either, so a
@@ -2467,6 +2472,12 @@ fn test_unpause_requires_admin_authorization() {
         },
     }]);
     assert!(client.try_unpause().is_err());
+
+    // The rejected call must leave the breaker engaged.
+    env.mock_all_auths();
+    assert!(client
+        .try_register_issuer(&Address::generate(&env), &map![&env])
+        .is_err());
 }
 
 #[test]
@@ -2536,4 +2547,358 @@ fn test_pause_is_scoped_to_one_instance() {
     let issuer = Address::generate(&env);
     assert!(a.try_register_issuer(&issuer, &map![&env]).is_err());
     assert!(b.register_issuer(&issuer, &map![&env]));
+}
+
+// ============== ISSUE #14: NEGATIVE AUTHORIZATION COVERAGE ==============
+//
+// Every admin entry point must reject a caller that is not the stored admin,
+// and must reject calls with no authorization at all. These tests pin both
+// cases with explicit auth mocks and assert that a rejected call leaves the
+// stored state untouched.
+
+/// Installs exactly one mocked authorization for `signer` invoking
+/// `contract.fn_name` with `args`. Any other auth is unavailable, so calls
+/// that check `require_auth` on a different address fail.
+fn mock_single_auth(
+    env: &Env,
+    signer: &Address,
+    contract: &Address,
+    fn_name: &str,
+    args: Vec<Val>,
+) {
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: signer,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract,
+            fn_name,
+            args,
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+#[test]
+fn test_verify_profile_true_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "verify_profile",
+        (issuer.clone(), true).into_val(&env),
+    );
+
+    assert!(client.try_verify_profile(&issuer, &true).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Pending
+    );
+}
+
+#[test]
+fn test_verify_profile_false_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "verify_profile",
+        (issuer.clone(), false).into_val(&env),
+    );
+
+    // A non-admin cannot un-verify a profile either.
+    assert!(client.try_verify_profile(&issuer, &false).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Verified
+    );
+}
+
+#[test]
+fn test_verify_profile_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    env.set_auths(&[]);
+    assert!(client.try_verify_profile(&issuer, &true).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Pending
+    );
+}
+
+#[test]
+fn test_revoke_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "revoke",
+        (issuer.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_revoke(&issuer).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Verified
+    );
+}
+
+#[test]
+fn test_revoke_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    env.set_auths(&[]);
+    assert!(client.try_revoke(&issuer).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(client.is_verified(&issuer));
+}
+
+#[test]
+fn test_reinstate_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    client.revoke(&issuer);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "reinstate",
+        (issuer.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_reinstate(&issuer).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Revoked
+    );
+}
+
+#[test]
+fn test_batch_register_issuers_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let entries = vec![&env, (first.clone(), map![&env]), (second.clone(), map![&env])];
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "batch_register_issuers",
+        (entries.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_batch_register_issuers(&entries).is_err());
+    assert_eq!(client.get_profile_count(&Role::Issuer), 0);
+    assert_eq!(
+        client.get_verification_status(&first),
+        VerificationStatus::Unregistered
+    );
+    assert_eq!(
+        client.get_verification_status(&second),
+        VerificationStatus::Unregistered
+    );
+}
+
+#[test]
+fn test_batch_register_buyers_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let entries = vec![&env, (first.clone(), map![&env]), (second.clone(), map![&env])];
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "batch_register_buyers",
+        (entries.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_batch_register_buyers(&entries).is_err());
+    assert_eq!(client.get_profile_count(&Role::Buyer), 0);
+    assert_eq!(
+        client.get_verification_status(&first),
+        VerificationStatus::Unregistered
+    );
+    assert_eq!(
+        client.get_verification_status(&second),
+        VerificationStatus::Unregistered
+    );
+}
+
+#[test]
+fn test_batch_registration_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let issuer_entries = vec![&env, (issuer.clone(), map![&env])];
+    let buyer_entries = vec![&env, (buyer.clone(), map![&env])];
+
+    env.set_auths(&[]);
+    assert!(client.try_batch_register_issuers(&issuer_entries).is_err());
+    assert!(client.try_batch_register_buyers(&buyer_entries).is_err());
+
+    assert_eq!(client.get_profile_count(&Role::Issuer), 0);
+    assert_eq!(client.get_profile_count(&Role::Buyer), 0);
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Unregistered
+    );
+    assert_eq!(
+        client.get_verification_status(&buyer),
+        VerificationStatus::Unregistered
+    );
+}
+
+#[test]
+fn test_pause_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+
+    env.set_auths(&[]);
+    assert!(client.try_pause().is_err());
+
+    // Still live after the rejected pause.
+    env.mock_all_auths();
+    assert!(client.register_issuer(&Address::generate(&env), &map![&env]));
+}
+
+#[test]
+fn test_unpause_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    client.pause();
+
+    env.set_auths(&[]);
+    assert!(client.try_unpause().is_err());
+
+    // Still paused after the rejected unpause.
+    env.mock_all_auths();
+    assert!(client
+        .try_register_issuer(&Address::generate(&env), &map![&env])
+        .is_err());
+
+    // The real admin can still resume it.
+    client.unpause();
+    assert!(client.register_issuer(&Address::generate(&env), &map![&env]));
+}
+
+#[test]
+fn test_transfer_ownership_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "transfer_ownership",
+        (new_admin.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_transfer_ownership_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+
+    env.set_auths(&[]);
+    assert!(client.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_transfer_admin_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "transfer_admin",
+        (new_admin.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_transfer_admin(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_transfer_admin_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+
+    env.set_auths(&[]);
+    assert!(client.try_transfer_admin(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
 }
