@@ -19,6 +19,7 @@ use soroban_sdk::{
 
 use crate::{
     DataKey, EscrowAction, EscrowContract, EscrowContractClient, EscrowEvent, EscrowRecord,
+    MAX_HISTORY_EVENTS, MIN_HISTORY_EVENTS,
 };
 
 #[contract]
@@ -158,6 +159,28 @@ fn generate_invoice_id(env: &Env, counter: u64) -> BytesN<32> {
 
 fn get_balance(env: &Env, token_id: &Address, addr: &Address) -> i128 {
     MockTokenClient::new(env, token_id).balance(addr)
+}
+
+/// Seed a synthetic history of `count` events directly into storage.
+///
+/// Amounts are `1..=count` and timestamps are `0..count` so tests can assert
+/// exactly which suffix survived compaction.
+fn seed_history(env: &Env, contract_id: &Address, invoice_id: &BytesN<32>, count: u32) {
+    env.as_contract(contract_id, || {
+        let mut history = Vec::new(env);
+        for i in 0..count {
+            history.push_back(EscrowEvent {
+                invoice_id: invoice_id.clone(),
+                action: EscrowAction::Locked,
+                amount: i as u128 + 1,
+                timestamp: i as u64,
+                caller: None,
+            });
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::History(invoice_id.clone()), &history);
+    });
 }
 
 fn assert_last_event_three<T1, T2>(
@@ -1100,6 +1123,153 @@ fn test_get_history_returns_action_log() {
         issuer,
         amount,
     );
+}
+
+#[test]
+fn test_compact_history_below_threshold_is_unchanged() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 200);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    let removed = client.compact_history(&invoice_id, &8);
+
+    assert_eq!(removed, 0);
+    let history = client.get_history(&invoice_id);
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.get(0).unwrap().amount, 1);
+    assert_eq!(history.get(3).unwrap().amount, 4);
+}
+
+#[test]
+fn test_compact_history_at_threshold_is_unchanged() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 201);
+    seed_history(&env, &client.address, &invoice_id, 5);
+
+    let removed = client.compact_history(&invoice_id, &5);
+
+    assert_eq!(removed, 0);
+    assert_eq!(client.get_history(&invoice_id).len(), 5);
+}
+
+#[test]
+fn test_compact_history_above_threshold_prunes_oldest_and_preserves_order() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 202);
+    seed_history(&env, &client.address, &invoice_id, 10);
+
+    let removed = client.compact_history(&invoice_id, &4);
+
+    assert_eq!(removed, 6);
+    let history = client.get_history(&invoice_id);
+    assert_eq!(history.len(), 4);
+    for (index, expected_amount) in [7u128, 8, 9, 10].iter().enumerate() {
+        let event = history.get(index as u32).unwrap();
+        assert_eq!(event.amount, *expected_amount);
+        assert_eq!(event.timestamp, 6 + index as u64);
+    }
+}
+
+#[test]
+fn test_compact_history_is_idempotent() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 203);
+    seed_history(&env, &client.address, &invoice_id, 12);
+
+    assert_eq!(client.compact_history(&invoice_id, &4), 8);
+    assert_eq!(client.compact_history(&invoice_id, &4), 0);
+    assert_eq!(client.get_history(&invoice_id).len(), 4);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_compact_history_missing_invoice_panics_not_found() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 204);
+
+    client.compact_history(&invoice_id, &4);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_compact_history_rejects_zero_retention() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 205);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    client.compact_history(&invoice_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_compact_history_rejects_retention_above_cap() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 206);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    client.compact_history(&invoice_id, &(MAX_HISTORY_EVENTS + 1));
+}
+
+#[test]
+fn test_compact_history_accepts_minimum_retention() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 207);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    assert_eq!(
+        client.compact_history(&invoice_id, &MIN_HISTORY_EVENTS),
+        3
+    );
+    assert_eq!(client.get_history(&invoice_id).len(), MIN_HISTORY_EVENTS);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth")]
+fn test_compact_history_requires_admin_authorization() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup_without_auths();
+    let invoice_id = generate_invoice_id(&env, 206);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    client.compact_history(&invoice_id, &2);
+}
+
+#[test]
+fn test_compact_history_emits_event() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 207);
+    seed_history(&env, &client.address, &invoice_id, 6);
+
+    client.compact_history(&invoice_id, &2);
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.last().expect("expected compaction event");
+    assert_eq!(contract, client.address);
+    assert_eq!(
+        Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(&env, "history_compacted")
+    );
+    assert_eq!(
+        BytesN::<32>::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+        invoice_id
+    );
+    let (retained, removed): (u32, u32) = TryFromVal::try_from_val(&env, &data).unwrap();
+    assert_eq!((retained, removed), (2, 4));
+}
+
+#[test]
+fn test_append_history_automatically_compacts_at_cap() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 208);
+    seed_history(&env, &client.address, &invoice_id, MAX_HISTORY_EVENTS);
+
+    client.lock(&invoice_id, &1_000_000_000, &issuer);
+
+    let history = client.get_history(&invoice_id);
+    assert_eq!(history.len(), MAX_HISTORY_EVENTS);
+    assert_eq!(history.get(0).unwrap().amount, 2);
+    let last = history.last().unwrap();
+    assert_eq!(last.action, EscrowAction::Locked);
+    assert_eq!(last.amount, 1_000_000_000);
 }
 
 #[test]

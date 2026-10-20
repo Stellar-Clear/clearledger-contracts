@@ -162,12 +162,16 @@ caller mistakes that should be fixed rather than silently skipped. Callers
 reconcile the returned funded IDs against their input to see which entries a
 capacity stop skipped.
 
-### Storing the `History` Vector
+### Storing the `History` Vector (resolved by #51)
 
-`escrow::append_history` stores a growable `Vec<EscrowEvent>` under
-`DataKey::History(invoice_id)`. Each event adds an element without
-compaction. For heavily-used contracts, this vector may grow large enough
-to exceed the per-entry size limit (~100 KB in practice).
+`escrow::append_history` stores a `Vec<EscrowEvent>` under
+`DataKey::History(invoice_id)` capped at `MAX_HISTORY_EVENTS` (32) entries.
+Appends evict the oldest entry once the cap is reached, and the admin-gated
+`compact_history(invoice_id, keep)` entry point can tighten retention further
+(`1..=32`) in bounded batches of at most 32 removals per call. This keeps the
+persistent entry well below the per-entry size limit (~100 KB in practice).
+Complete historical detail remains available from the per-action escrow events
+for indexers; see [ESCROW_HISTORY.md](./ESCROW_HISTORY.md).
 
 ---
 

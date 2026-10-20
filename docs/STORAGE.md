@@ -251,7 +251,7 @@ EscrowRecord {
 
 | DataKey | Type | Description |
 |---------|------|-------------|
-| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Append-only event log keyed by invoice ID |
+| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Bounded, chronological event log keyed by invoice ID |
 
 ```
 EscrowEvent {
@@ -259,8 +259,33 @@ EscrowEvent {
     action:     EscrowAction,   // Locked | ReleasedToIssuer | ReleasedToPool | DefaultHandled
     amount:     u128,
     timestamp:  u64,
+    caller:     Option<Address>,
 }
 ```
+
+#### History Retention and Compaction (issue #51)
+
+Escrow history is **bounded** so a long-lived invoice cannot grow its
+persistent entry without limit:
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `MAX_HISTORY_EVENTS` | 32 | Hard cap enforced by every `append_history` write. The oldest event is evicted when a 33rd is appended. |
+| `MIN_HISTORY_EVENTS` | 1 | Smallest retention an admin may request from `compact_history`. |
+| `MAX_COMPACT_PER_CALL` | 32 | Maximum events one `compact_history` call removes, bounding per-call CPU/memory. |
+
+`compact_history(invoice_id, keep) -> u32` is **admin-authenticated** and prunes
+the oldest entries until `keep` remain, returning the number removed. It is
+admin-gated rather than permissionless because removing on-chain audit data is
+destructive to clients that have not yet synced; the stored admin is the
+accountable party. Repeated calls are safe and idempotent: once the retained
+length is `<= keep` (or no further batch can be removed) the call returns `0`.
+
+Retained events keep their original chronological order (oldest first). Pruned
+events are **not** silently invented or rewritten; they remain available in the
+ledger's event stream via `funds_locked`, `released_to_issuer`,
+`released_to_pool`, and `default_resolved`. See
+[ESCROW_HISTORY.md](./ESCROW_HISTORY.md) for the full client/indexer policy.
 
 #### Lifecycle
 
@@ -273,7 +298,9 @@ EscrowEvent {
 ### Storage Key Count
 
 **Approximately 2 keys per funded invoice** — one `Locked` record and one
-`History` vector (which shares its TTL with the lock).
+`History` vector (which shares its TTL with the lock). The history vector is
+capped at `MAX_HISTORY_EVENTS` entries, so its size does not grow with invoice
+age or funding cycles.
 
 ---
 
@@ -398,6 +425,7 @@ Each registered asset requires two keys: one for its position in the list (`Asse
 | `pool::deposit` | 5 | 5 (+ TTL + token transfer) | Medium |
 | `pool::fund_invoice` | 6+ | 5 (+ TTL + cross-contract calls) | High |
 | `escrow::lock` | 2 | 2 (+ TTL + token transfer) | Medium |
+| `escrow::compact_history` | 1 | 1 (+ TTL), at most `MAX_COMPACT_PER_CALL` evictions | Low-Medium |
 
 See [LIMITATIONS.md](./LIMITATIONS.md) for current testnet budget constraints.
 

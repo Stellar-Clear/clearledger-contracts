@@ -93,6 +93,7 @@ Only the stored admin address may call this function.
 | `set_expiry_window` | Invoice | Configuration parameter |
 | `fund_invoice` | Pool | (*currently*) Capital allocation from pool |
 | `set_max_utilization` | Pool | Risk parameter |
+| `compact_history` | Escrow | Prunes on-chain history; admin is accountable for retention |
 | `transfer_ownership` | All | Changes the admin key |
 
 ### Pattern C — Cross-Contract Auth (`contract.require_auth()`)

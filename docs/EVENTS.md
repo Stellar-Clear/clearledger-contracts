@@ -560,6 +560,24 @@ Emitted when default is resolved and funds returned to pool.
 
 ---
 
+### `history_compacted`
+
+Emitted whenever escrow history is pruned, either automatically on append once
+the per-invoice cap is exceeded or explicitly via `compact_history`. Pruned
+entries are still recoverable by replaying the per-action escrow events, so
+indexers should ingest those events rather than relying on `get_history`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Topics** | | |
+| `topic[0]` | `Symbol` | `"history_compacted"` |
+| `topic[1]` | `BytesN<32>` | Invoice ID |
+| **Data** | `(u32, u32)` | `(retained, removed)` — events still stored, events removed |
+
+**Emitted by:** `append_history()` and `compact_history()` in `contracts/escrow/src/lib.rs`
+
+---
+
 ### `ownership_transferred` (dead code)
 
 Emitted when escrow ownership is transferred. Currently unused (marked `#[allow(dead_code)]`).
