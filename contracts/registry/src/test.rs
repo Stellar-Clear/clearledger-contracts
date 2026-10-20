@@ -25,6 +25,33 @@ fn setup() -> (Env, RegistryContractClient<'static>) {
     (env, client)
 }
 
+/// Asserts the last emitted event has the `(name, address, role)` topic shape
+/// used by the registry verification events.
+fn assert_last_event_role(
+    env: &Env,
+    client: &RegistryContractClient<'_>,
+    name: &str,
+    address: &Address,
+    role: Role,
+) {
+    let events = env.events().all();
+    let (contract, topics, _data) = events.get(events.len() - 1).unwrap();
+    assert_eq!(contract, client.address);
+    assert_eq!(topics.len(), 3);
+    assert_eq!(
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(env, name)
+    );
+    assert_eq!(
+        Address::try_from_val(env, &topics.get(1).unwrap()).unwrap(),
+        address.clone()
+    );
+    assert_eq!(
+        Role::try_from_val(env, &topics.get(2).unwrap()).unwrap(),
+        role
+    );
+}
+
 #[test]
 fn test_initialize() {
     let (env, client) = setup();
@@ -304,17 +331,20 @@ fn test_reinstate_restores_verified_and_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "profile_verified"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 true.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 ().into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_reinstated"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "address_reinstated"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 ().into_val(&env),
             ),
         ]
@@ -1071,6 +1101,61 @@ fn test_verify_profile_updates_status() {
 }
 
 #[test]
+fn test_verify_profile_event_includes_issuer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+
+    assert_last_event_role(&env, &client, "profile_verified", &issuer, Role::Issuer);
+
+    // The data payload remains the bool verification status.
+    let events = env.events().all();
+    let (_, _, data) = events.get(events.len() - 1).unwrap();
+    assert!(bool::try_from_val(&env, &data).unwrap());
+}
+
+#[test]
+fn test_verify_profile_event_includes_buyer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let buyer = Address::generate(&env);
+    client.register_buyer(&buyer, &map![&env]);
+    client.verify_profile(&buyer, &true);
+
+    assert_last_event_role(&env, &client, "profile_verified", &buyer, Role::Buyer);
+
+    let events = env.events().all();
+    let (_, _, data) = events.get(events.len() - 1).unwrap();
+    assert!(bool::try_from_val(&env, &data).unwrap());
+}
+
+#[test]
+fn test_revoke_and_reinstate_events_include_buyer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let buyer = Address::generate(&env);
+    client.register_buyer(&buyer, &map![&env]);
+    client.verify_profile(&buyer, &true);
+
+    client.revoke(&buyer);
+    assert_last_event_role(&env, &client, "address_revoked", &buyer, Role::Buyer);
+
+    client.reinstate(&buyer);
+    assert_last_event_role(
+        &env,
+        &client,
+        "address_reinstated",
+        &buyer,
+        Role::Buyer,
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_verify_profile_unknown_panics() {
     let (env, client) = setup();
@@ -1808,12 +1893,14 @@ fn test_revoke_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "profile_verified"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 true.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 ().into_val(&env),
             ),
         ]

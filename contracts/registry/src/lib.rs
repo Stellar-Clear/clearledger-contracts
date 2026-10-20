@@ -648,11 +648,12 @@ impl RegistryContract {
         }
         profile.set_verified(false);
         profile.set_revoked(true);
+        let role = profile.role();
         env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::address_revoked(&env, &address);
+        events::address_revoked(&env, &address, &role);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -697,11 +698,12 @@ impl RegistryContract {
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotFound));
         profile.set_verified(true);
         profile.set_revoked(false);
+        let role = profile.role();
         env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::address_reinstated(&env, &address);
+        events::address_reinstated(&env, &address, &role);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -722,11 +724,12 @@ impl RegistryContract {
         } else {
             profile.set_revoked(true);
         }
+        let role = profile.role();
         env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::profile_verified(&env, &address, verify);
+        events::profile_verified(&env, &address, verify, &role);
         Self::extend_instance_ttl(&env);
         true
     }

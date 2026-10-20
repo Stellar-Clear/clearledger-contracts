@@ -1,5 +1,7 @@
 use soroban_sdk::{Address, Env, Symbol};
 
+use crate::Role;
+
 pub fn contract_initialized(env: &Env, admin: &Address) {
     env.events().publish(
         (Symbol::new(env, "contract_initialized"), admin.clone()),
@@ -17,9 +19,17 @@ pub fn buyer_registered(env: &Env, address: &Address) {
         .publish((Symbol::new(env, "buyer_registered"), address.clone()), ());
 }
 
-pub fn address_revoked(env: &Env, address: &Address) {
-    env.events()
-        .publish((Symbol::new(env, "address_revoked"), address.clone()), ());
+/// Emitted by `revoke`. `role` is indexed in `topic[2]` so indexers can
+/// classify the profile without an extra `get_profile` read.
+pub fn address_revoked(env: &Env, address: &Address, role: &Role) {
+    env.events().publish(
+        (
+            Symbol::new(env, "address_revoked"),
+            address.clone(),
+            role.clone(),
+        ),
+        (),
+    );
 }
 
 pub fn batch_registered(env: &Env, registered: u32, skipped: u32) {
@@ -29,9 +39,18 @@ pub fn batch_registered(env: &Env, registered: u32, skipped: u32) {
     );
 }
 
-pub fn profile_verified(env: &Env, address: &Address, status: bool) {
+/// Emitted by `verify_profile`. `role` is indexed in `topic[2]` so indexers
+/// can classify the profile without an extra `get_profile` read. `data`
+/// remains the `bool` verification status; the authorizing admin added by
+/// #165 should be appended after `role` (e.g. `topic[3]`) to keep this ABI
+/// additive.
+pub fn profile_verified(env: &Env, address: &Address, status: bool, role: &Role) {
     env.events().publish(
-        (Symbol::new(env, "profile_verified"), address.clone()),
+        (
+            Symbol::new(env, "profile_verified"),
+            address.clone(),
+            role.clone(),
+        ),
         status,
     );
 }
@@ -41,9 +60,15 @@ pub fn profile_updated(env: &Env, address: &Address) {
         .publish((Symbol::new(env, "profile_updated"), address.clone()), ());
 }
 
-pub fn address_reinstated(env: &Env, address: &Address) {
+/// Emitted by `reinstate`. `role` is indexed in `topic[2]` so indexers can
+/// classify the profile without an extra `get_profile` read.
+pub fn address_reinstated(env: &Env, address: &Address, role: &Role) {
     env.events().publish(
-        (Symbol::new(env, "address_reinstated"), address.clone()),
+        (
+            Symbol::new(env, "address_reinstated"),
+            address.clone(),
+            role.clone(),
+        ),
         (),
     );
 }
