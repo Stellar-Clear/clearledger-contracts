@@ -13,4 +13,10 @@ pub enum PoolFactoryError {
     /// `register_existing_pool` was given an address that does not expose a
     /// pool initialized for the requested asset.
     InvalidPool = 5,
+    /// `get_assets_page` was given a zero limit or a limit above
+    /// [`MAX_ASSET_PAGE_LIMIT`](crate::MAX_ASSET_PAGE_LIMIT), which would
+    /// defeat the per-call cost bound pagination exists to provide.
+    InvalidLimit = 10,
+    /// `get_assets_page` was given a cursor past the end of the asset index.
+    InvalidCursor = 11,
 }
