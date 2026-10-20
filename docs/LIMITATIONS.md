@@ -1,6 +1,6 @@
 # Limitations
 
-> **Updated:** 2026-09-30
+> **Updated:** 2026-10-20
 > **Applies to:** ClearLedger protocol on Stellar testnet
 
 This document captures known limitations, testnet-specific constraints,
@@ -192,6 +192,19 @@ withdrawal. The regression test in `contracts/pool/src/test.rs` covers this
 scenario. Per-deposit lots would be required if the protocol needs a specific
 FIFO/HIFO tax or reporting policy.
 
+### Pool `set_max_utilization` Auth Is Caller-Controlled
+
+`pool::set_max_utilization(admin, new_cap_bps)` calls
+`admin.require_auth()` on the caller-supplied `admin` argument but never
+compares it to the stored pool admin
+(`contracts/pool/src/lib.rs:1914-1926`). Any account that signs its own call
+can raise or lower the utilization cap, despite the function's doc comment
+saying it requires the contract admin. The regression test
+`test_set_max_utilization_requires_admin_authorization`
+(`contracts/pool/src/test.rs:1530`) only covers an unsigned non-admin. Treat
+the cap as caller-controlled until the contract compares the argument to
+`DataKey::Admin`.
+
 ### Issuer Release Not Wired (Issue #56)
 
 After `fund_invoice` locks USDC in escrow, the pooled funds should be
@@ -237,7 +250,7 @@ terms.
 | Buyer repays exactly on `due_date`                                     | `invoice.repay` succeeds; `trigger_default` panics with `DueDateNotPassed`                          | Asymmetric: `repay` has no time gate beyond `status == Confirmed`; `trigger_default` requires `current_time > due_date` (strict)        |
 | `confirm_delivery` called after invoice is already confirmed           | Panics with `InvalidStatusTransition` because status is `Confirmed` not `Active`                    | Correct — prevents replay                                                                                                               |
 | `withdraw` when pool has funded invoices but no available liquidity    | Panics with `InsufficientLiquidity`                                                                 | Correct — prevents breaking the pool invariant                                                                                          |
-| Admin calls `set_max_utilization` to 0                                 | All `fund_invoice` calls will fail (utilization ≥ 0% ≥ cap of 0)                                    | This is a denial-of-service vector available to admin                                                                                   |
+| Admin (or any self-authenticating caller, see Known Gaps) calls `set_max_utilization` to 0 | All `fund_invoice` calls will fail (utilization ≥ 0% ≥ cap of 0)                                    | Denial-of-service vector; the current setter does not verify the caller against the stored admin                                       |
 | Calling `revoke` on an unregistered address                            | Panics with `NotFound`                                                                              | Per spec                                                                                                                                |
 | Calling `batch_register_issuers` with more than 50 entries             | Panics with `BatchSizeExceeded`                                                                     | Gas protection                                                                                                                          |
 | A buyer repays _less_ than `face_value`                                | Not possible on the buyer path — `invoice.repay` transfers the full `face_value` from buyer to pool | Partial amounts are only possible through `escrow::release_to_pool` during default / partial-repayment flows; see [Resolved](#resolved) |
@@ -272,8 +285,11 @@ are provided where available.
 - Formal verification or symbolic execution audit
 - `cargo-soroban` integration for automated WASM budget reporting
 - TypeScript SDK for contract interaction
-- Automated fuzz testing across all four contracts
-- Smart-contract upgrade mechanism (`__constructor` + `__upgrade`)
+- Automated fuzz testing across all deployed contracts
+- Timelocked or multisig contract upgrades. Admin-only `upgrade` entry points
+  already exist on `invoice` and `escrow`; `registry`, `pool`, and
+  `pool_factory` are not upgradeable through a contract entry point. See
+  [THREAT_MODEL.md](./THREAT_MODEL.md#upgrade-powers).
 
 > **Note:** Partial repayments are now supported on the **escrow** path
 > (`escrow::release_to_pool(invoice_id, repayment_amount)` accepts a
