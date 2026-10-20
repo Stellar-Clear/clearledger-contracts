@@ -1019,3 +1019,161 @@ fn test_partial_repayment_then_default_pool_loss_calculation() {
     let returned = pool.withdraw(&lp, &shares);
     assert_eq!(returned, deposit_amount - expected_loss);
 }
+
+// --------------- Batch Listing Failure Ordering (Issue #107) ---------------
+
+fn create_batch_test_invoice(lifecycle: &FeeLifecycle, attested: bool) -> BytesN<32> {
+    let face_value = 10_000_000_000u128;
+    let due_date = lifecycle.env.ledger().timestamp() + 30 * 86400;
+    let invoice_id = lifecycle.invoice.create(
+        &lifecycle.issuer,
+        &lifecycle.buyer,
+        &face_value,
+        &due_date,
+        &lifecycle.usdc_id,
+    );
+    if attested {
+        attest_invoice(&lifecycle.env, &lifecycle.invoice, &invoice_id);
+    }
+    invoice_id
+}
+
+/// `batch_list_for_financing` is tolerant per entry: it returns only the IDs
+/// that failed, and this test pins that those IDs come back in the exact order
+/// the caller supplied them, with the valid entries still listed.
+#[test]
+fn test_batch_listing_failure_ids_preserve_input_order() {
+    let lifecycle = setup_fee_lifecycle();
+
+    let valid_first = create_batch_test_invoice(&lifecycle, true);
+    let unattested = create_batch_test_invoice(&lifecycle, false);
+    let already_listed = create_batch_test_invoice(&lifecycle, true);
+    lifecycle.invoice.list_for_financing(&already_listed, &200);
+    let invalid_discount = create_batch_test_invoice(&lifecycle, true);
+    let valid_last = create_batch_test_invoice(&lifecycle, true);
+    let unattested_last = create_batch_test_invoice(&lifecycle, false);
+
+    // Failure IDs are deliberately out of creation order (and therefore not
+    // sorted) so a stable-sort or map iteration cannot satisfy this test.
+    let entries = vec![
+        &lifecycle.env,
+        (valid_first.clone(), 100),
+        (unattested_last.clone(), 150),
+        (already_listed.clone(), 200),
+        (invalid_discount.clone(), 5_001),
+        (valid_last.clone(), 250),
+        (unattested.clone(), 300),
+    ];
+
+    let failed = lifecycle.invoice.batch_list_for_financing(&entries);
+
+    assert_eq!(failed.len(), 4);
+    assert_eq!(failed.get(0).unwrap(), unattested_last);
+    assert_eq!(failed.get(1).unwrap(), already_listed);
+    assert_eq!(failed.get(2).unwrap(), invalid_discount);
+    assert_eq!(failed.get(3).unwrap(), unattested);
+
+    assert_eq!(
+        lifecycle.invoice.get_status(&valid_first),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&valid_first), 100);
+    assert_eq!(
+        lifecycle.invoice.get_status(&valid_last),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&valid_last), 250);
+
+    assert_eq!(
+        lifecycle.invoice.get_status(&unattested),
+        InvoiceStatus::Created as u32
+    );
+    assert_eq!(
+        lifecycle.invoice.get_status(&already_listed),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&already_listed), 200);
+    assert_eq!(
+        lifecycle.invoice.get_status(&invalid_discount),
+        InvoiceStatus::Created as u32
+    );
+    assert_eq!(
+        lifecycle.invoice.get_status(&unattested_last),
+        InvoiceStatus::Created as u32
+    );
+}
+
+#[test]
+fn test_batch_listing_all_valid_returns_no_failures() {
+    let lifecycle = setup_fee_lifecycle();
+
+    let first = create_batch_test_invoice(&lifecycle, true);
+    let second = create_batch_test_invoice(&lifecycle, true);
+    let third = create_batch_test_invoice(&lifecycle, true);
+
+    let entries = vec![
+        &lifecycle.env,
+        (second.clone(), 400),
+        (first.clone(), 123),
+        (third.clone(), 5_000),
+    ];
+
+    let failed = lifecycle.invoice.batch_list_for_financing(&entries);
+
+    assert!(failed.is_empty());
+    assert_eq!(
+        lifecycle.invoice.get_status(&first),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&first), 123);
+    assert_eq!(
+        lifecycle.invoice.get_status(&second),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&second), 400);
+    assert_eq!(
+        lifecycle.invoice.get_status(&third),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&third), 5_000);
+}
+
+#[test]
+fn test_batch_listing_all_failing_preserves_input_order() {
+    let lifecycle = setup_fee_lifecycle();
+
+    let already_listed = create_batch_test_invoice(&lifecycle, true);
+    lifecycle.invoice.list_for_financing(&already_listed, &200);
+    let unattested_first = create_batch_test_invoice(&lifecycle, false);
+    let invalid_discount = create_batch_test_invoice(&lifecycle, true);
+    let unattested_last = create_batch_test_invoice(&lifecycle, false);
+
+    let entries = vec![
+        &lifecycle.env,
+        (unattested_last.clone(), 200),
+        (already_listed.clone(), 300),
+        (invalid_discount.clone(), 6_000),
+        (unattested_first.clone(), 100),
+    ];
+
+    let failed = lifecycle.invoice.batch_list_for_financing(&entries);
+
+    assert_eq!(failed.len(), 4);
+    assert_eq!(failed.get(0).unwrap(), unattested_last);
+    assert_eq!(failed.get(1).unwrap(), already_listed);
+    assert_eq!(failed.get(2).unwrap(), invalid_discount);
+    assert_eq!(failed.get(3).unwrap(), unattested_first);
+
+    assert_eq!(
+        lifecycle.invoice.get_status(&already_listed),
+        InvoiceStatus::Listed as u32
+    );
+    assert_eq!(lifecycle.invoice.get_discount_bps(&already_listed), 200);
+    for invoice_id in [unattested_first, invalid_discount, unattested_last] {
+        assert_eq!(
+            lifecycle.invoice.get_status(&invoice_id),
+            InvoiceStatus::Created as u32
+        );
+        assert_eq!(lifecycle.invoice.get_discount_bps(&invoice_id), 0);
+    }
+}
