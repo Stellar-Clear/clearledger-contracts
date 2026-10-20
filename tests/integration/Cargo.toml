@@ -1,0 +1,21 @@
+[package]
+name = "clearledger-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+clearledger-registry = { workspace = true }
+clearledger-invoice = { workspace = true }
+clearledger-escrow = { workspace = true }
+clearledger-pool = { workspace = true }
+k256 = { version = "0.13.1", default-features = false, features = ["ecdsa"] }

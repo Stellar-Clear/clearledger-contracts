@@ -1,0 +1,8 @@
+# Configuration for `cargo audit` (https://github.com/rustsec/rustsec/tree/main/cargo-audit).
+#
+# By default this file grants no exceptions — every RUSTSEC advisory hard-fails CI.
+# When an advisory affects a transitive dependency with no available fix, add a
+# time-boxed, justified entry to `ignore` below. See CONTRIBUTING.md for the process.
+
+[advisories]
+ignore = []

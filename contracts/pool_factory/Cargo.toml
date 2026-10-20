@@ -1,0 +1,33 @@
+[package]
+name = "clearledger-pool-factory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+clearledger-ttl = { path = "../ttl" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# Cross-contract deps (`clearledger-pool`, `clearledger-invoice`,
+# `clearledger-escrow`) are intentionally `dev-dependencies`: the factory only
+# references those contracts by `Address` via `env.invoke_contract(...)` and
+# `Env::deployer()` and never imports their types in production code. The crates
+# are pulled in solely so the tests can drive the real `PoolContract` instance
+# that `register_asset` deploys, plus the real invoice/escrow contracts it wires
+# that instance to. Production builds (`cargo build --release`) must not pull
+# them in to keep the WASM binary as small as possible. Mirrors the same split in
+# contracts/pool/Cargo.toml.
+clearledger-pool = { workspace = true }
+clearledger-invoice = { workspace = true }
+clearledger-escrow = { workspace = true }
+clearledger-registry = { workspace = true }
+k256 = { version = "0.13.1", default-features = false, features = ["ecdsa"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

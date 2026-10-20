@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Cargo dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    allow:
+      - dependency-type: "all"
+    reviewers:
+      - "k1ngd4vid"
+    open-pull-requests-limit: 5
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    # Group actions updates to reduce noise
+    groups:
+      actions:
+        patterns:
+          - "actions/*"
+          - "dtolnay/*"
+          - "Swatinem/*"
+    reviewers:
+      - "k1ngd4vid"
+    open-pull-requests-limit: 5

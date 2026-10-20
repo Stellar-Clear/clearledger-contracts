@@ -1,0 +1,6 @@
+[advisories]
+# RUSTSEC-2026-0009: time crate DoS vulnerability
+# Originates from soroban-sdk 21.7.7 -> stellar-xdr -> time 0.3.36
+# This advisory affects transitive dependencies only.
+# Fix: Awaiting soroban-sdk to upgrade time >= 0.3.47
+ignore = ["RUSTSEC-2026-0009"]

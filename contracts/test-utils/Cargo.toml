@@ -1,0 +1,21 @@
+[package]
+name = "clearledger-test-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+clearledger-registry = { workspace = true }
+clearledger-invoice = { workspace = true }
+clearledger-escrow = { workspace = true }
+clearledger-pool = { workspace = true }
+clearledger-ttl = { path = "../ttl" }
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }

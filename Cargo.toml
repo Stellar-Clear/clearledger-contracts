@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/registry",
+    "contracts/test-utils",
+    "contracts/invoice",
+    "contracts/escrow",
+    "contracts/pool",
+    "contracts/pool_factory",
+    "contracts/ttl",
+    "contracts/pause",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["ClearLedger"]
+
+[workspace.dependencies]
+soroban-sdk = { version = "21.7.6" }
+proptest = "1.0.0"
+clearledger-registry = { path = "contracts/registry" }
+clearledger-invoice = { path = "contracts/invoice" }
+clearledger-escrow = { path = "contracts/escrow" }
+clearledger-pool = { path = "contracts/pool" }
+clearledger-pool-factory = { path = "contracts/pool_factory" }
+clearledger-test-utils = { path = "contracts/test-utils" }
+clearledger-pause = { path = "contracts/pause" }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true

@@ -1,0 +1,30 @@
+[package]
+name = "clearledger-invoice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+clearledger-ttl = { path = "../ttl" }
+clearledger-pause = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+clearledger-registry = { path = "../registry" }
+clearledger-escrow = { path = "../escrow" }
+clearledger-pool = { path = "../pool" }
+clearledger-test-utils = { workspace = true }
+proptest = "1"
+# Test-only: signs attestation payloads with a real secp256k1 key so
+# submit_attestation's signature-recovery path is exercised for real,
+# rather than mocked out. Version pinned to what soroban-env-host already
+# resolves (see Cargo.lock) so it doesn't pull in a second copy.
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

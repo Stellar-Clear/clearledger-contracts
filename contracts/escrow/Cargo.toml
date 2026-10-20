@@ -1,0 +1,21 @@
+[package]
+name = "clearledger-escrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+clearledger-pause = { path = "../pause" }
+clearledger-ttl = { path = "../ttl" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
