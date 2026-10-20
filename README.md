@@ -64,7 +64,7 @@ bash scripts/deploy.sh
 
 The deployment script supports resumable deployments and updates the address table above. See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration, wiring, verification, and rollback details. The default deployment targets the supported USDC workflow; XLM deployment is experimental and opt-in.
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. Architecture and integration references include the [threat model](docs/THREAT_MODEL.md), [event catalog](docs/EVENTS.md), [storage schema](docs/STORAGE.md), and [known limitations](docs/LIMITATIONS.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. Architecture and integration references include the [threat model](docs/THREAT_MODEL.md), [event catalog](docs/EVENTS.md), [storage schema](docs/STORAGE.md), [registry metadata privacy and data-minimization guidance](docs/METADATA_PRIVACY.md), and [known limitations](docs/LIMITATIONS.md).
 
 ## Network and security
 

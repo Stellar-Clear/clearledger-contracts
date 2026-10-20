@@ -87,7 +87,6 @@ Entries skipped as already-registered are never indexed twice, so
 
 ```
 Profile {
-    address:      Address,          // Stellar address (also the key)
     packed_flags: u32,              // Bit 0: role (0=Issuer, 1=Buyer)
                                     // Bit 1: verified status
                                     // Bit 2: revoked status
@@ -95,6 +94,19 @@ Profile {
     metadata:     Map<String, String>, // Arbitrary key-value metadata
 }
 ```
+
+The Stellar `Address` is not stored inside the struct: it is the
+`DataKey::Profile(Address)` key and the profile's public identity. All profile
+fields are public, and `get_profile(address)` returns the complete metadata map
+without authentication.
+
+Metadata is limited to 20 entries, with non-empty keys up to 64 bytes and
+non-empty values up to 512 bytes (`RegistryError::InvalidMetadata`, `#6`). The
+contract enforces only those size rules; it does not detect or redact personal
+data. Treat every metadata key and value as public and effectively permanent:
+there is no on-chain erasure, and updates leave earlier values in transaction
+history. See [Registry Metadata Privacy and Data Minimization](METADATA_PRIVACY.md)
+before storing references or submitting profile metadata.
 
 #### Indexing Notes
 

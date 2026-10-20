@@ -611,6 +611,12 @@ Emitted when the escrow's admin-gated emergency circuit breaker is disengaged.
 **Contract:** `registry_contract`  
 **Source:** `contracts/registry/src/events.rs`
 
+Registry events publish addresses and status changes, but they do not carry
+profile metadata. That is not a confidentiality guarantee: metadata is public
+through `get_profile`, storage reads, and the transaction arguments of the
+register/update call. See [Registry Metadata Privacy and Data Minimization](METADATA_PRIVACY.md)
+for the public visibility, data-minimization, and deletion rules.
+
 ### `contract_initialized`
 
 Emitted when the registry contract is initialized.

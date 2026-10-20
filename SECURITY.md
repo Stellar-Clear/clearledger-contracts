@@ -67,6 +67,7 @@ A security audit is planned prior to any mainnet deployment.
 
 - [Threat Model](./docs/THREAT_MODEL.md) — detailed trust assumptions, auth gates, and attack vectors
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout and TTL management
+- [Registry Metadata Privacy](./docs/METADATA_PRIVACY.md) — public visibility, prohibited personal data, and deletion limits
 - [Limitations](./docs/LIMITATIONS.md) — known gaps, testnet constraints, and unhandled edge cases
 
 ## Important Notice
