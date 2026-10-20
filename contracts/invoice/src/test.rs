@@ -1554,7 +1554,7 @@ fn test_get_by_status_filters_correctly() {
 
 // ============== O(1) STATUS MEMBERSHIP MARKERS (issues #831 / #835) ==============
 
-/// Reads the raw `DataKey::StatusMembership` marker straight from contract
+/// Reads the raw `DataKey::StatusPosition` slot straight from contract
 /// storage, so these tests assert on the key itself and not only on the
 /// public query helper.
 fn raw_status_membership(
@@ -1563,12 +1563,21 @@ fn raw_status_membership(
     status: InvoiceStatus,
     invoice_id: &BytesN<32>,
 ) -> bool {
-    let key = crate::status_membership_key(status, invoice_id);
+    let key = crate::status_position_key(status, invoice_id);
     env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get::<_, bool>(&key)
-            .unwrap_or(false)
+        env.storage().persistent().get::<_, u32>(&key).is_some()
+    })
+}
+
+fn raw_status_position(
+    env: &Env,
+    client: &InvoiceContractClient,
+    status: InvoiceStatus,
+    invoice_id: &BytesN<32>,
+) -> Option<u32> {
+    let key = crate::status_position_key(status, invoice_id);
+    env.as_contract(&client.address, || {
+        env.storage().persistent().get::<_, u32>(&key)
     })
 }
 
@@ -1587,7 +1596,7 @@ fn test_status_membership_marker_written_on_create_and_rolled_on_transitions() {
         &invoice_id
     ));
     assert!(client.has_status_membership(&InvoiceStatus::Created, &invoice_id));
-    let created_key = crate::status_membership_key(InvoiceStatus::Created, &invoice_id);
+    let created_key = crate::status_position_key(InvoiceStatus::Created, &invoice_id);
     let marker_ttl = env.as_contract(&client.address, || {
         env.storage().persistent().get_ttl(&created_key)
     });
@@ -4846,4 +4855,238 @@ fn test_move_status_index_compacts_storage() {
     let listed = client.get_by_status(&InvoiceStatus::Listed, &0, &MAX_PAGE_SIZE);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed.get(0).unwrap().id, id2);
+}
+
+fn index_contains(ids: &Vec<BytesN<32>>, target: &BytesN<32>) -> bool {
+    for id in ids.iter() {
+        if id.clone() == target.clone() {
+            return true;
+        }
+    }
+    false
+}
+
+fn status_index_count(env: &Env, client: &InvoiceContractClient, status: InvoiceStatus) -> u32 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&crate::DataKey::StatusIndexCount(status as u32))
+            .unwrap_or(0)
+    })
+}
+
+/// Compares the indexed status views against a ground-truth scan of every
+/// invoice, and verifies the compacted slot/position invariants.
+fn assert_status_views_match_linear(
+    env: &Env,
+    client: &InvoiceContractClient,
+    ids: &Vec<BytesN<32>>,
+) {
+    let statuses = [
+        InvoiceStatus::Created,
+        InvoiceStatus::Listed,
+        InvoiceStatus::Funded,
+        InvoiceStatus::Active,
+        InvoiceStatus::Confirmed,
+        InvoiceStatus::Repaid,
+        InvoiceStatus::Defaulted,
+        InvoiceStatus::Expired,
+        InvoiceStatus::Cancelled,
+    ];
+    let mut classified: u64 = 0;
+
+    for status in statuses {
+        let mut expected: Vec<BytesN<32>> = Vec::new(env);
+        for id in ids.iter() {
+            if client.get(id).status == status {
+                expected.push_back(id.clone());
+            }
+        }
+
+        let actual = client.get_by_status(&status, &0, &MAX_PAGE_SIZE);
+        assert_eq!(actual.len(), expected.len());
+
+        let mut seen: Vec<BytesN<32>> = Vec::new(env);
+        for invoice in actual.iter() {
+            assert_eq!(invoice.status, status);
+            assert!(!index_contains(&seen, &invoice.id), "duplicate status row");
+            assert!(index_contains(&expected, &invoice.id), "unexpected member");
+            seen.push_back(invoice.id.clone());
+        }
+        for id in expected.iter() {
+            assert!(index_contains(&seen, id), "missing status member");
+        }
+
+        let count = status_index_count(env, client, status);
+        assert_eq!(count, expected.len() as u32, "status slot count mismatch");
+
+        for id in ids.iter() {
+            let is_member = client.get(id).status == status;
+            assert_eq!(client.has_status_membership(&status, id), is_member);
+            match raw_status_position(env, client, status, id) {
+                Some(pos) => {
+                    assert!(is_member);
+                    assert!(pos < count);
+                    let stored: BytesN<32> = env.as_contract(&client.address, || {
+                        env.storage()
+                            .persistent()
+                            .get(&crate::DataKey::StatusIndexEntry(status as u32, pos))
+                            .unwrap()
+                    });
+                    assert_eq!(stored, id.clone(), "position points at wrong slot");
+                }
+                None => assert!(!is_member, "member is missing its position"),
+            }
+        }
+
+        classified += expected.len() as u64;
+    }
+
+    assert_eq!(classified, ids.len() as u64, "invoice counted twice");
+}
+
+#[test]
+fn test_status_membership_index_matches_linear_reads_across_transitions() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let base_time = env.ledger().timestamp();
+    let due_date = base_time + DEFAULT_DUE_OFFSET;
+
+    let mut ids: Vec<BytesN<32>> = Vec::new(&env);
+    for offset in 0..6u128 {
+        ids.push_back(client.create(
+            &issuer,
+            &buyer,
+            &(DEFAULT_FACE_VALUE + offset),
+            &due_date,
+            &usdc,
+        ));
+    }
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    let default_id = ids.get(0).unwrap();
+    let repaid_id = ids.get(1).unwrap();
+    let cancelled_id = ids.get(2).unwrap();
+    let listed_id = ids.get(3).unwrap();
+    let created_id = ids.get(4).unwrap();
+    let expired_id = ids.get(5).unwrap();
+
+    for id in [&default_id, &repaid_id, &expired_id, &listed_id] {
+        attest(&env, &client, id);
+        client.list_for_financing(id, &DEFAULT_DISCOUNT_BPS);
+    }
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    client.cancel(&cancelled_id);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&default_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT);
+    client.mark_funded(&repaid_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    client.mark_shipped(&default_id);
+    client.confirm_delivery(&default_id, &issuer);
+    client.confirm_delivery(&default_id, &buyer);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    client.set_expiry_window(&100);
+    env.ledger().set_timestamp(base_time + 101);
+    assert!(client.expire_listing(&expired_id, &issuer));
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    mint_tokens(&env, &usdc, &buyer, 2_000_000_000);
+    assert!(client.repay(&repaid_id));
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    env.ledger().set_timestamp(due_date);
+    client.trigger_default(&default_id);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    // Remaining non-terminal states are exactly as expected.
+    assert_eq!(client.get(&created_id).status, InvoiceStatus::Created);
+    assert_eq!(client.get(&listed_id).status, InvoiceStatus::Listed);
+    assert_status_views_match_linear(&env, &client, &ids);
+}
+
+#[test]
+fn test_migrate_status_index_compacts_legacy_rows_in_pages() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let id1 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let id2 = client.create(&issuer, &buyer, &(DEFAULT_FACE_VALUE + 1), &due_date, &usdc);
+    let id3 = client.create(&issuer, &buyer, &(DEFAULT_FACE_VALUE + 2), &due_date, &usdc);
+
+    attest(&env, &client, &id2);
+    client.list_for_financing(&id2, &DEFAULT_DISCOUNT_BPS);
+
+    // Reconstruct the pre-#22 append-only layout: Created is [id1, id2, id3]
+    // (id2 is now stale) and none of those rows has a position map entry.
+    env.as_contract(&client.address, || {
+        let created = InvoiceStatus::Created as u32;
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusIndexEntry(created, 2), &id2);
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusIndexCount(created), &3u32);
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusCount(created), &3u64);
+        for id in [&id1, &id2, &id3] {
+            env.storage()
+                .persistent()
+                .remove(&crate::status_position_key(InvoiceStatus::Created, id));
+            env.storage().persistent().set(
+                &crate::status_membership_key(InvoiceStatus::Created, id),
+                &true,
+            );
+        }
+        let listed = InvoiceStatus::Listed as u32;
+        env.storage()
+            .persistent()
+            .remove(&crate::status_position_key(InvoiceStatus::Listed, &id2));
+        env.storage().persistent().set(
+            &crate::status_membership_key(InvoiceStatus::Listed, &id2),
+            &true,
+        );
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusIndexCount(listed), &1u32);
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusCount(listed), &1u64);
+    });
+
+    // Before migration the legacy marker still answers membership.
+    assert!(client.has_status_membership(&InvoiceStatus::Listed, &id2));
+
+    let (cursor, done) = client.migrate_status_index(&InvoiceStatus::Created, &2);
+    assert_eq!(cursor, 2);
+    assert!(!done);
+    let (cursor, done) = client.migrate_status_index(&InvoiceStatus::Created, &2);
+    assert_eq!(cursor, 3);
+    assert!(done);
+    let (_, done) = client.migrate_status_index(&InvoiceStatus::Listed, &MAX_PAGE_SIZE);
+    assert!(done);
+
+    let created = client.get_by_status(&InvoiceStatus::Created, &0, &MAX_PAGE_SIZE);
+    assert_eq!(created.len(), 2);
+    assert_eq!(created.get(0).unwrap().id, id1);
+    assert_eq!(created.get(1).unwrap().id, id3);
+    let listed = client.get_by_status(&InvoiceStatus::Listed, &0, &MAX_PAGE_SIZE);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.get(0).unwrap().id, id2);
+
+    assert_eq!(status_index_count(&env, &client, InvoiceStatus::Created), 2);
+    assert_eq!(status_index_count(&env, &client, InvoiceStatus::Listed), 1);
+    assert!(raw_status_position(&env, &client, InvoiceStatus::Created, &id1).is_some());
+    assert!(raw_status_position(&env, &client, InvoiceStatus::Created, &id2).is_none());
+    assert!(raw_status_position(&env, &client, InvoiceStatus::Created, &id3).is_some());
+    let counts = client.get_counts();
+    assert_eq!(counts.get(String::from_str(&env, "Created")), Some(2));
+    assert_eq!(counts.get(String::from_str(&env, "Listed")), Some(1));
 }

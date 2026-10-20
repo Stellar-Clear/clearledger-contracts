@@ -121,9 +121,14 @@ The benchmark demonstrates negligible gas overhead (~0.25% CPU instruction delta
   `get_by_buyer`) are paginated (`page`, `page_size`, capped at
   `MAX_PAGE_SIZE`), so each call hydrates a bounded number of invoices no
   matter how many entries the index holds (issue #71). Callers page until an
-  empty result is returned. The status index is append-only, so a page can
-  return fewer than `page_size` invoices when it contains stale entries whose
-  invoice has since moved to another status.
+  empty result is returned.
+- The status index is a bounded membership index (issue #22): entering a
+  status appends one slot plus its `StatusPosition`, and leaving swap-and-pops
+  in O(1) using that position, so transitions never scan the status's
+  historical invoices. `get_by_status` reads only the requested page of live
+  members. Pre-upgrade rows without a position are located once on their next
+  transition, or eagerly via admin `migrate_status_index`; until migrated, a
+  page may be shorter than `page_size` because stale rows are filtered out.
 - `get_invoice_count_by_issuer` and `get_invoice_count_by_buyer` avoid that
   cost entirely: they read a single stored counter (`u32`) in O(1), so
   pagination and badge UIs should prefer them over `.len()` on the
@@ -299,10 +304,12 @@ the 2025-07-25 revision.
 > In reality `move_status_index` and the `extend_*_index` helpers linearly
 > scan the index on every transition, index rows are still not compacted,
 > and `get_by_status` skips stale rows only by loading each invoice and
-> comparing its status. The item remains open and the O(n) linear-scan
-> behaviour is tracked in
-> #831;
-> this document will be updated again when that lands.
+> comparing its status. This was subsequently fixed by issue #22: the status
+> index is now a compacted membership index with an O(1)
+> `DataKey::StatusPosition` slot map, swap-and-pop removal, and a bounded
+> admin migration (`migrate_status_index`) for pre-existing rows. See
+> [STORAGE.md](STORAGE.md#status-index-migration-upgrade-note). The historical
+> tracker was #831.
 
 - **Pool does not track individual LP yield accrual.** `pool::withdraw`
   now writes `DataKey::LPYieldEarned(lp)` and `pool::get_lp_position`
@@ -329,7 +336,7 @@ the 2025-07-25 revision.
 - #294 — Testnet limitation docs
 - #307 — General repo documentation
 - #460 — LIMITATIONS.md stale date (this PR fixes it)
-- #831 — Index helpers linearly scan whole indexes (open — tracks the linear-scan performance work; update this document when a real index/membership structure lands)
+- #831 — Index helpers linearly scan whole indexes (fixed for the status index by issue #22; issuer/buyer indexes remain append-only by design)
 - #835 — LIMITATIONS.md documents a `DataKey::StatusMembership` that does not exist (this PR fixes it)
 
 Resolved items reference the PRs that closed them:

@@ -191,31 +191,77 @@ Cancelled = 8   // issuer cancelled before listing
 | `IssuerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by issuer + index |
 | `BuyerIndexCount(Address)` | `u32` | Number of invoices for this buyer |
 | `BuyerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by buyer + index |
-| `StatusIndexCount(u32)` | `u32` | Number of invoices in this status |
-| `StatusIndexEntry(u32, u32)` | `BytesN<32>` | Invoice ID by status + index |
+| `StatusIndexCount(u32)` | `u32` | Number of live slots in this status index |
+| `StatusIndexEntry(u32, u32)` | `BytesN<32>` | Invoice ID by status + slot |
+| `StatusPosition(InvoiceStatus, BytesN<32>)` | `u32` | O(1) slot of an invoice in its status index; presence is membership |
 | `StatusCount(u32)` | `u64` | Count of invoices in each status |
+| `StatusMigrationCursor(InvoiceStatus)` | `u32` | Temporary source cursor for `migrate_status_index` |
+| `StatusMigrationKept(InvoiceStatus)` | `u32` | Temporary live-member counter for `migrate_status_index` |
+| `StatusMembership(InvoiceStatus, u64)` | `bool` | **Legacy only.** Pre-upgrade short-id marker; read fallback, never written by new code |
 
-#### Indexing Notes
+#### Status Index Notes
 
-- Three index families (`IssuerIndex`, `BuyerIndex`, `StatusIndex`) each
-  maintain a count key and an ordered list of entries.
-- Index entries are appended — no compaction on status transitions (entries
-  are added to the new status but not removed from the old).
-- `get_by_status()`, `get_by_issuer()`, and `get_by_buyer()` are paginated
-  (`page`, `page_size`, capped at `MAX_PAGE_SIZE`). Each call reads at most
-  `page_size` index entries, so cost is bounded regardless of index size.
-- `get_by_status()` still filters each page to entries whose current
-  `invoice.status` matches (to handle stale index entries), so a page may
-  contain fewer than `page_size` results.
+- The status index is a **bounded membership index**, not an append-only
+  history. `StatusPosition` maps `(status, full invoice id)` to the exact
+  `StatusIndexEntry` slot in O(1).
+- Entering a status appends one slot and writes its position. Leaving a
+  status swap-and-pops: the last slot fills the vacated slot, the moved
+  invoice's position is rewritten, and the departing position is deleted.
+  Both operations are O(1) and never scan the status's invoice history.
+- `StatusIndexCount` (slots) always equals the number of current members for
+  post-upgrade data. Storage is therefore bounded by live members, not by the
+  number of historical transitions.
+- `get_by_status()` reads only the requested page of member slots and
+  hydrates at most `page_size` invoices. The page is still filtered to the
+  invoice's current status so un-migrated legacy rows cannot leak stale
+  results; such a page can be short until migration completes.
+- Ordering follows the compacted slot array: insertion order is preserved
+  until a member leaves, at which point the previous last member moves into
+  the vacated slot (swap-and-pop, as covered by
+  `test_move_status_index_compacts_storage`).
+- `get_by_issuer()` and `get_by_buyer()` remain append-only, paginated index
+  families and are unaffected by this change.
+
+#### Status Index Migration (upgrade note)
+
+The old shape appended `StatusIndexEntry` rows and never reclaimed them, and
+had no position map. Existing deployments should upgrade as follows:
+
+1. Optionally `pause()` the contract while migrating so paginated reads do not
+   observe a half-compacted status.
+2. For each status, call
+   `migrate_status_index(status, page_size)` repeatedly until it returns
+   `done = true`. Each call scans at most `page_size` (≤ `MAX_PAGE_SIZE`)
+   source slots, keeps only invoices whose current status matches, rewrites
+   them into the compact prefix, writes their `StatusPosition`, and on the last
+   page deletes stale trailing slots, sets `StatusIndexCount` /
+   `StatusCount` to the live count, and clears the temporary migration keys.
+3. `unpause()` and resume. The function requires admin authorization and is
+   idempotent if re-run after completion.
+
+No migration is required for correctness before then: a pre-upgrade invoice
+without a position is located once by a compatibility scan on its next
+transition and seeded in the map. Calling `migrate_status_index` removes that
+one-time scan and any stale historical rows.
+
+**ABI change:** `migrate_status_index(status: InvoiceStatus, page_size: u32)
+-> (u32, bool)` is a new admin-authenticated entry point. Existing read
+signatures (`get_by_status(status, page, page_size)`) and their result shape
+are unchanged; only ordering under a departure follows the already-documented
+swap-and-pop compaction.
 
 ### Storage Key Count
 
-**Approximately 5 + (7 × number_of_invoices)** keys per active invoice:
+**Approximately 6 + (7 × number_of_invoices)** keys per active invoice:
 - 5 instance keys
 - 1 invoice entry
 - 1 issuer index entry (+1 for count if first)
 - 1 buyer index entry (+1 for count if first)
-- 1 status index entry (+1 for each status transition)
+- 1 status index entry
+- 1 status position (removed when the invoice leaves that status)
+
+Transitions reuse the single status slot/position rather than adding a row per
+historical status, so key count stays bounded over the invoice lifecycle.
 
 ---
 
