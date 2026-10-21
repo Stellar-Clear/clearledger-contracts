@@ -575,7 +575,7 @@ Emitted when locked funds are released back to the pool (on repayment).
 | `topic[0]` | `Symbol` | `"released_to_pool"` |
 | `topic[1]` | `BytesN<32>` | Invoice ID |
 | `topic[2]` | `Address` | Pool contract address |
-| **Data** | `u128` | Released amount (repayment amount) |
+| **Data** | `(u128, u128)` | `(released_amount, remaining_escrow_amount)` |
 
 **Emitted by:** `release_to_pool()` in `contracts/escrow/src/lib.rs:243`
 

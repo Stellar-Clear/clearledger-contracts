@@ -27,14 +27,20 @@ pub fn released_to_issuer(env: &Env, invoice_id: &BytesN<32>, issuer: &Address, 
     );
 }
 
-pub fn released_to_pool(env: &Env, invoice_id: &BytesN<32>, pool: &Address, amount: u128) {
+pub fn released_to_pool(
+    env: &Env,
+    invoice_id: &BytesN<32>,
+    pool: &Address,
+    amount: u128,
+    remaining: u128,
+) {
     env.events().publish(
         (
             Symbol::new(env, "released_to_pool"),
             invoice_id.clone(),
             pool.clone(),
         ),
-        amount,
+        (amount, remaining),
     );
 }
 
