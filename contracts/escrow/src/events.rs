@@ -64,6 +64,21 @@ pub fn ownership_transferred(env: &Env, old_admin: &Address, new_admin: &Address
     );
 }
 
+/// Emitted whenever on-chain escrow history is pruned, either automatically
+/// while appending or explicitly via `compact_history`.
+///
+/// `retained` is the number of events still stored on-chain after the prune and
+/// `removed` is the number dropped from storage in this operation. Pruned
+/// entries remain reconstructible from the contract's per-action events
+/// (`funds_locked`, `released_to_issuer`, `released_to_pool`,
+/// `default_resolved`) by indexers that ingested them.
+pub fn history_compacted(env: &Env, invoice_id: &BytesN<32>, retained: u32, removed: u32) {
+    env.events().publish(
+        (Symbol::new(env, "history_compacted"), invoice_id.clone()),
+        (retained, removed),
+    );
+}
+
 /// Emitted by `pause` when the emergency circuit breaker is engaged. `admin` is
 /// the address that authorized the pause, indexed so indexers can track who
 /// flipped the breaker.

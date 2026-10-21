@@ -1,8 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 use clearledger_pause::{require_not_paused, set_paused};
+use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 
+mod bench;
 mod constants;
 mod errors;
 mod events;
@@ -123,12 +124,45 @@ impl RegistryContract {
         true
     }
 
-    // Returns the list of addresses that were skipped (already registered) so
-    // the caller knows exactly which entries were not processed (#66).
-    //
-    // Only freshly created profiles are appended to the issuer enumeration
-    // index; entries skipped as already-registered are never indexed twice
-    // (#841).
+    /// Batch-registers issuer profiles.
+    ///
+    /// Duplicate handling is deterministic and per-entry:
+    /// * An address that already has a profile (from `register_issuer` or an
+    ///   earlier batch) is **skipped**, not reverted, and returned in the
+    ///   skipped list. Its existing profile and metadata are left untouched.
+    /// * If the same address appears more than once in `entries`, the first
+    ///   occurrence is registered and every later occurrence is skipped. Thus
+    ///   `skipped` can contain the same address more than once.
+    /// * A failed validation is **not** skipped: invalid metadata rejects the
+    ///   whole batch. Metadata is validated for every entry up front, so no
+    ///   entry is persisted if any entry is invalid.
+    ///
+    /// There is no separate address syntax check on-chain: each entry is an
+    /// SDK `Address`, which is always structurally valid. Entries do not
+    /// require the registered address's auth; only the admin authorizes the
+    /// batch.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `entries` - A vector of `(Address, Map<String, String>)` pairs. Issuer
+    ///   metadata is validated but not stored by this path; new issuer
+    ///   profiles start with empty metadata.
+    ///
+    /// # Auth
+    /// * Requires `admin.require_auth()`.
+    ///
+    /// # Panics
+    /// * `RegistryError::BatchSizeExceeded` if `entries.len() > 50`.
+    /// * `RegistryError::NotInitialized` if the contract admin is not set.
+    /// * `RegistryError::InvalidMetadata` if any entry's metadata is invalid.
+    ///
+    /// # Returns
+    /// * `Vec<Address>` - Addresses skipped because they were already
+    ///   registered, including later occurrences of a within-batch duplicate.
+    ///
+    /// Only freshly created profiles are appended to the issuer enumeration
+    /// index; entries skipped as already-registered are never indexed twice
+    /// (#841).
     pub fn batch_register_issuers(
         env: Env,
         entries: Vec<(Address, Map<String, String>)>,
@@ -185,6 +219,15 @@ impl RegistryContract {
     /// creates `Role::Buyer` profiles. The admin must be authorized and the
     /// batch size must not exceed 50 entries.
     ///
+    /// Duplicate handling matches the issuer path: an already-registered
+    /// address is skipped and returned, the first occurrence of a within-batch
+    /// duplicate is registered while later occurrences are skipped, and
+    /// invalid metadata rejects the entire call rather than skipping the
+    /// offending entry. Buyer metadata is validated and, for newly registered
+    /// addresses, stored on the profile. As with issuers, an `Address` is
+    /// always structurally valid on-chain and only the admin authorizes the
+    /// batch.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `entries` - A vector of `(Address, Map<String, String>)` pairs, each
@@ -197,6 +240,7 @@ impl RegistryContract {
     /// # Panics
     /// * `RegistryError::BatchSizeExceeded` if `entries.len() > 50`.
     /// * `RegistryError::NotInitialized` if the contract admin is not set.
+    /// * `RegistryError::InvalidMetadata` if any entry's metadata is invalid.
     ///
     /// # Returns
     /// * `Vec<Address>` - The list of addresses that were skipped (already
@@ -544,6 +588,12 @@ impl RegistryContract {
     /// page comes back shorter than `limit` enumerates every registered
     /// address for `role` exactly once.
     ///
+    /// Prefer [`list_profiles_page`](Self::list_profiles_page) when
+    /// registrations may be appended while a caller is paging: its cursor
+    /// resumes from an absolute index slot, so appends cannot shift entries
+    /// across page boundaries. This offset-based view remains available for
+    /// callers that already track `start` themselves.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `role` - The role to enumerate (`Role::Issuer` or `Role::Buyer`).
@@ -609,6 +659,121 @@ impl RegistryContract {
         addresses
     }
 
+    /// Returns a cursor-paginated page of registered addresses for `role`.
+    ///
+    /// This is the cursor-based companion to
+    /// [`list_profiles`](Self::list_profiles). Instead of a caller-supplied
+    /// offset, each call returns an opaque `next_cursor` that resumes exactly
+    /// after the last index slot examined by the previous call. Because the
+    /// role's enumeration index is append-only (registrations only ever append
+    /// new slots; there is no deregistration path), appending registrations
+    /// between two page reads cannot shift, duplicate, or omit the entries
+    /// already covered by the cursor.
+    ///
+    /// Walking the list is a simple loop: start with `cursor = None`, then pass
+    /// the returned [`ProfilePage::next_cursor`] until it is `None`. Every
+    /// indexed address for `role` is returned exactly once, in registration
+    /// order. A cursor obtained for one role is only meaningful for that role.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `role` - The role to enumerate (`Role::Issuer` or `Role::Buyer`).
+    /// * `cursor` - `None` to start at the beginning, or the `next_cursor`
+    ///   from the previous page. A cursor equal to `get_profile_count(role)` is
+    ///   valid and yields an empty final page; larger cursors are rejected.
+    /// * `limit` - Maximum number of index slots to examine. Must be in
+    ///   `1..=MAX_LIST_LIMIT` (50).
+    ///
+    /// # Auth
+    /// * No `require_auth()` call is made — this is a read-only view.
+    ///
+    /// # Panics
+    /// * `RegistryError::InvalidPageSize` if `limit == 0`.
+    /// * `RegistryError::PageSizeExceeded` if `limit > MAX_LIST_LIMIT`.
+    /// * `RegistryError::InvalidCursor` if `cursor` is greater than the
+    ///   current profile count for `role`.
+    ///
+    /// # Returns
+    /// * `ProfilePage` - Up to `limit` addresses in registration order plus the
+    ///   cursor for the next page, or `None` when the end of the index was
+    ///   reached.
+    ///
+    /// # Cost
+    /// Bounded by `limit`: at most `limit` index reads plus TTL extensions and
+    /// one counter read, never the whole index. An index slot that has aged out
+    /// is skipped, so a page can contain fewer than `limit` items while its
+    /// cursor still advances past the gap.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut cursor = None;
+    /// loop {
+    ///     let page = client.list_profiles_page(&Role::Issuer, &cursor, &25);
+    ///     // ... process page.items ...
+    ///     match page.next_cursor {
+    ///         Some(next) => cursor = Some(next),
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn list_profiles_page(
+        env: Env,
+        role: Role,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> ProfilePage {
+        if limit == 0 {
+            panic_with_error!(&env, RegistryError::InvalidPageSize);
+        }
+        if limit > MAX_LIST_LIMIT {
+            panic_with_error!(&env, RegistryError::PageSizeExceeded);
+        }
+
+        let count_key = DataKey::ProfileCount(role.clone());
+        let count: u32 = match env.storage().persistent().get::<_, u32>(&count_key) {
+            Some(count) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                count
+            }
+            None => 0,
+        };
+
+        let start = match cursor {
+            Some(position) => {
+                if position > count {
+                    panic_with_error!(&env, RegistryError::InvalidCursor);
+                }
+                position
+            }
+            None => 0,
+        };
+
+        // Bound the scan to `limit` slots and clamp it to the indexed range.
+        // `saturating_add` keeps a cursor near `u32::MAX` from overflowing.
+        let end = start.saturating_add(limit).min(count);
+
+        let mut items: Vec<Address> = Vec::new(&env);
+        let mut index = start;
+        while index < end {
+            let index_key = DataKey::ProfileIndex(role.clone(), index);
+            // A slot can be missing if its entry aged out while the profile
+            // itself survived. Skip the gap rather than failing the page; the
+            // cursor still advances past it.
+            if let Some(address) = env.storage().persistent().get::<_, Address>(&index_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&index_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                items.push_back(address);
+            }
+            index += 1;
+        }
+
+        let next_cursor = if end < count { Some(end) } else { None };
+        ProfilePage { items, next_cursor }
+    }
+
     /// Revokes a registered profile by setting its verification status to `false`.
     ///
     /// This function is idempotent: calling it on an already-revoked profile
@@ -634,6 +799,37 @@ impl RegistryContract {
     /// let result = client.revoke(&issuer);
     /// ```
     pub fn revoke(env: Env, address: Address) -> bool {
+        Self::revoke_with_reason(env, address, RevocationReason::Unspecified)
+    }
+
+    /// Revokes a registered profile and records a machine-readable reason.
+    ///
+    /// This is the reason-aware variant of [`revoke`](Self::revoke). The
+    /// reason is emitted in the `address_revoked` event data as its stable
+    /// `u32` discriminant. Behaviour, auth and idempotency are otherwise
+    /// identical: an already-unverified profile returns `true` without
+    /// re-emitting the event.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `address` - The address of the profile to revoke.
+    /// * `reason` - Bounded [`RevocationReason`] supplied by the admin.
+    ///
+    /// # Auth
+    /// * Requires admin authorization (the stored admin from `DataKey::Admin`).
+    ///
+    /// # Returns
+    /// * `true` if the profile is now in revoked state (including if it was
+    ///   already revoked).
+    ///
+    /// # Panics
+    /// * `NotFound` if the address is not registered.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = client.revoke_with_reason(&issuer, &RevocationReason::Fraud);
+    /// ```
+    pub fn revoke_with_reason(env: Env, address: Address, reason: RevocationReason) -> bool {
         require_not_paused(&env);
         let admin = Self::require_admin(&env);
         admin.require_auth();
@@ -648,11 +844,12 @@ impl RegistryContract {
         }
         profile.set_verified(false);
         profile.set_revoked(true);
+        let role = profile.role();
         env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::address_revoked(&env, &address);
+        events::address_revoked(&env, &address, &role, &reason);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -697,11 +894,12 @@ impl RegistryContract {
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotFound));
         profile.set_verified(true);
         profile.set_revoked(false);
+        let role = profile.role();
         env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::address_reinstated(&env, &address);
+        events::address_reinstated(&env, &address, &role);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -722,11 +920,12 @@ impl RegistryContract {
         } else {
             profile.set_revoked(true);
         }
+        let role = profile.role();
         env.storage().persistent().set(&key, &profile);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::profile_verified(&env, &address, verify);
+        events::profile_verified(&env, &address, verify, &role);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -744,9 +943,13 @@ impl RegistryContract {
     ///
     /// # Panics
     /// * `RegistryError::NotInitialized` if the contract has not been initialized.
+    /// * `RegistryError::InvalidAddress` if `new_admin` is this registry
+    ///   contract, which cannot be a valid external controller. Validation
+    ///   runs before the admin slot is written.
     pub fn transfer_ownership(env: Env, new_admin: Address) {
         require_not_paused(&env);
         let admin = Self::require_admin(&env);
+        Self::assert_valid_new_admin(&env, &new_admin);
         admin.require_auth();
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -776,6 +979,8 @@ impl RegistryContract {
     /// # Panics
     /// * `RegistryError::NotInitialized` if the contract has not been
     ///   initialized.
+    /// * `RegistryError::InvalidAddress` if `new_admin` is this registry
+    ///   contract. Validation runs before the admin slot is written.
     ///
     /// # Returns
     /// * `()` - No value is returned.
@@ -787,6 +992,7 @@ impl RegistryContract {
     pub fn transfer_admin(env: Env, new_admin: Address) {
         require_not_paused(&env);
         let admin = Self::require_admin(&env);
+        Self::assert_valid_new_admin(&env, &new_admin);
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         events::admin_transferred(&env, &admin, &new_admin);
@@ -889,6 +1095,13 @@ impl RegistryContract {
 }
 
 impl RegistryContract {
+    /// Rejects an admin transfer to the contract's own address.
+    fn assert_valid_new_admin(env: &Env, new_admin: &Address) {
+        if new_admin == &env.current_contract_address() {
+            panic_with_error!(env, RegistryError::InvalidAddress);
+        }
+    }
+
     fn require_admin(env: &Env) -> Address {
         env.storage()
             .instance()

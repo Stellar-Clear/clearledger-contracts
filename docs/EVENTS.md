@@ -1,10 +1,21 @@
 # Event Catalog
 
+See [public reads and storage cost expectations](READ_METHODS.md) for RPC
+pagination guidance; event-driven indexing can avoid repeated full-history reads.
+
 This document lists every event emitted by the ClearLedger smart contracts. Events are published via `env.events().publish(topics, data)` and are indexed by the Go indexer for off-chain consumption.
 
 All amounts are in **USDC stroops** (1 USDC = 10,000,000 stroops).  
 All timestamps are **Unix seconds** (u64).  
 Invoice IDs are **BytesN<32>** (32-byte identifiers).
+
+Events are public ledger data. Addresses, amounts, identifiers, and any other
+published fields are visible to network observers; downstream indexers may
+retain them independently of contract-storage TTL. Do not place confidential
+information in event fields. An event records the contract call's reported
+state change, not a guarantee of financing, repayment, or returns. See the
+[caller-controlled storage audit](STORAGE.md#caller-controlled-persistent-data-audit)
+for storage retention, bounds, and trust boundaries.
 
 ---
 
@@ -40,9 +51,22 @@ Emitted when an invoice is listed for financing.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"invoice_listed"` |
 | `topic[1]` | `BytesN<32>` | Invoice ID |
-| **Data** | `u32` | Discount in basis points (1 bp = 0.01%) |
+| **Data** | `(u32, u64)` | `(discount_bps, expires_at)` — discount in basis points (1 bp = 0.01%) and the effective listing expiry deadline in Unix seconds |
 
-**Emitted by:** `list_for_financing()` in `contracts/invoice/src/lib.rs:335`
+`expires_at` is computed as `listed_at + expiry_window`, where `expiry_window`
+is the window configured at listing time (default `604800`, i.e. 7 days). It is
+the deadline used by `expire_listing()` to decide when the listing may be
+expired.
+
+> **Data shape change:** topics are unchanged, but the data payload changed
+> from a bare `u32` discount to the `(u32, u64)` tuple above. Indexers that
+> decoded the old `u32` payload must be updated. The window is read when the
+> invoice is listed; an admin change to `set_expiry_window` after listing
+> affects the deadline subsequently enforced by `expire_listing()`, so treat
+> `expires_at` as the deadline announced at listing time.
+
+**Emitted by:** `list_for_financing()` in `contracts/invoice/src/lib.rs` and
+`batch_list_for_financing()` per successfully listed entry
 
 ---
 
@@ -412,17 +436,34 @@ Emitted when the pool handles a defaulted invoice.
 
 Emitted when the admin changes the protocol fee and/or the treasury address. The
 old value is included so an indexer can report what changed rather than only
-what it changed to. A rejected call (fee above `MAX_PROTOCOL_FEE_BPS`) emits
-nothing.
+what it changed to. The authorizing admin is included in event data. A rejected
+call (fee above `MAX_PROTOCOL_FEE_BPS`) emits nothing. Existing topics are
+unchanged; indexers should decode the expanded data tuple.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"protocol_fee_updated"` |
-| **Data** | `(u32, u32, Address)` | `(old_fee_bps, new_fee_bps, treasury)` |
+| **Data** | `(Address, u32, u32, Address)` | `(admin, old_fee_bps, new_fee_bps, treasury)` |
 
-**Emitted by:** `set_protocol_fee()` in `contracts/pool/src/lib.rs:1525`  
+**Emitted by:** `set_protocol_fee()` in `contracts/pool/src/lib.rs`
 **Source:** `contracts/pool/src/events.rs:72`
+
+---
+
+### `max_utilization_updated`
+
+Emitted when the admin changes the pool's maximum utilization. Existing topics
+are unchanged; the authorizing admin is included in the expanded data tuple.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Topics** | | |
+| `topic[0]` | `Symbol` | `"max_utilization_updated"` |
+| **Data** | `(Address, u32, u32)` | `(admin, old_cap_bps, new_cap_bps)` |
+
+**Emitted by:** `set_max_utilization()` in `contracts/pool/src/lib.rs`
+**Source:** `contracts/pool/src/events.rs`
 
 ---
 
@@ -430,7 +471,8 @@ nothing.
 
 Emitted by the SEP-41 `approve()` whenever an LP's spending grant changes.
 `amount` is the new **total** grant (not a delta), and `amount == 0` is the
-revoke signal.
+revoke signal. See [SEP-41 LP Share Token: Design and Behavior](SEP41_DESIGN.md#allowance-expiry-semantics)
+for the ledger-based expiration rules and event-shape deviations.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -521,8 +563,12 @@ Emitted when locked funds are released to the issuer.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"released_to_issuer"` |
 | `topic[1]` | `BytesN<32>` | Invoice ID |
-| `topic[2]` | `Address` | Issuer address |
+| `topic[2]` | `Address` | Issuer recorded at lock time |
 | **Data** | `u128` | Released amount |
+
+`topic[2]` is always the issuer recorded in the escrow lock. A caller-supplied
+address that does not match it is rejected with `InvalidRecipient` before any
+transfer or event is emitted.
 
 **Emitted by:** `release_to_issuer()` in `contracts/escrow/src/lib.rs:184`
 
@@ -557,6 +603,24 @@ Emitted when default is resolved and funds returned to pool.
 | **Data** | `u128` | Returned amount |
 
 **Emitted by:** `handle_default()` in `contracts/escrow/src/lib.rs:311`
+
+---
+
+### `history_compacted`
+
+Emitted whenever escrow history is pruned, either automatically on append once
+the per-invoice cap is exceeded or explicitly via `compact_history`. Pruned
+entries are still recoverable by replaying the per-action escrow events, so
+indexers should ingest those events rather than relying on `get_history`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Topics** | | |
+| `topic[0]` | `Symbol` | `"history_compacted"` |
+| `topic[1]` | `BytesN<32>` | Invoice ID |
+| **Data** | `(u32, u32)` | `(retained, removed)` — events still stored, events removed |
+
+**Emitted by:** `append_history()` and `compact_history()` in `contracts/escrow/src/lib.rs`
 
 ---
 
@@ -610,6 +674,14 @@ Emitted when the escrow's admin-gated emergency circuit breaker is disengaged.
 
 **Contract:** `registry_contract`  
 **Source:** `contracts/registry/src/events.rs`
+
+Verification events (`profile_verified`, `address_revoked`, `address_reinstated`) index the profile's `Role` (`Issuer` or `Buyer`, from `contracts/registry/src/types.rs`) as `topic[2]`.
+
+Registry events publish addresses and status changes, but they do not carry
+profile metadata. That is not a confidentiality guarantee: metadata is public
+through `get_profile`, storage reads, and the transaction arguments of the
+register/update call. See [Registry Metadata Privacy and Data Minimization](METADATA_PRIVACY.md)
+for the public visibility, data-minimization, and deletion rules.
 
 ### `contract_initialized`
 
@@ -680,9 +752,40 @@ Emitted when an address is revoked (issuer or buyer).
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"address_revoked"` |
 | `topic[1]` | `Address` | Revoked address |
-| **Data** | `()` | None |
+| `topic[2]` | `Role` | Profile role (`Issuer` or `Buyer`) |
+| **Data** | `RevocationReason` (`u32`) | Machine-readable reason code (see below) |
 
-**Emitted by:** `revoke()` in `contracts/registry/src/lib.rs:498`
+**ABI note:** The profile `Role` is indexed as `topic[2]`, while the stable
+revocation reason is encoded in event data. Consumers using the first two
+topics remain compatible.
+
+**Emitted by:** `revoke()` (defaults to `Unspecified`) and
+`revoke_with_reason()` in `contracts/registry/src/lib.rs`.
+
+#### Revocation reason codes
+
+`RevocationReason` is a bounded `#[contracttype]` enum serialized as a
+`u32` in the event data. These discriminants are ABI-stable; new codes may be
+appended, but existing values are never renumbered.
+
+| Code | Variant | Meaning | Suggested display |
+|------|---------|---------|-------------------|
+| `0` | `Unspecified` | No reason supplied, including all legacy `revoke(address)` calls. | "Revoked" (neutral) |
+| `1` | `Compliance` | Regulatory or policy compliance action. | "Revoked: compliance" |
+| `2` | `Fraud` | Suspected or confirmed fraud. | "Revoked: fraud" (high severity) |
+| `3` | `Inactivity` | Account dormant under the operator's inactivity policy. | "Revoked: inactivity" |
+| `4` | `Other` | Any reason not covered above. | "Revoked: other" |
+
+Decoding guidance for off-chain indexers:
+
+- Read the event **data** as a `u32`; do not infer the reason from topics.
+- Preserve unknown codes as-is and display a generic "Revoked (reason code N)"
+  label so future appended codes degrade gracefully.
+- Treat `Fraud` and `Compliance` as high-severity labels; `Unspecified`,
+  `Inactivity` and `Other` should not be presented as fraud accusations.
+- `verify_profile(address, false)` does **not** emit this event (it emits
+  `profile_verified` with `false` and still marks the profile revoked), so it
+  carries no reason code.
 
 ---
 
@@ -695,9 +798,12 @@ Emitted when a previously revoked address is reinstated.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"address_reinstated"` |
 | `topic[1]` | `Address` | Reinstated address |
+| `topic[2]` | `Role` | Profile role (`Issuer` or `Buyer`) |
 | **Data** | `()` | None |
 
-**Emitted by:** `reinstate()` in `contracts/registry/src/lib.rs:546`
+**ABI note:** `Role` was added as an indexed `topic[2]`; `topic[0]`, `topic[1]` and the empty data payload are unchanged.
+
+**Emitted by:** `reinstate()` in `contracts/registry/src/lib.rs:689`
 
 ---
 
@@ -724,9 +830,12 @@ Emitted when a profile's verification status is checked/updated.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"profile_verified"` |
 | `topic[1]` | `Address` | Profile address |
+| `topic[2]` | `Role` | Profile role (`Issuer` or `Buyer`) |
 | **Data** | `bool` | Verification status (true = verified) |
 
-**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs:570`
+**ABI note:** `Role` was added as an indexed `topic[2]`; `topic[0]`, `topic[1]` and the `bool` data payload are unchanged. The authorizing admin planned in PR #165 should be appended after the role (for example, as `topic[3]`) rather than reordering the existing topics or changing the data payload, so both changes remain additive and merge cleanly.
+
+**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs:711`
 
 ---
 
@@ -842,6 +951,23 @@ Emitted when `register_existing_pool()` registers a pre-existing pool for an ass
 
 ---
 
+### `ownership_transferred`
+
+Emitted when factory admin ownership moves to a new admin. Asset registration
+authority moves with it, so indexers should key admin-gated calls off the most
+recent transfer.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Topics** | | |
+| `topic[0]` | `Symbol` | `"ownership_transferred"` |
+| `topic[1]` | `Address` | Previous admin address |
+| **Data** | `Address` | New admin address |
+
+**Emitted by:** `transfer_ownership()` in `contracts/pool_factory/src/lib.rs`
+
+---
+
 ## Cross-Reference: Duplicate Event Names
 
 Note that some event names appear in multiple contracts. When indexing, filter by contract address:
@@ -874,3 +1000,25 @@ Note that some event names appear in multiple contracts. When indexing, filter b
 - [THREAT_MODEL.md](./THREAT_MODEL.md) — trust assumptions and auth gates
 - [STORAGE.md](./STORAGE.md) — on-chain data layout and TTL patterns
 - [LIMITATIONS.md](./LIMITATIONS.md) — known gaps and testnet constraints
+
+## Golden XDR regression fixtures
+
+`tests/integration/fixtures/event-xdr.tsv` pins topics and data as hexadecimal
+serialized `ScVal` values for each emitter in invoice, registry, pool, escrow and
+pool_factory. `event_golden.rs` invokes the real emitter source in a contract
+context and compares both payloads byte for byte. The emitting contract ID is
+checked separately and is not part of the topics payload.
+
+Inputs are fixed in each case: contract StrKeys have distinct repeated-byte IDs,
+BytesN values have 32 repeated bytes, and u128 values exceed u64::MAX to exercise
+both halves. Addresses are synthetic test contracts, not deployed Mainnet assets.
+Amount fields remain raw contract integers; fixtures do not assume token decimals.
+A TSV row contains `contract.event`, topics XDR hex, then data XDR hex. `SCV_VEC`
+is tag 16, symbols are tag 15, u128 is tag 9, and void is tag 1. Decode with the
+Stellar XDR ScVal schema before interpreting event-specific fields.
+
+Run `cargo test -p clearledger-integration-tests --test event_golden`. Any schema
+change requires reviewing and updating the fixture and corresponding event docs;
+tests never regenerate expected bytes. These emitter-level tests complement
+workflow coverage: they do not prove that every entry point emits the right event
+or that every legacy schema is acceptable to all deployed network versions.

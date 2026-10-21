@@ -4,19 +4,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
-    xdr::ToXdr,
-    Address, Bytes, BytesN, Env, Map, String, Symbol, TryFromVal,
-};
 use clearledger_escrow::EscrowContractClient;
 use clearledger_invoice::InvoiceContractClient;
 use clearledger_pool::PoolContractClient;
 use clearledger_registry::{RegistryContract, RegistryContractClient};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    xdr::ToXdr,
+    Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Vec,
+};
 
 use crate::{
-    DataKey, PoolFactoryContract, PoolFactoryContractClient, DEFAULT_MIN_INITIAL_DEPOSIT,
-    DEFAULT_SHARE_DECIMALS, DEFAULT_SHARE_NAME, DEFAULT_SHARE_SYMBOL,
+    DataKey, PoolFactoryContract, PoolFactoryContractClient, PoolStats,
+    DEFAULT_MIN_INITIAL_DEPOSIT, DEFAULT_SHARE_DECIMALS, DEFAULT_SHARE_NAME, DEFAULT_SHARE_SYMBOL,
+    MAX_AGGREGATE_STATS_PAGE_LIMIT, MAX_ASSET_PAGE_LIMIT,
 };
 
 /// Everything a test needs to drive the factory, already wired together: an
@@ -82,6 +83,26 @@ fn setup() -> TestEnv {
         registry_id,
         pool_wasm_hash,
     }
+}
+
+#[test]
+fn test_initialize_rejects_untrusted_admin_signer() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let factory = PoolFactoryContractClient::new(&env, &factory_id);
+    let admin = Address::generate(&env);
+    let untrusted = Address::generate(&env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &factory_id,
+            fn_name: "initialize",
+            args: (admin.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(factory.try_initialize(&admin).is_err());
 }
 
 /// Deploys and initializes an escrow contract for `asset`.
@@ -381,6 +402,27 @@ fn test_register_asset_without_admin_auth_panics() {
 }
 
 #[test]
+fn test_register_existing_pool_rejects_untrusted_admin_signer() {
+    let te = setup();
+    let pool_address = Address::generate(&te.env);
+    let untrusted = Address::generate(&te.env);
+
+    te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &untrusted,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &te.factory_id,
+            fn_name: "register_existing_pool",
+            args: (te.asset.clone(), pool_address.clone()).into_val(&te.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(te
+        .factory
+        .try_register_existing_pool(&te.asset, &pool_address)
+        .is_err());
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_register_asset_duplicate_panics() {
     let te = setup();
@@ -388,6 +430,38 @@ fn test_register_asset_duplicate_panics() {
     // Re-registering would silently repoint the asset at a second instance and
     // orphan the first one, so the second call is rejected.
     register_asset(&te, &te.asset.clone());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_register_asset_rejects_admin_as_asset_with_typed_error() {
+    let te = setup();
+    te.factory.register_asset(
+        &te.admin,
+        &te.pool_wasm_hash,
+        &te.invoice_id,
+        &te.escrow_id,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_register_asset_rejects_colliding_contracts_with_typed_error() {
+    let te = setup();
+    te.factory.register_asset(
+        &te.asset,
+        &te.pool_wasm_hash,
+        &te.invoice_id,
+        &te.invoice_id,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_register_existing_pool_rejects_admin_as_asset_with_typed_error() {
+    let te = setup();
+    let pool_address = new_initialized_pool(&te, &te.asset);
+    te.factory.register_existing_pool(&te.admin, &pool_address);
 }
 
 #[test]
@@ -632,6 +706,287 @@ fn test_list_assets_multiple() {
     assert_eq!(assets.get(2), Some(asset3));
 }
 
+// ---------------- Aggregate stats pagination ----------------
+
+/// Seeds the asset index and pool mapping exactly as repeated registrations
+/// would, without paying for a pool deploy/initialize per order-sensitive
+/// pagination test. Each asset gets its own mock stats pool so the returned
+/// pair order is observable.
+fn seed_aggregate_assets(
+    env: &Env,
+    factory_id: &Address,
+    assets: &[Address],
+) -> Vec<Address> {
+    // A max-size page makes up to `MAX_AGGREGATE_STATS_PAGE_LIMIT` real
+    // cross-contract calls, which can cross the default test-host budget.
+    env.budget().reset_unlimited();
+    let mut pools = Vec::new(env);
+    for _ in assets {
+        pools.push_back(env.register_contract(None, MockStatsPool));
+    }
+    env.as_contract(factory_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCount, &(assets.len() as u32));
+        for (index, asset) in assets.iter().enumerate() {
+            let pool = pools.get(index as u32).unwrap();
+            env.storage()
+                .instance()
+                .set(&DataKey::AssetIndex(index as u32), asset);
+            env.storage()
+                .instance()
+                .set(&DataKey::PoolForAsset(asset.clone()), &pool);
+        }
+    });
+    pools
+}
+
+/// Appends one asset and its pool mapping the way `record_pool` does, returning
+/// the new mock pool address.
+fn append_aggregate_asset(env: &Env, factory_id: &Address, asset: &Address) -> Address {
+    let pool = env.register_contract(None, MockStatsPool);
+    env.as_contract(factory_id, || {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCount, &(count + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetIndex(count), asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolForAsset(asset.clone()), &pool);
+    });
+    pool
+}
+
+/// Walks every aggregate-stats page from cursor 0 and concatenates the items.
+fn walk_aggregate_stats(
+    env: &Env,
+    client: &PoolFactoryContractClient<'_>,
+    limit: u32,
+) -> Vec<(Address, PoolStats)> {
+    let mut cursor = 0u32;
+    let mut items = Vec::new(env);
+    loop {
+        let page = client.get_aggregate_stats_page(&cursor, &limit);
+        let mut index = 0;
+        while index < page.items.len() {
+            items.push_back(page.items.get(index).unwrap());
+            index += 1;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    items
+}
+
+#[test]
+fn test_get_aggregate_stats_page_empty() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let page = client.get_aggregate_stats_page(&0, &10);
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_aggregate_stats_page_first_page() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let page = client.get_aggregate_stats_page(&0, &2);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap().0, pools.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap().0, pools.get(1).unwrap());
+    assert_eq!(page.next_cursor, Some(2));
+}
+
+#[test]
+fn test_get_aggregate_stats_page_multi_page_walk_has_no_gaps_or_duplicates() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let walked = walk_aggregate_stats(&env, &client, 2);
+
+    assert_eq!(walked.len(), 5);
+    for (index, pool) in pools.iter().enumerate() {
+        assert_eq!(walked.get(index as u32).unwrap().0, pool);
+    }
+}
+
+#[test]
+fn test_get_aggregate_stats_page_exact_and_max_limit() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    // An exact multiple of the page size ends on a full page whose
+    // `next_cursor` is already `None` rather than an extra empty page.
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let first = client.get_aggregate_stats_page(&0, &2);
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.next_cursor, Some(2));
+
+    let last = client.get_aggregate_stats_page(&2, &2);
+    assert_eq!(last.items.len(), 2);
+    assert!(last.next_cursor.is_none());
+
+    // A full max-size request is accepted and bounded by the constant.
+    let max_assets: std::vec::Vec<Address> = (0..MAX_AGGREGATE_STATS_PAGE_LIMIT)
+        .map(|_| Address::generate(&env))
+        .collect();
+    seed_aggregate_assets(&env, &factory_id, &max_assets);
+
+    let page = client.get_aggregate_stats_page(&0, &MAX_AGGREGATE_STATS_PAGE_LIMIT);
+    assert_eq!(page.items.len(), MAX_AGGREGATE_STATS_PAGE_LIMIT);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_get_aggregate_stats_page_zero_limit_panics() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    client.get_aggregate_stats_page(&0, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_get_aggregate_stats_page_limit_above_max_panics() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    client.get_aggregate_stats_page(&0, &(MAX_AGGREGATE_STATS_PAGE_LIMIT + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_get_aggregate_stats_page_cursor_past_end_panics() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [Address::generate(&env), Address::generate(&env)];
+    seed_aggregate_assets(&env, &factory_id, &assets);
+
+    client.get_aggregate_stats_page(&3, &2);
+}
+
+#[test]
+fn test_get_aggregate_stats_page_cursor_at_end_is_empty() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [Address::generate(&env), Address::generate(&env)];
+    seed_aggregate_assets(&env, &factory_id, &assets);
+
+    // `cursor == count` is a valid, empty final page rather than an error.
+    let page = client.get_aggregate_stats_page(&2, &2);
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_aggregate_stats_page_append_between_pages() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    let first = client.get_aggregate_stats_page(&0, &2);
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items.get(0).unwrap().0, pools.get(0).unwrap());
+    assert_eq!(first.items.get(1).unwrap().0, pools.get(1).unwrap());
+    assert_eq!(first.next_cursor, Some(2));
+
+    // Registration between reads appends at the end: the already-read items
+    // keep their cursors and the new asset appears on the next page.
+    let appended_asset = Address::generate(&env);
+    let appended_pool = append_aggregate_asset(&env, &factory_id, &appended_asset);
+
+    let second = client.get_aggregate_stats_page(&2, &2);
+    assert_eq!(second.items.len(), 2);
+    assert_eq!(second.items.get(0).unwrap().0, pools.get(2).unwrap());
+    assert_eq!(second.items.get(1).unwrap().0, appended_pool);
+    assert!(second.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_aggregate_stats_page_cursor_advances_past_skipped_pools() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let pools = seed_aggregate_assets(&env, &factory_id, &assets);
+
+    // Model a corrupt/legacy mapping for the middle asset: its pool call
+    // fails, so it is skipped without stalling the walk.
+    let broken_asset = assets[1].clone();
+    let broken_pool = Address::generate(&env);
+    env.as_contract(&factory_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolForAsset(broken_asset), &broken_pool);
+    });
+
+    let page = client.get_aggregate_stats_page(&0, &3);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap().0, pools.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap().0, pools.get(2).unwrap());
+    assert!(page.next_cursor.is_none());
+}
+
 // --------------- Mock Token for Integration Tests ---------------
 
 use soroban_sdk::{contract, contractimpl, contracttype};
@@ -654,6 +1009,29 @@ impl MockToken {
 
     pub fn balance(env: Env, addr: Address) -> i128 {
         env.storage().persistent().get(&TKey(addr)).unwrap_or(0)
+    }
+}
+
+/// Minimal pool stand-in whose only job is to answer the factory's aggregate
+/// `get_stats` cross-contract call, so pagination tests can observe item order
+/// without deploying and initializing a real pool per asset.
+#[contract]
+pub struct MockStatsPool;
+
+#[contractimpl]
+impl MockStatsPool {
+    pub fn get_stats(_env: Env) -> PoolStats {
+        PoolStats {
+            total_deposits: 1,
+            total_funded: 2,
+            available_liquidity: 3,
+            utilization_rate_bps: 4,
+            total_yield_distributed: 5,
+            total_loss_realised: 6,
+            active_invoice_count: 7,
+            total_shares: 8,
+            max_utilization_bps: 9,
+        }
     }
 }
 
@@ -700,15 +1078,13 @@ fn attest_invoice(env: &Env, invoice: &InvoiceContractClient, invoice_id: &Bytes
     invoice.set_agent_registry_contract(&agent_registry_id);
 
     let payload = clearledger_invoice::AttestationPayload {
-        domain_separator: BytesN::from_array(
-            env,
-            &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-        ),
+        domain_separator: invoice.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -941,6 +1317,254 @@ fn test_pool_instances_do_not_cross_contaminate() {
     assert_eq!(stats2.total_shares, 30_000_000);
 }
 
+/// Proves that two factory-deployed pools for different assets keep deposits,
+/// shares and token custody fully separate, including across a withdrawal.
+#[test]
+fn test_two_asset_pools_isolate_deposits_shares_and_balances() {
+    let te = setup();
+    let asset_a = te.env.register_contract(None, MockToken);
+    let asset_b = te.env.register_contract(None, MockToken);
+
+    let pool_a_address = register_asset(&te, &asset_a);
+    let pool_b_address = register_asset(&te, &asset_b);
+
+    // Factory lookups are asset-scoped: each asset resolves to exactly its own
+    // instance, and an address with no registration resolves to nothing.
+    assert_eq!(
+        te.factory.get_pool_for_asset(&asset_a),
+        Some(pool_a_address.clone())
+    );
+    assert_eq!(
+        te.factory.get_pool_for_asset(&asset_b),
+        Some(pool_b_address.clone())
+    );
+    assert_ne!(pool_a_address, pool_b_address);
+    assert_eq!(
+        te.factory.get_pool_for_asset(&Address::generate(&te.env)),
+        None
+    );
+    let listed = te.factory.list_assets();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.get(0), Some(asset_a.clone()));
+    assert_eq!(listed.get(1), Some(asset_b.clone()));
+
+    let pool_a = PoolContractClient::new(&te.env, &pool_a_address);
+    let pool_b = PoolContractClient::new(&te.env, &pool_b_address);
+    assert_eq!(pool_a.get_funding_asset(), asset_a);
+    assert_eq!(pool_b.get_funding_asset(), asset_b);
+
+    let lp_a = Address::generate(&te.env);
+    let lp_b = Address::generate(&te.env);
+    let token_a = MockTokenClient::new(&te.env, &asset_a);
+    let token_b = MockTokenClient::new(&te.env, &asset_b);
+
+    // Seed each LP with only the token of the pool it deposits into. If either
+    // pool reached across assets, the deposit would fail against the token it
+    // does not hold.
+    te.env.as_contract(&asset_a, || {
+        te.env
+            .storage()
+            .persistent()
+            .set(&TKey(lp_a.clone()), &100_000_000_000i128);
+    });
+    te.env.as_contract(&asset_b, || {
+        te.env
+            .storage()
+            .persistent()
+            .set(&TKey(lp_b.clone()), &100_000_000_000i128);
+    });
+
+    pool_a.deposit(&lp_a, &2_000_000_000);
+    pool_b.deposit(&lp_b, &4_000_000_000);
+
+    let stats_a = pool_a.get_stats();
+    let stats_b = pool_b.get_stats();
+    assert_eq!(stats_a.total_deposits, 2_000_000_000);
+    assert_eq!(stats_a.total_shares, 2_000_000_000);
+    assert_eq!(stats_b.total_deposits, 4_000_000_000);
+    assert_eq!(stats_b.total_shares, 4_000_000_000);
+    assert_eq!(stats_a.total_funded, 0);
+    assert_eq!(stats_b.total_funded, 0);
+    assert_eq!(stats_a.utilization_rate_bps, 0);
+    assert_eq!(stats_b.utilization_rate_bps, 0);
+
+    // Token custody is per-instance as well.
+    assert_eq!(token_a.balance(&pool_a_address), 2_000_000_000);
+    assert_eq!(token_a.balance(&pool_b_address), 0);
+    assert_eq!(token_b.balance(&pool_b_address), 4_000_000_000);
+    assert_eq!(token_b.balance(&pool_a_address), 0);
+
+    // Withdrawing from pool A must not burn shares or release tokens from B.
+    pool_a.withdraw(&lp_a, &1_000_000_000);
+    let stats_a_after = pool_a.get_stats();
+    let stats_b_after = pool_b.get_stats();
+    assert_eq!(stats_a_after.total_deposits, 1_000_000_000);
+    assert_eq!(stats_a_after.total_shares, 1_000_000_000);
+    assert_eq!(stats_b_after.total_deposits, 4_000_000_000);
+    assert_eq!(stats_b_after.total_shares, 4_000_000_000);
+    assert_eq!(token_a.balance(&pool_a_address), 1_000_000_000);
+    assert_eq!(token_b.balance(&pool_b_address), 4_000_000_000);
+}
+
+/// Proves that invoice eligibility, funded totals and utilization are scoped to
+/// the asset a pool was deployed for: an invoice in asset A cannot be funded by
+/// pool B, and funding one pool leaves the other's counters untouched.
+#[test]
+fn test_two_asset_pools_isolate_funding_utilization_and_invoice_eligibility() {
+    let te = setup();
+    te.env.budget().reset_unlimited();
+
+    let asset_a = te.env.register_contract(None, MockToken);
+    let asset_b = te.env.register_contract(None, MockToken);
+    let invoice = InvoiceContractClient::new(&te.env, &te.invoice_id);
+    invoice.add_supported_asset(&asset_a);
+    invoice.add_supported_asset(&asset_b);
+
+    let pool_a_address = register_asset(&te, &asset_a);
+    let pool_b_address = register_asset(&te, &asset_b);
+    let pool_a = PoolContractClient::new(&te.env, &pool_a_address);
+    let pool_b = PoolContractClient::new(&te.env, &pool_b_address);
+
+    let issuer = Address::generate(&te.env);
+    let buyer = Address::generate(&te.env);
+    let lp_a = Address::generate(&te.env);
+    let lp_b = Address::generate(&te.env);
+    let registry = RegistryContractClient::new(&te.env, &te.registry_id);
+    let metadata: Map<String, String> = Map::new(&te.env);
+    registry.register_issuer(&issuer, &metadata);
+    registry.register_buyer(&buyer, &metadata);
+    registry.verify_profile(&issuer, &true);
+    registry.verify_profile(&buyer, &true);
+
+    for asset in [&asset_a, &asset_b] {
+        te.env.as_contract(asset, || {
+            te.env
+                .storage()
+                .persistent()
+                .set(&TKey(lp_a.clone()), &100_000_000_000i128);
+            te.env
+                .storage()
+                .persistent()
+                .set(&TKey(lp_b.clone()), &100_000_000_000i128);
+            te.env
+                .storage()
+                .persistent()
+                .set(&TKey(buyer.clone()), &100_000_000_000i128);
+        });
+    }
+    pool_a.deposit(&lp_a, &2_000_000_000);
+    pool_b.deposit(&lp_b, &2_000_000_000);
+
+    let invoice_a = create_listed_invoice(&te, &issuer, &buyer, &asset_a);
+    let invoice_b = create_listed_invoice(&te, &issuer, &buyer, &asset_b);
+
+    // Cross-asset funding is rejected before any pool accounting moves.
+    let wrong_a = pool_a.try_fund_invoice(&invoice_b);
+    let wrong_b = pool_b.try_fund_invoice(&invoice_a);
+    assert!(
+        std::format!("{wrong_a:?}").contains("#11"),
+        "expected AssetMismatch, got {wrong_a:?}"
+    );
+    assert!(
+        std::format!("{wrong_b:?}").contains("#11"),
+        "expected AssetMismatch, got {wrong_b:?}"
+    );
+    for stats in [pool_a.get_stats(), pool_b.get_stats()] {
+        assert_eq!(stats.total_funded, 0);
+        assert_eq!(stats.utilization_rate_bps, 0);
+        assert_eq!(stats.active_invoice_count, 0);
+        assert_eq!(stats.available_liquidity, 2_000_000_000);
+    }
+    assert_eq!(invoice.get_status(&invoice_a), 1);
+    assert_eq!(invoice.get_status(&invoice_b), 1);
+
+    // Fund A only: A's funded total and utilization move, B's stay zero.
+    invoice.set_pool_contract(&pool_a_address);
+    assert!(pool_a.fund_invoice(&invoice_a));
+
+    let funded_amount = 1_000_000_000u128 * 9_800 / 10_000;
+    let stats_a = pool_a.get_stats();
+    let stats_b = pool_b.get_stats();
+    assert_eq!(stats_a.total_funded, funded_amount);
+    assert_eq!(stats_a.utilization_rate_bps, 4_900);
+    assert_eq!(stats_a.active_invoice_count, 1);
+    assert_eq!(stats_a.available_liquidity, 2_000_000_000 - funded_amount);
+    assert_eq!(stats_b.total_funded, 0);
+    assert_eq!(stats_b.utilization_rate_bps, 0);
+    assert_eq!(stats_b.active_invoice_count, 0);
+    assert_eq!(stats_b.available_liquidity, 2_000_000_000);
+    assert_eq!(invoice.get_status(&invoice_a), 2);
+    assert_eq!(invoice.get_status(&invoice_b), 1);
+
+    // Pool B can still fund its own asset, and the two ledgers remain
+    // independent rather than sharing a global funded counter.
+    invoice.set_pool_contract(&pool_b_address);
+    assert!(pool_b.fund_invoice(&invoice_b));
+
+    let stats_a = pool_a.get_stats();
+    let stats_b = pool_b.get_stats();
+    assert_eq!(stats_a.total_funded, funded_amount);
+    assert_eq!(stats_b.total_funded, funded_amount);
+    assert_eq!(stats_a.utilization_rate_bps, 4_900);
+    assert_eq!(stats_b.utilization_rate_bps, 4_900);
+    assert_eq!(stats_a.active_invoice_count, 1);
+    assert_eq!(stats_b.active_invoice_count, 1);
+    assert_eq!(stats_a.available_liquidity, 2_000_000_000 - funded_amount);
+    assert_eq!(stats_b.available_liquidity, 2_000_000_000 - funded_amount);
+
+    // The factory's aggregate view reads each instance's own ledger.
+    let aggregate = te.factory.get_aggregate_stats();
+    assert_eq!(aggregate.len(), 2);
+    assert_eq!(aggregate.get(0).unwrap().0, pool_a_address);
+    assert_eq!(aggregate.get(1).unwrap().0, pool_b_address);
+    assert_pool_stats_equal(aggregate.get(0).unwrap().1, stats_a);
+    assert_pool_stats_equal(aggregate.get(1).unwrap().1, stats_b);
+}
+
+/// Registration must not record a pool when the escrow it is wired to custodies
+/// a different asset: the pool initializer rejects the mismatch before the
+/// factory writes its asset -> pool mapping.
+#[test]
+fn test_register_asset_rejects_escrow_asset_mismatch_without_recording_pool() {
+    let te = setup();
+    let other_asset = te.env.register_contract(None, MockToken);
+
+    // `te.escrow_id` was initialized for `te.asset`, not `other_asset`.
+    let result = te.factory.try_register_asset(
+        &other_asset,
+        &te.pool_wasm_hash,
+        &te.invoice_id,
+        &te.escrow_id,
+    );
+    assert!(
+        std::format!("{result:?}").contains("#20"),
+        "expected EscrowAssetMismatch, got {result:?}"
+    );
+
+    assert_eq!(te.factory.get_pool_for_asset(&other_asset), None);
+    assert_eq!(te.factory.get_pool_for_asset(&te.asset), None);
+    assert_eq!(te.factory.list_assets().len(), 0);
+}
+
+/// A wrong-asset `register_existing_pool` is rejected and leaves the factory's
+/// mapping/index untouched, so a failed migration cannot poison an asset lookup.
+#[test]
+fn test_register_existing_pool_wrong_asset_does_not_record_mapping() {
+    let te = setup();
+    let other_asset = Address::generate(&te.env);
+    let other_pool = new_initialized_pool(&te, &other_asset);
+
+    let result = te.factory.try_register_existing_pool(&te.asset, &other_pool);
+    assert!(
+        std::format!("{result:?}").contains("#5"),
+        "expected InvalidPool, got {result:?}"
+    );
+
+    assert_eq!(te.factory.get_pool_for_asset(&te.asset), None);
+    assert_eq!(te.factory.get_pool_for_asset(&other_asset), None);
+    assert_eq!(te.factory.list_assets().len(), 0);
+}
+
 #[test]
 fn test_get_aggregate_stats() {
     let te = setup();
@@ -1014,4 +1638,465 @@ fn test_get_aggregate_stats_skips_pool_when_stats_call_fails() {
     let aggregate = te.factory.get_aggregate_stats();
     assert_eq!(aggregate.len(), 1);
     assert_eq!(aggregate.get(0).unwrap().0, valid_pool);
+}
+
+fn stored_admin(te: &TestEnv) -> Address {
+    te.env.as_contract(&te.factory_id, || {
+        te.env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("factory should have an admin")
+    })
+}
+
+/// Ownership transfer is a two-party operation: the stored admin authorizes
+/// giving the factory away and the incoming admin authorizes accepting it.
+#[test]
+fn test_transfer_ownership_changes_admin_and_emits_event() {
+    let te = setup();
+    let new_admin = Address::generate(&te.env);
+
+    te.env.mock_auths(&[
+        MockAuth {
+            address: &te.admin,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (new_admin.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (new_admin.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    te.factory.transfer_ownership(&new_admin);
+
+    assert_eq!(stored_admin(&te), new_admin);
+
+    // ownership_transferred(old_admin, new_admin)
+    let events = te.env.events().all();
+    let (contract, topics, data) = events.get(events.len() - 1).unwrap();
+    assert_eq!(contract, te.factory_id);
+    assert_eq!(topics.len(), 2);
+    assert_eq!(
+        Symbol::try_from_val(&te.env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(&te.env, "ownership_transferred")
+    );
+    assert_eq!(
+        Address::try_from_val(&te.env, &topics.get(1).unwrap()).unwrap(),
+        te.admin
+    );
+    assert_eq!(Address::try_from_val(&te.env, &data).unwrap(), new_admin);
+}
+
+/// With only the current admin's authorization, the transfer is rejected
+/// because the incoming admin never consented.
+#[test]
+fn test_transfer_ownership_requires_new_admin_auth() {
+    let te = setup();
+    let new_admin = Address::generate(&te.env);
+
+    te.env.mock_auths(&[MockAuth {
+        address: &te.admin,
+        invoke: &MockAuthInvoke {
+            contract: &te.factory_id,
+            fn_name: "transfer_ownership",
+            args: (new_admin.clone(),).into_val(&te.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(te.factory.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(stored_admin(&te), te.admin);
+}
+
+/// With only the new admin's authorization, the transfer is rejected: a
+/// non-admin cannot seize a factory by consenting on its behalf.
+#[test]
+fn test_transfer_ownership_requires_current_admin_auth() {
+    let te = setup();
+    let new_admin = Address::generate(&te.env);
+
+    te.env.mock_auths(&[MockAuth {
+        address: &new_admin,
+        invoke: &MockAuthInvoke {
+            contract: &te.factory_id,
+            fn_name: "transfer_ownership",
+            args: (new_admin.clone(),).into_val(&te.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(te.factory.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(stored_admin(&te), te.admin);
+}
+
+/// Even with the incoming admin's consent, an unrelated account cannot move
+/// ownership because the current-admin check fails.
+#[test]
+fn test_transfer_ownership_rejects_unauthorized_caller() {
+    let te = setup();
+    let new_admin = Address::generate(&te.env);
+    let attacker = Address::generate(&te.env);
+
+    te.env.mock_auths(&[
+        MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (new_admin.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (new_admin.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    assert!(te.factory.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(stored_admin(&te), te.admin);
+}
+
+/// Missing all authorization is rejected rather than treated as an implicit
+/// admin action.
+#[test]
+fn test_transfer_ownership_without_auth_is_rejected() {
+    let te = setup();
+    let new_admin = Address::generate(&te.env);
+
+    te.env.set_auths(&[]);
+    assert!(te.factory.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(stored_admin(&te), te.admin);
+}
+
+/// After the transfer the old admin's key has no residual authority: it can
+/// neither register an asset nor replay the transfer, while the new admin can
+/// register assets.
+#[test]
+fn test_transfer_ownership_moves_registration_authority() {
+    let te = setup();
+    let new_admin = Address::generate(&te.env);
+
+    // Build a pre-existing, correctly initialized pool to register through the
+    // migration path (which, unlike `register_asset`, needs no nested deploy
+    // authorization and so can be driven with a single explicit auth mock).
+    let asset = Address::generate(&te.env);
+    let existing_pool = new_initialized_pool(&te, &asset);
+
+    te.env.mock_auths(&[
+        MockAuth {
+            address: &te.admin,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (new_admin.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (new_admin.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+    te.factory.transfer_ownership(&new_admin);
+    assert_eq!(stored_admin(&te), new_admin);
+
+    // The old admin still controls its key, but the factory now checks the new
+    // admin for registration, so the call is rejected and no mapping is written.
+    te.env.mock_auths(&[MockAuth {
+        address: &te.admin,
+        invoke: &MockAuthInvoke {
+            contract: &te.factory_id,
+            fn_name: "register_existing_pool",
+            args: (asset.clone(), existing_pool.clone()).into_val(&te.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(te
+        .factory
+        .try_register_existing_pool(&asset, &existing_pool)
+        .is_err());
+    assert_eq!(te.factory.get_pool_for_asset(&asset), None);
+
+    // The new admin is now the only key that can mutate asset registration.
+    te.env.mock_auths(&[MockAuth {
+        address: &new_admin,
+        invoke: &MockAuthInvoke {
+            contract: &te.factory_id,
+            fn_name: "register_existing_pool",
+            args: (asset.clone(), existing_pool.clone()).into_val(&te.env),
+            sub_invokes: &[],
+        },
+    }]);
+    te.factory.register_existing_pool(&asset, &existing_pool);
+    assert_eq!(
+        te.factory.get_pool_for_asset(&asset),
+        Some(existing_pool.clone())
+    );
+
+    // Replaying the transfer with the old admin's signature must fail too: the
+    // stored admin is the new admin, which did not authorize this call.
+    let replacement = Address::generate(&te.env);
+    te.env.mock_auths(&[
+        MockAuth {
+            address: &te.admin,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (replacement.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &replacement,
+            invoke: &MockAuthInvoke {
+                contract: &te.factory_id,
+                fn_name: "transfer_ownership",
+                args: (replacement.clone(),).into_val(&te.env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+    assert!(te.factory.try_transfer_ownership(&replacement).is_err());
+    assert_eq!(stored_admin(&te), new_admin);
+}
+
+/// Seeds the asset index exactly as repeated registrations would, without
+/// paying for a pool deploy/initialize on every order-sensitive pagination
+/// test.
+fn seed_assets(env: &Env, factory_id: &Address, assets: &[Address]) {
+    env.as_contract(factory_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCount, &(assets.len() as u32));
+        for (index, asset) in assets.iter().enumerate() {
+            env.storage()
+                .instance()
+                .set(&DataKey::AssetIndex(index as u32), asset);
+        }
+    });
+}
+
+/// Appends one asset to the index the way `record_pool` does.
+fn append_asset(env: &Env, factory_id: &Address, asset: &Address) {
+    env.as_contract(factory_id, || {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetIndex(count), asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetCount, &(count + 1));
+    });
+}
+
+/// Walks every page from cursor 0 and returns the concatenated assets.
+fn walk_assets(env: &Env, client: &PoolFactoryContractClient<'_>, limit: u32) -> Vec<Address> {
+    let mut cursor = 0u32;
+    let mut assets = Vec::new(env);
+    loop {
+        let page = client.get_assets_page(&cursor, &limit);
+        let mut index = 0;
+        while index < page.items.len() {
+            assets.push_back(page.items.get(index).unwrap());
+            index += 1;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    assets
+}
+
+#[test]
+fn test_get_assets_page_empty() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let page = client.get_assets_page(&0, &10);
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_assets_page_first_page() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    seed_assets(&env, &factory_id, &assets);
+
+    let page = client.get_assets_page(&0, &2);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0), Some(assets[0].clone()));
+    assert_eq!(page.items.get(1), Some(assets[1].clone()));
+    assert_eq!(page.next_cursor, Some(2));
+}
+
+#[test]
+fn test_get_assets_page_multi_page_walk_has_no_gaps_or_duplicates() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    seed_assets(&env, &factory_id, &assets);
+
+    let walked = walk_assets(&env, &client, 2);
+
+    assert_eq!(walked.len(), 5);
+    assert_eq!(walked, client.list_assets());
+    for (index, asset) in assets.iter().enumerate() {
+        assert_eq!(walked.get(index as u32), Some(asset.clone()));
+    }
+}
+
+#[test]
+fn test_get_assets_page_exact_and_max_limit() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let mut assets = std::vec::Vec::new();
+    for _ in 0..MAX_ASSET_PAGE_LIMIT {
+        assets.push(Address::generate(&env));
+    }
+    seed_assets(&env, &factory_id, &assets);
+
+    // Exactly MAX_ASSET_PAGE_LIMIT assets: a max-sized page is the final page.
+    let exact = client.get_assets_page(&0, &MAX_ASSET_PAGE_LIMIT);
+    assert_eq!(exact.items.len(), MAX_ASSET_PAGE_LIMIT);
+    assert!(exact.next_cursor.is_none());
+
+    // A cursor at the end is valid and yields an empty final page.
+    let at_end = client.get_assets_page(&MAX_ASSET_PAGE_LIMIT, &10);
+    assert_eq!(at_end.items.len(), 0);
+    assert!(at_end.next_cursor.is_none());
+
+    // One more asset: the max-sized page now points at the single tail item.
+    let tail_asset = Address::generate(&env);
+    append_asset(&env, &factory_id, &tail_asset);
+
+    let full = client.get_assets_page(&0, &MAX_ASSET_PAGE_LIMIT);
+    assert_eq!(full.items.len(), MAX_ASSET_PAGE_LIMIT);
+    assert_eq!(full.next_cursor, Some(MAX_ASSET_PAGE_LIMIT));
+
+    let tail = client.get_assets_page(&MAX_ASSET_PAGE_LIMIT, &MAX_ASSET_PAGE_LIMIT);
+    assert_eq!(tail.items.len(), 1);
+    assert_eq!(tail.items.get(0), Some(tail_asset));
+    assert!(tail.next_cursor.is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_get_assets_page_rejects_zero_limit() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    client.get_assets_page(&0, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_get_assets_page_rejects_limit_above_max() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    client.get_assets_page(&0, &(MAX_ASSET_PAGE_LIMIT + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_get_assets_page_rejects_cursor_past_end() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, PoolFactoryContract);
+    let client = PoolFactoryContractClient::new(&env, &factory_id);
+
+    let assets = [Address::generate(&env), Address::generate(&env)];
+    seed_assets(&env, &factory_id, &assets);
+
+    client.get_assets_page(&3, &10);
+}
+
+#[test]
+fn test_get_assets_page_appends_between_pages() {
+    let te = setup();
+
+    let first_asset = Address::generate(&te.env);
+    let second_asset = Address::generate(&te.env);
+    for asset in [&first_asset, &second_asset] {
+        let pool = new_initialized_pool(&te, asset);
+        te.factory.register_existing_pool(asset, &pool);
+    }
+
+    // Read one item, then register another asset before asking for page 2.
+    let first = te.factory.get_assets_page(&0, &1);
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items.get(0), Some(first_asset.clone()));
+    assert_eq!(first.next_cursor, Some(1));
+
+    let appended_asset = Address::generate(&te.env);
+    let appended_pool = new_initialized_pool(&te, &appended_asset);
+    te.factory.register_existing_pool(&appended_asset, &appended_pool);
+
+    let second = te.factory.get_assets_page(&first.next_cursor.unwrap(), &1);
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items.get(0), Some(second_asset.clone()));
+    assert_eq!(second.next_cursor, Some(2));
+
+    let third = te.factory.get_assets_page(&second.next_cursor.unwrap(), &1);
+    assert_eq!(third.items.len(), 1);
+    assert_eq!(third.items.get(0), Some(appended_asset.clone()));
+    assert!(third.next_cursor.is_none());
+
+    // The append landed after everything already read and matches the legacy
+    // unbounded view's order.
+    let walked = walk_assets(&te.env, &te.factory, 1);
+    assert_eq!(walked, te.factory.list_assets());
+    assert_eq!(walked.len(), 3);
+    assert_eq!(walked.get(0), Some(first_asset));
+    assert_eq!(walked.get(1), Some(second_asset));
+    assert_eq!(walked.get(2), Some(appended_asset));
 }

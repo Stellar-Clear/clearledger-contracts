@@ -8,12 +8,12 @@ use soroban_sdk::{
     testutils::{storage::Persistent as _, Address as _, Events as _, Ledger},
     token,
     xdr::ToXdr,
-    Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Vec,
 };
 
 use crate::{
-    InvoiceContract, InvoiceContractClient, InvoiceError, InvoiceStatus, MAX_BATCH_SIZE,
-    MAX_FACE_VALUE, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
+    InvoiceContract, InvoiceContractClient, InvoiceError, InvoiceStatus, DEFAULT_EXPIRY_WINDOW,
+    MAX_BATCH_SIZE, MAX_FACE_VALUE, MAX_INVOICE_LIFETIME_SECONDS, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
 // Default invoice parameters used across tests.
@@ -189,6 +189,25 @@ fn assert_wiring_setter_rejects(
     assert!(result.is_err(), "{method} accepted a conflicting address");
 }
 
+fn assert_admin_auth_rejected(env: &Env, client: &InvoiceContractClient, method: &str, args: Vec<soroban_sdk::Val>) {
+    let non_admin = Address::generate(env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: method,
+            args: &args,
+            sub_invokes: &[],
+        },
+    }]);
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &client.address,
+        &Symbol::new(env, method),
+        args,
+    );
+    assert!(result.is_err(), "{method} accepted a non-admin caller");
+}
+
 #[allow(dead_code)]
 type SetupWithAdmin = (
     Env,
@@ -243,6 +262,27 @@ fn mock_pool_with_asset(env: &Env, asset: &Address) -> Address {
     pool_id
 }
 
+/// Creates an invoice, lists it, and funds it through a mock pool, returning
+/// the invoice id. Keeps the `get_funded_amount` boundary tests focused on the
+/// amount under test rather than repeating the funding setup each time.
+fn funded_invoice(
+    env: &Env,
+    client: &InvoiceContractClient,
+    issuer: &Address,
+    buyer: &Address,
+    usdc: &Address,
+    funded_amount: u128,
+) -> BytesN<32> {
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(issuer, buyer, &DEFAULT_FACE_VALUE, &due_date, usdc);
+    attest(env, client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let pool = mock_pool_with_asset(env, usdc);
+    client.set_pool_contract(&pool);
+    client.mark_funded(&invoice_id, &pool, usdc, &funded_amount);
+    invoice_id
+}
+
 // --------------- Mock Agent Registry (Underwrite) ---------------
 //
 // Stands in for the agent-registry contract from the separate
@@ -274,6 +314,20 @@ use clearledger_test_utils::{test_agent_pubkey, test_agent_signing_key};
 /// signed attestation for `invoice_id`. Centralizes the plumbing so
 /// individual tests can just call this right before `list_for_financing`.
 fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
+    attest_with_expiry(
+        env,
+        client,
+        invoice_id,
+        env.ledger().timestamp() + 3_600,
+    );
+}
+
+fn attest_with_expiry(
+    env: &Env,
+    client: &InvoiceContractClient,
+    invoice_id: &BytesN<32>,
+    expires_at: u64,
+) {
     let agent_id = Symbol::new(env, "test_agent");
     let registry_id = env.register_contract(None, MockAgentRegistry);
     let registry_client = MockAgentRegistryClient::new(env, &registry_id);
@@ -287,12 +341,13 @@ fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at,
     };
     let payload_bytes = payload.to_xdr(env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -307,7 +362,90 @@ fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     client.submit_attestation(invoice_id, &payload_bytes, &signature);
 }
 
+/// Registers the shared test secp256k1 key as an active agent and points
+/// `client` at the fresh mock registry.
+fn register_test_agent(env: &Env, client: &InvoiceContractClient) -> Symbol {
+    let agent_id = Symbol::new(env, "test_agent");
+    let registry_id = env.register_contract(None, MockAgentRegistry);
+    let registry_client = MockAgentRegistryClient::new(env, &registry_id);
+    registry_client.register_agent(
+        &agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(env),
+        },
+    );
+    client.set_agent_registry_contract(&registry_id);
+    agent_id
+}
+
+/// Signs `payload` exactly as an off-chain agent would: keccak256 over the
+/// XDR bytes, then a recoverable secp256k1 signature over that digest.
+fn sign_attestation(
+    env: &Env,
+    payload: &crate::AttestationPayload,
+) -> (soroban_sdk::Bytes, BytesN<65>) {
+    let payload_bytes = payload.to_xdr(env);
+    let digest = env.crypto().keccak256(&payload_bytes).to_array();
+    let (sig, recid) = test_agent_signing_key()
+        .sign_prehash_recoverable(&digest)
+        .unwrap();
+    let mut sig_bytes = [0u8; 65];
+    sig_bytes[..64].copy_from_slice(&sig.to_bytes());
+    sig_bytes[64] = recid.to_byte();
+    (payload_bytes, BytesN::from_array(env, &sig_bytes))
+}
+
+fn test_payload(
+    env: &Env,
+    client: &InvoiceContractClient,
+    invoice_id: &BytesN<32>,
+    agent_id: &Symbol,
+    nonce: u64,
+) -> crate::AttestationPayload {
+    crate::AttestationPayload {
+        domain_separator: client.get_attestation_domain_separator(),
+        invoice_id: invoice_id.clone(),
+        risk_score: 5000,
+        evidence_hash: BytesN::from_array(env, &[9u8; 32]),
+        agent_id: agent_id.clone(),
+        nonce,
+    }
+}
+
 // ============== FAILURE-PATH TESTS FOR submit_attestation ==============
+
+#[cfg(test)]
+mod versioned_event_tests {
+    use crate::events::{invoice_funded, invoice_funded_v1};
+    use soroban_sdk::{BytesN, Env, Symbol};
+    use soroban_sdk::{testutils::Events, IntoVal, Val, Vec};
+
+    #[test]
+    fn funding_keeps_legacy_payload_and_adds_explicit_version() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::InvoiceContract);
+        let invoice_id = BytesN::from_array(&env, &[17; 32]);
+        env.as_contract(&contract, || {
+            invoice_funded_v1(&env, &invoice_id, 123u128);
+            invoice_funded(&env, &invoice_id, 123u128);
+        });
+        let published = env.events().all();
+        assert_eq!(published.len(), 2);
+        let (legacy_contract, legacy_topics, legacy_data) = published.get(1).unwrap();
+        let expected_legacy_topics: Vec<Val> =
+            (Symbol::new(&env, "invoice_funded"), invoice_id.clone()).into_val(&env);
+        assert_eq!(legacy_contract, contract);
+        assert_eq!(legacy_topics, expected_legacy_topics);
+        assert_eq!(legacy_data, 123u128.into_val(&env));
+        let (versioned_contract, versioned_topics, versioned_data) = published.get(0).unwrap();
+        let expected_versioned_topics: Vec<Val> =
+            (Symbol::new(&env, "invoice_funded_v1"), invoice_id).into_val(&env);
+        assert_eq!(versioned_contract, contract);
+        assert_eq!(versioned_topics, expected_versioned_topics);
+        assert_eq!(versioned_data, (1u32, 123u128).into_val(&env));
+    }
+}
 
 #[test]
 #[should_panic(expected = "Error(Contract, #21)")]
@@ -333,12 +471,13 @@ fn test_submit_attestation_untrusted_signer_wrong_pubkey() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -377,12 +516,13 @@ fn test_submit_attestation_inactive_agent() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -412,12 +552,13 @@ fn test_submit_attestation_unregistered_agent() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -456,12 +597,13 @@ fn test_submit_attestation_replay_rejection() {
     client.set_agent_registry_contract(&registry_id);
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 6000,
         evidence_hash: BytesN::from_array(&env, &[10u8; 32]),
         agent_id,
         nonce: 2,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -509,6 +651,7 @@ fn test_submit_attestation_domain_separator_mismatch() {
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -545,12 +688,13 @@ fn test_submit_attestation_invoice_id_mismatch() {
     // Different invoice_id in payload vs argument
     let wrong_invoice_id = BytesN::from_array(&env, &[1u8; 32]);
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: wrong_invoice_id,
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -563,6 +707,334 @@ fn test_submit_attestation_invoice_id_mismatch() {
     let signature = BytesN::from_array(&env, &sig_bytes);
 
     client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+// ============== REPLAY / DOMAIN-SEPARATION TESTS ==============
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_submit_attestation_same_signature_cannot_be_replayed() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    // Byte-for-byte replay of the accepted submission.
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_rejects_legacy_fixed_domain_separator() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Pre-#117 clients used the raw scheme tag as the separator. It carries
+    // no network or contract binding and must no longer verify.
+    let mut payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    payload.domain_separator = BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_invoices() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_a = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let invoice_b = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Signed for invoice A; try to spend it on invoice B.
+    let payload = test_payload(&env, &client, &invoice_a, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_b, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_networks() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    // The separator commits to ledger.network_id() (the network passphrase
+    // hash). Same contract, same invoice, but a different network must reject
+    // the signature produced for the original network.
+    env.ledger().set_network_id([2u8; 32]);
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_contracts() {
+    let (env, client, issuer, buyer, registry_client, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // A second invoice contract on the same network. Invoice IDs are
+    // deterministic from terms + counter, so identical terms produce the same
+    // invoice id here; only the contract-level domain binding distinguishes
+    // the two deployments.
+    let second_contract_id = env.register_contract(None, InvoiceContract);
+    let second = InvoiceContractClient::new(&env, &second_contract_id);
+    let second_admin = Address::generate(&env);
+    second.initialize(&second_admin, &registry_client.address);
+    second.add_supported_asset(&usdc);
+    second.set_agent_registry_contract(&client.get_agent_registry_contract().unwrap());
+    let second_invoice_id =
+        second.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_eq!(second_invoice_id, invoice_id);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    // Signature covers the first contract's domain; replaying the same bytes
+    // against the second deployment must fail.
+    second.submit_attestation(&second_invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_not_reusable_with_wrong_nonce() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let signed_payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    // Reuse the nonce-1 signature after mutating the payload's nonce.
+    let tampered_payload = test_payload(&env, &client, &invoice_id, &agent_id, 2);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_bound_to_agent_identity() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+    let other_agent_id = Symbol::new(&env, "other_agent");
+
+    // Give the other agent the same registered key: the only difference is
+    // the agent_id claimed inside the signed payload.
+    let registry_id = client.get_agent_registry_contract().unwrap();
+    let registry_client = MockAgentRegistryClient::new(&env, &registry_id);
+    registry_client.register_agent(
+        &other_agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(&env),
+        },
+    );
+
+    let signed_payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    let tampered_payload = test_payload(&env, &client, &invoice_id, &other_agent_id, 1);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
+}
+
+#[test]
+fn test_submit_attestation_rejects_malformed_payload() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &payload);
+
+    let malformed = Bytes::from_slice(&env, &[0xff; 8]);
+    let result = client.try_submit_attestation(&invoice_id, &malformed, &signature);
+    assert!(result.is_err(), "malformed payload must be rejected");
+}
+
+#[test]
+fn test_submit_attestation_rejects_invalid_signature() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let payload_bytes = payload.to_xdr(&env);
+
+    let zero_signature = BytesN::from_array(&env, &[0u8; 65]);
+    let zero_result = client.try_submit_attestation(&invoice_id, &payload_bytes, &zero_signature);
+    assert!(zero_result.is_err(), "zero signature must be rejected");
+
+    let (_, signature) = sign_attestation(&env, &payload);
+    let mut bad_recovery = signature.to_array();
+    bad_recovery[64] = 4;
+    let bad_recovery_signature = BytesN::from_array(&env, &bad_recovery);
+    let recovery_result =
+        client.try_submit_attestation(&invoice_id, &payload_bytes, &bad_recovery_signature);
+    assert!(
+        recovery_result.is_err(),
+        "out-of-range recovery id must be rejected"
+    );
+}
+
+#[test]
+fn test_gas_benchmark_submit_attestation() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    env.budget().reset_default();
+    let cpu_before = env.budget().cpu_instruction_cost();
+    let mem_before = env.budget().memory_bytes_cost();
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    let cpu_after = env.budget().cpu_instruction_cost();
+    let mem_after = env.budget().memory_bytes_cost();
+
+    let cpu_delta = cpu_after - cpu_before;
+    let mem_delta = mem_after - mem_before;
+    assert!(cpu_delta > 0);
+    assert!(mem_delta > 0);
+    std::eprintln!(
+        "\n== GAS BENCHMARK ==\nsubmit_attestation(): CPU instructions: {}, Memory bytes: {}\n=====",
+        cpu_delta,
+        mem_delta
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_submit_attestation_same_signature_cannot_be_replayed() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    // Byte-for-byte replay of the accepted submission.
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_invoices() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_a = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let invoice_b = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Signature covers invoice A; attempt to spend it on invoice B.
+    let payload = test_payload(&env, &client, &invoice_a, &agent_id, 1);
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_b, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_signature_not_reusable_across_domains() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // Simulate a signature produced for another protocol/network domain.
+    let mut payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    payload.domain_separator =
+        BytesN::from_array(&env, b"ClearLedger.OtherDomain.v1______");
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_submit_attestation_wrong_contract_domain_separator() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    // A separator from a different ClearLedger contract must not validate.
+    let mut payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    payload.domain_separator =
+        BytesN::from_array(&env, b"ClearLedger.EscrowAttest.v1_____");
+    let (payload_bytes, signature) = sign_attestation(&env, &payload);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_not_reusable_with_wrong_nonce() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+
+    let signed_payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    // Reuse the nonce-1 signature after mutating the payload's nonce.
+    let tampered_payload = test_payload(&env, &client, &invoice_id, &agent_id, 2);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_submit_attestation_signature_bound_to_agent_identity() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let agent_id = register_test_agent(&env, &client);
+    let other_agent_id = Symbol::new(&env, "other_agent");
+
+    let registry_id = client.get_agent_registry_contract().unwrap();
+    let registry_client = MockAgentRegistryClient::new(&env, &registry_id);
+    registry_client.register_agent(
+        &other_agent_id,
+        &crate::Agent {
+            active: true,
+            pubkey: test_agent_pubkey(&env),
+        },
+    );
+
+    let signed_payload = test_payload(&env, &client, &invoice_id, &agent_id, 1);
+    let (_, signature) = sign_attestation(&env, &signed_payload);
+
+    // Same key, valid agent, but the signed identity names another agent.
+    let tampered_payload = test_payload(&env, &client, &invoice_id, &other_agent_id, 1);
+    let tampered_bytes = tampered_payload.to_xdr(&env);
+
+    client.submit_attestation(&invoice_id, &tampered_bytes, &signature);
 }
 
 #[test]
@@ -595,12 +1067,13 @@ fn test_submit_attestation_nonexistent_invoice() {
 
     let fake_invoice_id = BytesN::from_array(&env, &[1u8; 32]);
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: fake_invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -787,6 +1260,35 @@ fn test_create_fails_above_max_face_value() {
 }
 
 #[test]
+fn prop_invalid_face_values_do_not_create_invoices() {
+    let invalid_face_values = prop_oneof![
+        Just(0u128),
+        (MAX_FACE_VALUE + 1)..=u128::MAX,
+    ];
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(&invalid_face_values, |face_value| {
+            let (env, client, issuer, buyer, _, usdc) = setup();
+            let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+            let before = client.get_counts();
+
+            prop_assert!(
+                client
+                    .try_create(&issuer, &buyer, &face_value, &due_date, &usdc)
+                    .is_err(),
+                "invalid face value {face_value} must fail"
+            );
+            let after = client.get_counts();
+            prop_assert_eq!(
+                after.get(String::from_str(&env, "Created")),
+                before.get(String::from_str(&env, "Created"))
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_create_fails_past_due_date() {
     let (env, client, issuer, buyer, _, usdc) = setup();
@@ -839,6 +1341,72 @@ fn test_create_succeeds_when_due_date_one_second_in_future() {
     let events = env.events().all();
     let (event_contract, _topics, _data) = events.last().expect("expected at least one event");
     assert_eq!(event_contract, client.address.clone());
+}
+
+// ============== ISSUE #30: MAX INVOICE LIFETIME BOUNDS ==============
+
+// A due date exactly `MAX_INVOICE_LIFETIME_SECONDS` ahead is accepted: the
+// upper-bound comparator is `due_date > max_due_date`, so equality is valid.
+#[test]
+fn test_create_succeeds_at_max_invoice_lifetime() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let now = env.ledger().timestamp();
+    let due_date = now + MAX_INVOICE_LIFETIME_SECONDS;
+
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Created);
+    assert_eq!(invoice.due_date, due_date);
+    assert_eq!(invoice.created_at, now);
+}
+
+// One second past the maximum lifetime is rejected with InvalidDueDate (#7).
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_fails_one_second_past_max_invoice_lifetime() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let due_date = env.ledger().timestamp() + MAX_INVOICE_LIFETIME_SECONDS + 1;
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+}
+
+// A far-future due date (u64::MAX) from a normal ledger time is rejected by
+// the lifetime cap, not silently accepted or truncated.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_fails_far_future_due_date() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &u64::MAX, &usdc);
+}
+
+// When `now + MAX_INVOICE_LIFETIME_SECONDS` would overflow u64, the contract
+// panics with MathOverflow (#15) instead of wrapping.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_create_fails_when_lifetime_addition_overflows() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(u64::MAX - 1);
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &u64::MAX, &usdc);
+}
+
+// Normal success case: a due date comfortably inside the lifetime succeeds.
+#[test]
+fn test_create_succeeds_with_normal_due_date() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Created);
+    assert_eq!(invoice.due_date, due_date);
 }
 
 #[test]
@@ -988,6 +1556,7 @@ fn test_list_for_financing_discount_bps_min_boundary() {
     let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
 
     attest(&env, &client, &invoice_id);
+    let listed_at = env.ledger().timestamp();
     let result = client.list_for_financing(&invoice_id, &1);
     assert!(result);
 
@@ -1003,7 +1572,27 @@ fn test_list_for_financing_discount_bps_min_boundary() {
         topics,
         (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
     );
-    assert_eq!(u32::try_from_val(&env, &data).unwrap(), 1u32);
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
+fn test_batch_list_for_financing_expiry_overflow_reports_failed_entry() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&11);
+    env.ledger().set_timestamp(u64::MAX - 10);
+
+    let entries = vec![&env, (invoice_id.clone(), DEFAULT_DISCOUNT_BPS)];
+    let failed = client.batch_list_for_financing(&entries);
+
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed.get(0).unwrap(), invoice_id);
+    assert_eq!(client.get_status(&invoice_id), 0);
 }
 
 #[test]
@@ -1014,6 +1603,7 @@ fn test_list_for_financing_discount_bps_max_boundary() {
     let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
 
     attest(&env, &client, &invoice_id);
+    let listed_at = env.ledger().timestamp();
     let result = client.list_for_financing(&invoice_id, &5000);
     assert!(result);
 
@@ -1029,7 +1619,111 @@ fn test_list_for_financing_discount_bps_max_boundary() {
         topics,
         (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
     );
-    assert_eq!(u32::try_from_val(&env, &data).unwrap(), 5000u32);
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (5000u32, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_includes_default_expiry_deadline() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    env.ledger().set_timestamp(listed_at);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    assert_eq!(client.get(&invoice_id).listed_at, Some(listed_at));
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.last().expect("expected at least one event");
+    assert_eq!(contract, client.address);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
+    );
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_uses_configured_expiry_window() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    let window = 3_600u64;
+    env.ledger().set_timestamp(listed_at);
+    client.set_expiry_window(&window);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let events = env.events().all();
+    let (_, _, data) = events.last().expect("expected at least one event");
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + window)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_min_expiry_window_boundary() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    env.ledger().set_timestamp(listed_at);
+    client.set_expiry_window(&0);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let events = env.events().all();
+    let (_, _, data) = events.last().expect("expected at least one event");
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_max_expiry_window_boundary() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    let window = 31_536_000u64;
+    env.ledger().set_timestamp(listed_at);
+    client.set_expiry_window(&window);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let events = env.events().all();
+    let (_, _, data) = events.last().expect("expected at least one event");
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + window)
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_invoice_listed_event_expiry_overflow_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&11);
+    env.ledger().set_timestamp(u64::MAX - 10);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
 }
 
 #[test]
@@ -1554,7 +2248,7 @@ fn test_get_by_status_filters_correctly() {
 
 // ============== O(1) STATUS MEMBERSHIP MARKERS (issues #831 / #835) ==============
 
-/// Reads the raw `DataKey::StatusMembership` marker straight from contract
+/// Reads the raw `DataKey::StatusPosition` slot straight from contract
 /// storage, so these tests assert on the key itself and not only on the
 /// public query helper.
 fn raw_status_membership(
@@ -1563,12 +2257,21 @@ fn raw_status_membership(
     status: InvoiceStatus,
     invoice_id: &BytesN<32>,
 ) -> bool {
-    let key = crate::status_membership_key(status, invoice_id);
+    let key = crate::status_position_key(status, invoice_id);
     env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get::<_, bool>(&key)
-            .unwrap_or(false)
+        env.storage().persistent().get::<_, u32>(&key).is_some()
+    })
+}
+
+fn raw_status_position(
+    env: &Env,
+    client: &InvoiceContractClient,
+    status: InvoiceStatus,
+    invoice_id: &BytesN<32>,
+) -> Option<u32> {
+    let key = crate::status_position_key(status, invoice_id);
+    env.as_contract(&client.address, || {
+        env.storage().persistent().get::<_, u32>(&key)
     })
 }
 
@@ -1587,7 +2290,7 @@ fn test_status_membership_marker_written_on_create_and_rolled_on_transitions() {
         &invoice_id
     ));
     assert!(client.has_status_membership(&InvoiceStatus::Created, &invoice_id));
-    let created_key = crate::status_membership_key(InvoiceStatus::Created, &invoice_id);
+    let created_key = crate::status_position_key(InvoiceStatus::Created, &invoice_id);
     let marker_ttl = env.as_contract(&client.address, || {
         env.storage().persistent().get_ttl(&created_key)
     });
@@ -1898,6 +2601,144 @@ fn test_get_funding_terms_returns_correct_values() {
     assert_eq!(discount_bps, 200);
 }
 
+// ============================================================================
+// Funded Amount Accessor Tests (Issue #21)
+// ============================================================================
+
+#[test]
+fn test_get_funded_amount_returns_committed_amount() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, DEFAULT_FUNDED_AMOUNT);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(client.get(&invoice_id).funded_amount, DEFAULT_FUNDED_AMOUNT);
+}
+
+#[test]
+fn test_get_funded_amount_partial_funding_boundary() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let partial = DEFAULT_FACE_VALUE / 3;
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, partial);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), partial);
+}
+
+#[test]
+fn test_get_funded_amount_smallest_non_zero_amount() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, 1);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), 1);
+}
+
+#[test]
+fn test_get_funded_amount_full_face_value() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, DEFAULT_FACE_VALUE);
+
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FACE_VALUE);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_get_funded_amount_unfunded_invoice_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    client.get_funded_amount(&invoice_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_get_funded_amount_listed_but_unfunded_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    client.get_funded_amount(&invoice_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_get_funded_amount_unknown_invoice_panics() {
+    let (env, client, _, _, _, _) = setup();
+    let fake_id = BytesN::from_array(&env, &[0u8; 32]);
+
+    client.get_funded_amount(&fake_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_get_funded_amount_uninitialized_panics() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, InvoiceContract);
+    let client = InvoiceContractClient::new(&env, &contract_id);
+    let fake_id = BytesN::from_array(&env, &[0u8; 32]);
+
+    client.get_funded_amount(&fake_id);
+}
+
+#[test]
+fn test_get_funded_amount_rejected_zero_funding_stays_unfunded() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+
+    // `mark_funded` rejects a zero commitment, so no invoice can legitimately
+    // report 0 through the accessor.
+    let result = env.try_invoke_contract::<bool, InvoiceError>(
+        &client.address,
+        &Symbol::new(&env, "mark_funded"),
+        (invoice_id.clone(), pool.clone(), usdc.clone(), 0u128).into_val(&env),
+    );
+    assert_eq!(result.err().and_then(|e| e.ok()), Some(InvoiceError::InvalidAmount));
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Listed);
+    assert_eq!(invoice.funded_amount, 0);
+    assert!(invoice.funded_at.is_none());
+
+    let view = env.try_invoke_contract::<u128, InvoiceError>(
+        &client.address,
+        &Symbol::new(&env, "get_funded_amount"),
+        (invoice_id.clone(),).into_val(&env),
+    );
+    assert_eq!(view.err().and_then(|e| e.ok()), Some(InvoiceError::NotFunded));
+}
+
+#[test]
+fn test_get_funded_amount_is_read_only() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let invoice_id = funded_invoice(&env, &client, &issuer, &buyer, &usdc, DEFAULT_FUNDED_AMOUNT);
+    let invoice_key = crate::DataKey::Invoice(invoice_id.clone());
+    let ttl_before = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&invoice_key)
+    });
+    let invoice_before = client.get(&invoice_id).to_xdr(&env);
+    let events_before = env.events().all().len();
+
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(client.get_funded_amount(&invoice_id), DEFAULT_FUNDED_AMOUNT);
+
+    let ttl_after = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&invoice_key)
+    });
+    assert_eq!(ttl_after, ttl_before, "accessor must not extend TTL");
+    assert_eq!(
+        client.get(&invoice_id).to_xdr(&env),
+        invoice_before,
+        "accessor must not mutate invoice state"
+    );
+    assert_eq!(env.events().all().len(), events_before, "accessor must not emit events");
+}
+
 #[test]
 fn test_expire_listing_succeeds_by_issuer() {
     let (env, client, issuer, buyer, _, usdc) = setup();
@@ -2015,6 +2856,114 @@ fn test_expire_listing_one_second_before_boundary_panics() {
     client.expire_listing(&invoice_id, &issuer);
 }
 
+/// Same-ledger race at the exact expiry deadline: expiry is inclusive, so
+/// `expire_listing` wins even though it was submitted first, and funding then
+/// observes `Expired` and fails without writing funding state.
+#[test]
+fn test_same_ledger_expire_then_fund_at_deadline_expire_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline);
+
+    assert!(client.expire_listing(&invoice_id, &issuer));
+    assert!(client
+        .try_mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT)
+        .is_err());
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Expired);
+    assert_eq!(invoice.funded_amount, 0);
+    assert_eq!(invoice.funded_at, None);
+    assert_eq!(invoice.funding_pool, None);
+}
+
+/// Same-ledger race at the exact expiry deadline with funding submitted first:
+/// funding still fails because the deadline is inclusive, then expiry succeeds.
+#[test]
+fn test_same_ledger_fund_then_expire_at_deadline_expire_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline);
+
+    assert!(client
+        .try_mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT)
+        .is_err());
+    assert!(client.expire_listing(&invoice_id, &issuer));
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Expired);
+    assert_eq!(invoice.funded_amount, 0);
+    assert_eq!(invoice.funded_at, None);
+    assert_eq!(invoice.funding_pool, None);
+}
+
+/// One tick before expiry, the listing is still fundable: expire-then-fund
+/// leaves the invoice `Funded` because expiry failed with `ListingNotExpired`.
+#[test]
+fn test_same_ledger_expire_then_fund_before_deadline_fund_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline - 1);
+
+    assert!(client.try_expire_listing(&invoice_id, &issuer).is_err());
+    assert!(client.mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT));
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Funded);
+    assert_eq!(invoice.funded_at, Some(deadline - 1));
+    assert_eq!(invoice.funding_pool, Some(pool));
+}
+
+/// One tick before expiry with funding submitted first: funding wins and the
+/// later expiry observes `Funded`, fails, and does not overwrite funding state.
+#[test]
+fn test_same_ledger_fund_then_expire_before_deadline_fund_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline - 1);
+
+    assert!(client.mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT));
+    assert!(client.try_expire_listing(&invoice_id, &issuer).is_err());
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Funded);
+    assert_eq!(invoice.funded_amount, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(invoice.funded_at, Some(deadline - 1));
+    assert_eq!(invoice.funding_pool, Some(pool));
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #18)")]
 fn test_set_expiry_window_rejects_out_of_bounds() {
@@ -2104,6 +3053,49 @@ fn test_set_agent_registry_contract_rejects_conflicting_addresses() {
 }
 
 #[test]
+fn test_invoice_admin_configuration_auth_matrix_rejects_non_admins() {
+    let (env, client, _, _, _, asset) = setup();
+    let address = Address::generate(&env);
+
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_pool_contract",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_escrow_contract",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_agent_registry_contract",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "add_supported_asset",
+        (address.clone(),).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "remove_supported_asset",
+        (asset,).into_val(&env),
+    );
+    assert_admin_auth_rejected(
+        &env,
+        &client,
+        "set_expiry_window",
+        (3600u64,).into_val(&env),
+    );
+}
+
+#[test]
 fn test_initialize_rejects_conflicting_registry_address() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2114,6 +3106,38 @@ fn test_initialize_rejects_conflicting_registry_address() {
     for registry in [admin.clone(), contract_id.clone()] {
         assert!(client.try_initialize(&admin, &registry).is_err());
     }
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_set_pool_contract_rejects_admin_with_typed_error() {
+    let (_env, client, ..) = setup();
+    let admin = client.get_admin().unwrap();
+    client.set_pool_contract(&admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn test_set_escrow_contract_rejects_self_with_typed_error() {
+    let (_env, client, ..) = setup();
+    let contract_address = client.address.clone();
+    client.set_escrow_contract(&contract_address);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #34)")]
+fn test_add_supported_asset_rejects_admin_with_typed_error() {
+    let (_env, client, ..) = setup();
+    let admin = client.get_admin().unwrap();
+    client.add_supported_asset(&admin);
+}
+
+#[test]
+fn test_add_supported_asset_accepts_distinct_token() {
+    let (env, client, ..) = setup();
+    let asset = Address::generate(&env);
+    client.add_supported_asset(&asset);
+    assert!(client.is_supported_asset(&asset));
 }
 
 #[test]
@@ -2397,6 +3421,154 @@ fn test_invoice_ids_unique_for_different_face_values() {
     let id2 = client.create(&issuer, &buyer, &2_000_000_000, &due_date, &usdc);
 
     assert_ne!(id1, id2);
+}
+
+// ============== Duplicate-terms warning key ==============
+//
+// `duplicate_terms_key` is an advisory digest for off-chain indexers. It must
+// be stable for identical issuer/buyer/terms, change when any field changes,
+// and never act as an on-chain uniqueness constraint.
+
+#[test]
+fn test_duplicate_terms_key_is_deterministic() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let key1 = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let key2 = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    assert_eq!(key1, key2);
+
+    // The key purposely does not depend on ledger time.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + DEFAULT_DUE_OFFSET);
+    let key_later =
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_eq!(key1, key_later);
+}
+
+#[test]
+fn test_duplicate_terms_key_changes_with_each_field() {
+    let (env, client, issuer, buyer, registry, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let base = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let other_issuer = Address::generate(&env);
+    registry.register(&other_issuer);
+    let other_buyer = Address::generate(&env);
+    registry.register(&other_buyer);
+    let other_asset = env.register_contract(None, MockToken);
+
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&other_issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &other_buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &buyer, &2_000_000_000, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &(due_date + 1), &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(
+            &issuer,
+            &buyer,
+            &DEFAULT_FACE_VALUE,
+            &due_date,
+            &other_asset
+        )
+    );
+}
+
+#[test]
+fn test_duplicate_terms_key_matches_real_invoice_and_does_not_block_create() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    // Querying before creation is allowed and needs no initialization state.
+    let key_before =
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    // Two invoices with identical commercial terms are still both created;
+    // the key is advisory and is not asserted as a uniqueness constraint.
+    let id1 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let id2 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_ne!(id1, id2);
+    assert_eq!(client.get_status(&id1), InvoiceStatus::Created as u32);
+    assert_eq!(client.get_status(&id2), InvoiceStatus::Created as u32);
+
+    // Recomputing from the persisted invoice terms yields the same key, and
+    // it differs from the counter-based invoice ID.
+    let inv = client.get(&id1);
+    let key_after = client.duplicate_terms_key(
+        &inv.issuer,
+        &inv.buyer,
+        &inv.face_value,
+        &inv.due_date,
+        &inv.funding_asset,
+    );
+    assert_eq!(key_before, key_after);
+    assert_ne!(key_after, inv.id);
+
+    let inv2 = client.get(&id2);
+    assert_eq!(
+        key_after,
+        client.duplicate_terms_key(
+            &inv2.issuer,
+            &inv2.buyer,
+            &inv2.face_value,
+            &inv2.due_date,
+            &inv2.funding_asset,
+        )
+    );
+}
+
+#[test]
+fn test_duplicate_terms_key_boundary_values() {
+    let (_env, client, issuer, buyer, _, usdc) = setup();
+
+    // Smallest accepted face value and the maximum create accepts.
+    let min_key = client.duplicate_terms_key(&issuer, &buyer, &1, &0, &usdc);
+    let max_key = client.duplicate_terms_key(&issuer, &buyer, &MAX_FACE_VALUE, &u64::MAX, &usdc);
+    assert_ne!(min_key, max_key);
+
+    // Same boundary inputs remain stable.
+    assert_eq!(
+        max_key,
+        client.duplicate_terms_key(&issuer, &buyer, &MAX_FACE_VALUE, &u64::MAX, &usdc)
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_duplicate_terms_key_rejects_self_invoicing() {
+    let (env, client, issuer, _, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    client.duplicate_terms_key(&issuer, &issuer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_duplicate_terms_key_rejects_zero_face_value() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    client.duplicate_terms_key(&issuer, &buyer, &0, &due_date, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_duplicate_terms_key_rejects_face_value_above_max() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let above_max = MAX_FACE_VALUE.checked_add(1).unwrap();
+    client.duplicate_terms_key(&issuer, &buyer, &above_max, &due_date, &usdc);
 }
 
 // ── Issue #196: repay from Funded, Active, or Confirmed ─────────────────────────
@@ -3268,6 +4440,105 @@ fn test_repay_from_expired_rejected() {
 }
 
 #[test]
+fn test_supported_asset_count_accepts_last_slot_then_rejects_overflow() {
+    let (env, client, _, _, _, _) = setup();
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&crate::DataKey::SupportedAssetCount, &(u32::MAX - 1));
+    });
+    let last = Address::generate(&env);
+    client.add_supported_asset(&last);
+    let overflow = Address::generate(&env);
+    assert!(client.try_add_supported_asset(&overflow).is_err());
+    env.as_contract(&client.address, || {
+        assert_eq!(
+            env.storage()
+                .instance()
+                .get::<_, u32>(&crate::DataKey::SupportedAssetCount),
+            Some(u32::MAX)
+        );
+        assert!(env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::SupportedAsset(last)));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::SupportedAsset(overflow)));
+    });
+}
+
+#[test]
+fn test_status_index_last_slot_and_page_range_at_u32_limit() {
+    let (env, client, _, _, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        let count_key = crate::DataKey::StatusIndexCount(InvoiceStatus::Created as u32);
+        env.storage().persistent().set(&count_key, &(u32::MAX - 1));
+        crate::extend_status_index(&env, InvoiceStatus::Created, &id);
+        assert_eq!(
+            env.storage().persistent().get::<_, u32>(&count_key),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get::<_, BytesN<32>>(&crate::DataKey::StatusIndexEntry(
+                    InvoiceStatus::Created as u32,
+                    u32::MAX - 1
+                )),
+            Some(id)
+        );
+        assert_eq!(
+            crate::page_range(&env, u32::MAX, u32::MAX - 1, 1),
+            (u32::MAX - 1, u32::MAX)
+        );
+        assert_eq!(crate::page_range(&env, u32::MAX, u32::MAX, 2), (0, 0));
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_extend_issuer_index_overflow_fails_before_scan_or_write() {
+    let (env, client, issuer, _buyer, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::IssuerIndexCount(issuer.clone()), &u32::MAX);
+        crate::extend_issuer_index(&env, &issuer, &id);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_extend_buyer_index_overflow_fails_before_scan_or_write() {
+    let (env, client, _issuer, buyer, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::BuyerIndexCount(buyer.clone()), &u32::MAX);
+        crate::extend_buyer_index(&env, &buyer, &id);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_extend_status_index_overflow_fails_before_scan_or_write() {
+    let (env, client, _issuer, _buyer, _, _) = setup();
+    let id = BytesN::from_array(&env, &[95; 32]);
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &crate::DataKey::StatusIndexCount(InvoiceStatus::Created as u32),
+            &u32::MAX,
+        );
+        crate::extend_status_index(&env, InvoiceStatus::Created, &id);
+    });
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #17)")]
 fn test_create_fails_counter_overflow() {
     let (env, client, issuer, buyer, _, usdc) = setup();
@@ -4030,6 +5301,99 @@ fn test_repay_early_reads_stored_funded_amount() {
     assert_eq!(inv.remaining_balance, 0);
 }
 
+// ============== EARLY-REPAYMENT DISCOUNT ROUNDING (issue #26) ==============
+//
+// Protocol decision: the pool's time-proportional discount is
+// `floor(discount * elapsed / term)` (rounded down to the stroop). The buyer
+// keeps the unearned remainder, so its net repayment is
+// `face_value - refund_to_buyer = funded_amount + earned_by_pool`.
+
+#[test]
+fn test_repay_early_zero_discount_refunds_nothing() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let face_value: u128 = DEFAULT_FACE_VALUE;
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &face_value, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &0);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &face_value);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+
+    env.ledger().set_timestamp(due_date / 2);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(MockPoolClient::new(&env, &pool).get_last_refund(), 0);
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), 0);
+}
+
+#[test]
+fn test_repay_early_non_divisible_rounds_pool_discount_down() {
+    let (env, client, buyer, invoice_id, pool, _) = setup_confirmed_invoice();
+    // face = 1_000_000_000, 200 bps -> discount = 20_000_000, term = 86_400s.
+    // elapsed = 1s: 20_000_000 / 86_400 = 231.48 -> floor = 231.
+    let face_value: u128 = DEFAULT_FACE_VALUE;
+    let expected_earned: u128 = 231;
+    let expected_refund: u128 = 20_000_000 - expected_earned;
+
+    let usdc = client.get(&invoice_id).funding_asset;
+    env.ledger().set_timestamp(1);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(
+        MockPoolClient::new(&env, &pool).get_last_refund(),
+        expected_refund
+    );
+
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), expected_refund as i128);
+    assert_eq!(face_value - expected_refund, 980_000_000 + expected_earned);
+}
+
+#[test]
+fn test_repay_early_max_valid_discount_rounds_down() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let face_value: u128 = 1_000_000_000;
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &face_value, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    // 5000 bps is the maximum accepted listing discount.
+    client.list_for_financing(&invoice_id, &5000);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &500_000_000);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+
+    // discount = 500_000_000; at elapsed = 1s over an 86_400s term:
+    // 500_000_000 / 86_400 = 5787.03 -> floor = 5787.
+    let expected_earned: u128 = 5787;
+    let expected_refund: u128 = 500_000_000 - expected_earned;
+    env.ledger().set_timestamp(1);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(
+        MockPoolClient::new(&env, &pool).get_last_refund(),
+        expected_refund
+    );
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), expected_refund as i128);
+}
+
 // ── Issue #872: expire_listing issuer path with explicit auth ────────────────
 //
 // The tests above run under `mock_all_auths()`, which masks the difference
@@ -4121,12 +5485,13 @@ fn attest_no_mock_auth(env: &Env, client: &InvoiceContractClient, invoice_id: &B
     );
 
     let payload = crate::AttestationPayload {
-        domain_separator: BytesN::from_array(env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        domain_separator: client.get_attestation_domain_separator(),
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9u8; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -4789,6 +6154,32 @@ fn test_batch_list_for_financing_emits_batch_summary_event() {
 }
 
 #[test]
+fn test_batch_invoice_listed_event_includes_expiry_deadline() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    env.ledger().set_timestamp(listed_at);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    let entries = vec![&env, (invoice_id.clone(), DEFAULT_DISCOUNT_BPS)];
+    let failed = client.batch_list_for_financing(&entries);
+    assert!(failed.is_empty());
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.get(events.len() - 2).unwrap();
+    assert_eq!(contract, client.address);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
+    );
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #28)")]
 fn test_batch_list_for_financing_rejects_oversized_batch() {
     let (env, client, _, _, _, _) = setup();
@@ -4929,4 +6320,238 @@ fn test_status_page_boundaries_after_swap_and_pop() {
     assert!(client
         .get_by_status(&InvoiceStatus::Created, &u32::MAX, &MAX_PAGE_SIZE)
         .is_empty());
+}
+
+fn index_contains(ids: &Vec<BytesN<32>>, target: &BytesN<32>) -> bool {
+    for id in ids.iter() {
+        if id.clone() == target.clone() {
+            return true;
+        }
+    }
+    false
+}
+
+fn status_index_count(env: &Env, client: &InvoiceContractClient, status: InvoiceStatus) -> u32 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&crate::DataKey::StatusIndexCount(status as u32))
+            .unwrap_or(0)
+    })
+}
+
+/// Compares the indexed status views against a ground-truth scan of every
+/// invoice, and verifies the compacted slot/position invariants.
+fn assert_status_views_match_linear(
+    env: &Env,
+    client: &InvoiceContractClient,
+    ids: &Vec<BytesN<32>>,
+) {
+    let statuses = [
+        InvoiceStatus::Created,
+        InvoiceStatus::Listed,
+        InvoiceStatus::Funded,
+        InvoiceStatus::Active,
+        InvoiceStatus::Confirmed,
+        InvoiceStatus::Repaid,
+        InvoiceStatus::Defaulted,
+        InvoiceStatus::Expired,
+        InvoiceStatus::Cancelled,
+    ];
+    let mut classified: u64 = 0;
+
+    for status in statuses {
+        let mut expected: Vec<BytesN<32>> = Vec::new(env);
+        for id in ids.iter() {
+            if client.get(id).status == status {
+                expected.push_back(id.clone());
+            }
+        }
+
+        let actual = client.get_by_status(&status, &0, &MAX_PAGE_SIZE);
+        assert_eq!(actual.len(), expected.len());
+
+        let mut seen: Vec<BytesN<32>> = Vec::new(env);
+        for invoice in actual.iter() {
+            assert_eq!(invoice.status, status);
+            assert!(!index_contains(&seen, &invoice.id), "duplicate status row");
+            assert!(index_contains(&expected, &invoice.id), "unexpected member");
+            seen.push_back(invoice.id.clone());
+        }
+        for id in expected.iter() {
+            assert!(index_contains(&seen, id), "missing status member");
+        }
+
+        let count = status_index_count(env, client, status);
+        assert_eq!(count, expected.len() as u32, "status slot count mismatch");
+
+        for id in ids.iter() {
+            let is_member = client.get(id).status == status;
+            assert_eq!(client.has_status_membership(&status, id), is_member);
+            match raw_status_position(env, client, status, id) {
+                Some(pos) => {
+                    assert!(is_member);
+                    assert!(pos < count);
+                    let stored: BytesN<32> = env.as_contract(&client.address, || {
+                        env.storage()
+                            .persistent()
+                            .get(&crate::DataKey::StatusIndexEntry(status as u32, pos))
+                            .unwrap()
+                    });
+                    assert_eq!(stored, id.clone(), "position points at wrong slot");
+                }
+                None => assert!(!is_member, "member is missing its position"),
+            }
+        }
+
+        classified += expected.len() as u64;
+    }
+
+    assert_eq!(classified, ids.len() as u64, "invoice counted twice");
+}
+
+#[test]
+fn test_status_membership_index_matches_linear_reads_across_transitions() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let base_time = env.ledger().timestamp();
+    let due_date = base_time + DEFAULT_DUE_OFFSET;
+
+    let mut ids: Vec<BytesN<32>> = Vec::new(&env);
+    for offset in 0..6u128 {
+        ids.push_back(client.create(
+            &issuer,
+            &buyer,
+            &(DEFAULT_FACE_VALUE + offset),
+            &due_date,
+            &usdc,
+        ));
+    }
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    let default_id = ids.get(0).unwrap();
+    let repaid_id = ids.get(1).unwrap();
+    let cancelled_id = ids.get(2).unwrap();
+    let listed_id = ids.get(3).unwrap();
+    let created_id = ids.get(4).unwrap();
+    let expired_id = ids.get(5).unwrap();
+
+    for id in [&default_id, &repaid_id, &expired_id, &listed_id] {
+        attest(&env, &client, id);
+        client.list_for_financing(id, &DEFAULT_DISCOUNT_BPS);
+    }
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    client.cancel(&cancelled_id);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&default_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT);
+    client.mark_funded(&repaid_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    client.mark_shipped(&default_id);
+    client.confirm_delivery(&default_id, &issuer);
+    client.confirm_delivery(&default_id, &buyer);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    client.set_expiry_window(&100);
+    env.ledger().set_timestamp(base_time + 101);
+    assert!(client.expire_listing(&expired_id, &issuer));
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    mint_tokens(&env, &usdc, &buyer, 2_000_000_000);
+    assert!(client.repay(&repaid_id));
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    env.ledger().set_timestamp(due_date);
+    client.trigger_default(&default_id);
+    assert_status_views_match_linear(&env, &client, &ids);
+
+    // Remaining non-terminal states are exactly as expected.
+    assert_eq!(client.get(&created_id).status, InvoiceStatus::Created);
+    assert_eq!(client.get(&listed_id).status, InvoiceStatus::Listed);
+    assert_status_views_match_linear(&env, &client, &ids);
+}
+
+#[test]
+fn test_migrate_status_index_compacts_legacy_rows_in_pages() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let id1 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let id2 = client.create(&issuer, &buyer, &(DEFAULT_FACE_VALUE + 1), &due_date, &usdc);
+    let id3 = client.create(&issuer, &buyer, &(DEFAULT_FACE_VALUE + 2), &due_date, &usdc);
+
+    attest(&env, &client, &id2);
+    client.list_for_financing(&id2, &DEFAULT_DISCOUNT_BPS);
+
+    // Reconstruct the pre-#22 append-only layout: Created is [id1, id2, id3]
+    // (id2 is now stale) and none of those rows has a position map entry.
+    env.as_contract(&client.address, || {
+        let created = InvoiceStatus::Created as u32;
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusIndexEntry(created, 2), &id2);
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusIndexCount(created), &3u32);
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusCount(created), &3u64);
+        for id in [&id1, &id2, &id3] {
+            env.storage()
+                .persistent()
+                .remove(&crate::status_position_key(InvoiceStatus::Created, id));
+            env.storage().persistent().set(
+                &crate::status_membership_key(InvoiceStatus::Created, id),
+                &true,
+            );
+        }
+        let listed = InvoiceStatus::Listed as u32;
+        env.storage()
+            .persistent()
+            .remove(&crate::status_position_key(InvoiceStatus::Listed, &id2));
+        env.storage().persistent().set(
+            &crate::status_membership_key(InvoiceStatus::Listed, &id2),
+            &true,
+        );
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusIndexCount(listed), &1u32);
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::StatusCount(listed), &1u64);
+    });
+
+    // Before migration the legacy marker still answers membership.
+    assert!(client.has_status_membership(&InvoiceStatus::Listed, &id2));
+
+    let (cursor, done) = client.migrate_status_index(&InvoiceStatus::Created, &2);
+    assert_eq!(cursor, 2);
+    assert!(!done);
+    let (cursor, done) = client.migrate_status_index(&InvoiceStatus::Created, &2);
+    assert_eq!(cursor, 3);
+    assert!(done);
+    let (_, done) = client.migrate_status_index(&InvoiceStatus::Listed, &MAX_PAGE_SIZE);
+    assert!(done);
+
+    let created = client.get_by_status(&InvoiceStatus::Created, &0, &MAX_PAGE_SIZE);
+    assert_eq!(created.len(), 2);
+    assert_eq!(created.get(0).unwrap().id, id1);
+    assert_eq!(created.get(1).unwrap().id, id3);
+    let listed = client.get_by_status(&InvoiceStatus::Listed, &0, &MAX_PAGE_SIZE);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.get(0).unwrap().id, id2);
+
+    assert_eq!(status_index_count(&env, &client, InvoiceStatus::Created), 2);
+    assert_eq!(status_index_count(&env, &client, InvoiceStatus::Listed), 1);
+    assert!(raw_status_position(&env, &client, InvoiceStatus::Created, &id1).is_some());
+    assert!(raw_status_position(&env, &client, InvoiceStatus::Created, &id2).is_none());
+    assert!(raw_status_position(&env, &client, InvoiceStatus::Created, &id3).is_some());
+    let counts = client.get_counts();
+    assert_eq!(counts.get(String::from_str(&env, "Created")), Some(2));
+    assert_eq!(counts.get(String::from_str(&env, "Listed")), Some(1));
 }

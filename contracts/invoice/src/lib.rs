@@ -1,11 +1,11 @@
 #![no_std]
 
+use clearledger_pause::{require_not_paused, set_paused};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token,
     xdr::{FromXdr, ToXdr},
     Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, Vec,
 };
-use clearledger_pause::{require_not_paused, set_paused};
 
 mod constants;
 mod errors;
@@ -33,11 +33,24 @@ pub const MAX_FACE_VALUE: u128 = u128::MAX / 10_000;
 /// in the future). The value is ~10 years (10 * 365 * 24 * 60 * 60).
 pub const MAX_INVOICE_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
-/// Fixed 32-byte domain separator that Underwrite agents must include in
-/// the [`AttestationPayload`] they sign. Binds a signature to this
-/// contract's attestation scheme specifically, so it can't be replayed
-/// against an unrelated contract or message format.
+/// Stable 32-byte protocol tag for ClearLedger invoice attestations.
+///
+/// This is mixed into the effective domain separator returned by
+/// [`InvoiceContract::get_attestation_domain_separator`]. Agents must put
+/// that returned value — not this raw tag — into
+/// [`AttestationPayload::domain_separator`]. The effective separator is
+/// `SHA-256(tag || network_id || contract_id_xdr)`, which binds a signature
+/// to this attestation scheme, the current Stellar network, and this exact
+/// invoice contract deployment.
 pub const ATTESTATION_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceAttest.v1____";
+
+/// Fixed 32-byte domain separator prefixed to the [`InvoiceContract::duplicate_terms_key`]
+/// digest input.
+///
+/// Binding the digest to this scheme prevents it from colliding with any other
+/// hash computed over an invoice's terms (for example the counter-based
+/// [`Invoice::id`]) and makes the `v1` composition explicit and upgradeable.
+pub const DUPLICATE_TERMS_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceDupTerms.v1__";
 
 /// Maximum number of invoices a single paginated `get_by_*` query may return.
 ///
@@ -60,6 +73,10 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// Requests over the cap panic with [`InvoiceError::BatchSizeExceeded`].
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// Default listing expiry window in seconds (7 days), used when the admin has
+/// not called `set_expiry_window`.
+pub const DEFAULT_EXPIRY_WINDOW: u64 = 7 * 24 * 60 * 60;
+
 #[contract]
 pub struct InvoiceContract;
 
@@ -70,6 +87,22 @@ impl InvoiceContract {
         env.storage()
             .persistent()
             .extend_ttl(&inv_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn expiry_window(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExpiryWindow)
+            .unwrap_or(DEFAULT_EXPIRY_WINDOW)
+    }
+
+    fn listing_expiry_timestamp(env: &Env, listed_at: u64) -> u64 {
+        Self::checked_listing_expiry_timestamp(env, listed_at)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+    }
+
+    fn checked_listing_expiry_timestamp(env: &Env, listed_at: u64) -> Option<u64> {
+        listed_at.checked_add(Self::expiry_window(env))
     }
 
     /// Initializes the invoice contract with admin and registry references.
@@ -84,8 +117,8 @@ impl InvoiceContract {
     ///
     /// # Panics
     /// * `InvoiceError::AlreadyInitialized` if the contract has already been initialized.
-    /// * `InvoiceError::InvalidConfiguration` if the registry address equals
-    ///   the admin or this invoice contract.
+    /// * `InvoiceError::InvalidContractAddress` if the registry address
+    ///   equals the admin or this invoice contract.
     ///
     /// # Returns
     /// * `()` - No value is returned.
@@ -180,8 +213,9 @@ impl InvoiceContract {
     ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the admin is not initialized.
-    /// * `InvoiceError::InvalidConfiguration` if the pool address aliases the
-    ///   admin, this invoice contract, registry, escrow, or agent registry.
+    /// * `InvoiceError::InvalidContractAddress` if the pool address aliases
+    ///   the admin, this invoice contract, registry, escrow, or agent
+    ///   registry.
     ///
     /// # Returns
     /// * `()` - No value is returned.
@@ -267,7 +301,7 @@ impl InvoiceContract {
     ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the admin is not initialized.
-    /// * `InvoiceError::InvalidConfiguration` if the agent-registry address
+    /// * `InvoiceError::InvalidContractAddress` if the agent-registry address
     ///   aliases the admin, this invoice contract, registry, pool, or escrow.
     ///
     /// # Returns
@@ -358,7 +392,7 @@ impl InvoiceContract {
     ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the admin is not initialized.
-    /// * `InvoiceError::InvalidConfiguration` if the escrow address aliases
+    /// * `InvoiceError::InvalidContractAddress` if the escrow address aliases
     ///   the admin, this invoice contract, registry, pool, or agent registry.
     ///
     /// # Returns
@@ -475,6 +509,9 @@ impl InvoiceContract {
     ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the admin has not been initialized.
+    /// * `InvoiceError::InvalidAsset` if `asset` aliases `admin`, this
+    ///   contract, or one of the wired registry/pool/escrow/agent-registry
+    ///   contracts. Validation runs before the allow-list is modified.
     ///
     /// # Returns
     /// * `()` - No value is returned.
@@ -499,6 +536,28 @@ impl InvoiceContract {
             .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotInitialized));
         admin.require_auth();
 
+        let mut other_wired_contracts = Vec::new(&env);
+        if let Some(pool) = env.storage().instance().get(&DataKey::PoolContract) {
+            other_wired_contracts.push_back(pool);
+        }
+        if let Some(escrow) = env.storage().instance().get(&DataKey::EscrowContract) {
+            other_wired_contracts.push_back(escrow);
+        }
+        if let Some(agent_registry) = env
+            .storage()
+            .instance()
+            .get(&DataKey::AgentRegistryContract)
+        {
+            other_wired_contracts.push_back(agent_registry);
+        }
+        Self::assert_valid_asset(
+            &env,
+            &asset,
+            &admin,
+            env.storage().instance().get(&DataKey::RegistryContract),
+            other_wired_contracts,
+        );
+
         let key = DataKey::SupportedAsset(asset.clone());
         if env.storage().persistent().has(&key) {
             return;
@@ -509,10 +568,16 @@ impl InvoiceContract {
             .instance()
             .get(&DataKey::SupportedAssetCount)
             .unwrap_or(0);
+        let next_count = count
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::CounterOverflow));
         env.storage()
             .instance()
-            .set(&DataKey::SupportedAssetCount, &(count + 1));
+            .set(&DataKey::SupportedAssetCount, &next_count);
         env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::extend_instance_ttl(&env);
         events::supported_asset_added(&env, &asset);
     }
@@ -616,6 +681,100 @@ impl InvoiceContract {
             .instance()
             .get(&DataKey::SupportedAssetCount)
             .unwrap_or(0)
+    }
+
+    /// Returns a deterministic digest of an invoice's issuer, buyer, and
+    /// commercial terms, for off-chain duplicate warnings.
+    ///
+    /// This is an advisory, read-only key. It performs no storage reads, needs
+    /// no authorization, and does **not** reject or alter [`Self::create`]:
+    /// two invoices with identical terms still get distinct invoice IDs (the
+    /// generated ID includes the monotonically increasing counter) and are
+    /// both persisted. Indexers can compare this key across invoices and warn
+    /// about re-submitted commercial terms without treating the result as a
+    /// uniqueness constraint.
+    ///
+    /// # Digest composition (`v1`)
+    ///
+    /// The returned value is
+    /// `SHA-256(DUPLICATE_TERMS_DOMAIN_SEPARATOR || fields)`, where `fields`
+    /// is, in order:
+    ///
+    /// 1. `u32` big-endian length + canonical Soroban XDR encoding of `issuer`
+    /// 2. `u32` big-endian length + canonical Soroban XDR encoding of `buyer`
+    /// 3. `face_value` as 16-byte big-endian (USDC stroops, 7 decimals; never a
+    ///    float)
+    /// 4. `due_date` as 8-byte big-endian (Unix seconds from the Stellar
+    ///    ledger clock)
+    /// 5. `u32` big-endian length + canonical Soroban XDR encoding of
+    ///    `funding_asset`
+    ///
+    /// Length-prefixing the variable-width address encodings and fixing the
+    /// scalar widths makes the concatenation unambiguous. The domain
+    /// separator ([`DUPLICATE_TERMS_DOMAIN_SEPARATOR`]) keeps the digest
+    /// distinct from the invoice ID and any other hash scheme. The current
+    /// invoice model has no description or metadata fields, so none are
+    /// included; if those fields are added, this composition must be revised
+    /// and the domain separator version bumped.
+    ///
+    /// The digest deliberately does **not** validate `due_date` against the
+    /// current ledger time, so the same inputs always produce the same key
+    /// regardless of when it is queried. It is also independent of the
+    /// counter and of later mutable financing terms such as `discount_bps`, so
+    /// the key remains stable across the invoice lifecycle.
+    ///
+    /// # Off-chain usage
+    ///
+    /// Clients can query this method through a Soroban RPC read/simulation
+    /// against the deployed (Testnet) invoice contract, or reproduce the
+    /// composition locally from the fields returned by [`Self::get`]. Soroban
+    /// `Address` values are canonical XDR encodings of the Stellar StrKey
+    /// address bytes, and amounts must be passed in stroops at 7-decimal asset
+    /// precision.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The invoice issuer address.
+    /// * `buyer` - The invoice buyer address.
+    /// * `face_value` - The face value in USDC stroops.
+    /// * `due_date` - The due date as Unix seconds.
+    /// * `funding_asset` - The funding asset (token contract) address.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `InvoiceError::InvalidParticipants` if `issuer == buyer`, matching
+    ///   [`Self::create`]'s participant check.
+    /// * `InvoiceError::InvalidFaceValue` if `face_value` is zero.
+    /// * `InvoiceError::InvalidAmount` if `face_value` exceeds
+    ///   [`MAX_FACE_VALUE`].
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The deterministic duplicate-terms key.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let key = client.duplicate_terms_key(&issuer, &buyer, &1_000, &due, &usdc);
+    /// ```
+    pub fn duplicate_terms_key(
+        env: Env,
+        issuer: Address,
+        buyer: Address,
+        face_value: u128,
+        due_date: u64,
+        funding_asset: Address,
+    ) -> BytesN<32> {
+        if issuer == buyer {
+            panic_with_error!(&env, InvoiceError::InvalidParticipants);
+        }
+        if face_value == 0 {
+            panic_with_error!(&env, InvoiceError::InvalidFaceValue);
+        }
+        if face_value > MAX_FACE_VALUE {
+            panic_with_error!(&env, InvoiceError::InvalidAmount);
+        }
+        duplicate_terms_digest(&env, &issuer, &buyer, face_value, due_date, &funding_asset)
     }
 
     /// Creates a new invoice with the given issuer, buyer, and terms.
@@ -912,6 +1071,8 @@ impl InvoiceContract {
     /// * `InvoiceError::NotFound` if the invoice does not exist.
     /// * `InvoiceError::VerificationRequired` if no Underwrite agent attestation has
     ///   been submitted for this invoice (see `submit_attestation`).
+    /// * `InvoiceError::AttestationExpired` if the submitted attestation has
+    ///   expired before listing.
     /// * `InvoiceError::InvalidStatusTransition` if invoice status is not `Created`.
     /// * `InvoiceError::IssuerNotVerified` if the issuer's registry verification
     ///   has since been revoked.
@@ -941,6 +1102,9 @@ impl InvoiceContract {
         {
             panic_with_error!(&env, InvoiceError::VerificationRequired);
         }
+        if Self::attestation_expired(&env, &invoice_id) {
+            panic_with_error!(&env, InvoiceError::AttestationExpired);
+        }
         invoice.issuer.require_auth();
         if invoice.status != InvoiceStatus::Created {
             panic_with_error!(&env, InvoiceError::InvalidStatusTransition);
@@ -966,9 +1130,11 @@ impl InvoiceContract {
         if discount_bps > 5000 {
             panic_with_error!(&env, InvoiceError::DiscountTooHigh);
         }
+        let listed_at = env.ledger().timestamp();
+        let expires_at = Self::listing_expiry_timestamp(&env, listed_at);
         invoice.status = InvoiceStatus::Listed;
         invoice.discount_bps = discount_bps;
-        invoice.listed_at = Some(env.ledger().timestamp());
+        invoice.listed_at = Some(listed_at);
         Self::save_invoice(&env, inv_key, &invoice);
         Self::extend_instance_ttl(&env);
 
@@ -978,7 +1144,7 @@ impl InvoiceContract {
             InvoiceStatus::Created,
             InvoiceStatus::Listed,
         );
-        events::invoice_listed(&env, &invoice_id, discount_bps);
+        events::invoice_listed(&env, &invoice_id, discount_bps, expires_at);
         true
     }
 
@@ -1093,6 +1259,9 @@ impl InvoiceContract {
         {
             return false;
         }
+        if Self::attestation_expired(env, invoice_id) {
+            return false;
+        }
         if !authorized.contains(&invoice.issuer) {
             invoice.issuer.require_auth();
             authorized.push_back(invoice.issuer.clone());
@@ -1108,9 +1277,13 @@ impl InvoiceContract {
         if discount_bps > 5000 {
             return false;
         }
+        let listed_at = env.ledger().timestamp();
+        let Some(expires_at) = Self::checked_listing_expiry_timestamp(env, listed_at) else {
+            return false;
+        };
         invoice.status = InvoiceStatus::Listed;
         invoice.discount_bps = discount_bps;
-        invoice.listed_at = Some(env.ledger().timestamp());
+        invoice.listed_at = Some(listed_at);
         Self::save_invoice(env, inv_key, &invoice);
 
         move_status_index(
@@ -1119,7 +1292,7 @@ impl InvoiceContract {
             InvoiceStatus::Created,
             InvoiceStatus::Listed,
         );
-        events::invoice_listed(env, invoice_id, discount_bps);
+        events::invoice_listed(env, invoice_id, discount_bps, expires_at);
         true
     }
 
@@ -1132,6 +1305,14 @@ impl InvoiceContract {
         let verified: bool =
             env.invoke_contract(registry_id, &Symbol::new(env, "is_verified"), args);
         verified
+    }
+
+    fn attestation_expired(env: &Env, invoice_id: &BytesN<32>) -> bool {
+        // Legacy attestations have no expiry key and retain their prior behavior.
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::AttestationExpiry(invoice_id.clone()))
+            .is_some_and(|expires_at| env.ledger().timestamp() >= expires_at)
     }
 
     /// Cancels an invoice while it is still in `Created` status.
@@ -1160,6 +1341,61 @@ impl InvoiceContract {
         true
     }
 
+    /// Returns the effective domain separator that Underwrite agents must
+    /// place in [`AttestationPayload::domain_separator`] before signing.
+    ///
+    /// It is computed as
+    /// `SHA-256(ATTESTATION_DOMAIN_SEPARATOR || network_id || contract_id_xdr)`,
+    /// where:
+    ///
+    /// * `ATTESTATION_DOMAIN_SEPARATOR` is the fixed ClearLedger scheme tag
+    ///   (`ClearLedger.InvoiceAttest.v1____`).
+    /// * `network_id` is the 32-byte value returned by
+    ///   [`soroban_sdk::ledger::Ledger::network_id`], i.e. `SHA-256` of the
+    ///   Stellar network passphrase (`Test SDF Network ; September 2015` on
+    ///   testnet, `Public Global Stellar Network ; September 2015` on
+    ///   mainnet). Binding it prevents an attestation signed for one network
+    ///   from being accepted on another.
+    /// * `contract_id_xdr` is this contract's address encoded as XDR.
+    ///   Binding it prevents a signature from being replayed against another
+    ///   invoice-contract deployment. Soroban contract IDs are themselves
+    ///   derived with the network ID, so this is an additional, explicit
+    ///   contract-level binding rather than a replacement for the network
+    ///   one.
+    ///
+    /// Agents should call this view against the invoice contract they intend
+    /// to attest to instead of hard-coding a separator.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// Does not panic.
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The domain separator to include in the signed payload.
+    pub fn get_attestation_domain_separator(env: Env) -> BytesN<32> {
+        Self::attestation_domain_separator(&env)
+    }
+
+    /// Computes the effective domain separator described on
+    /// [`Self::get_attestation_domain_separator`].
+    fn attestation_domain_separator(env: &Env) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        for byte in ATTESTATION_DOMAIN_SEPARATOR.iter() {
+            preimage.push_back(*byte);
+        }
+        let network_id = env.ledger().network_id();
+        for byte in network_id.to_array() {
+            preimage.push_back(byte);
+        }
+        let contract_id = env.current_contract_address().to_xdr(env);
+        for byte in contract_id.iter() {
+            preimage.push_back(byte);
+        }
+        env.crypto().sha256(&preimage).into()
+    }
+
     /// Submits a signed risk attestation from a registered Underwrite agent
     /// against an invoice, unlocking it for `list_for_financing`.
     ///
@@ -1173,8 +1409,8 @@ impl InvoiceContract {
     /// * `env` - The Soroban environment.
     /// * `invoice_id` - The invoice being attested.
     /// * `payload` - XDR-encoded [`AttestationPayload`]: `domain_separator`,
-    ///   `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`.
-    ///   This is exactly the byte string the agent signed.
+    ///   `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`, and
+    ///   `expires_at`. This is exactly the byte string the agent signed.
     /// * `signature` - A 65-byte recoverable secp256k1 signature over
     ///   `keccak256(payload)`: 64 bytes of `r || s` followed by a 1-byte
     ///   recovery id.
@@ -1184,6 +1420,47 @@ impl InvoiceContract {
     /// Trust comes entirely from the signature recovering to an active
     /// agent's registered pubkey, not from who relays the transaction.
     ///
+    /// # Signed preimage and replay / domain binding
+    ///
+    /// The signed preimage is exactly the XDR encoding of
+    /// [`AttestationPayload`]:
+    ///
+    /// ```text
+    /// domain_separator (BytesN<32>)
+    /// invoice_id       (BytesN<32>)
+    /// risk_score       (u32)
+    /// evidence_hash    (BytesN<32>)
+    /// agent_id         (Symbol)
+    /// nonce            (u64)
+    /// ```
+    ///
+    /// The digest is `keccak256(payload)` and the 65-byte signature is
+    /// `r || s || recovery_id`, so every field is cryptographically bound:
+    ///
+    /// * **Network + contract** — `domain_separator` must equal
+    ///   [`Self::get_attestation_domain_separator`], a hash over the scheme
+    ///   tag, `ledger.network_id()` (the network passphrase hash), and this
+    ///   contract's id. A signature made for another network or another
+    ///   invoice-contract deployment is rejected.
+    /// * **Invoice** — `invoice_id` must equal the `invoice_id` argument.
+    /// * **Agent identity** — `agent_id` is looked up in the configured
+    ///   agent registry, and the recovered pubkey must equal the registered
+    ///   active agent's pubkey. Changing the claimed agent changes the
+    ///   digest (and/or fails the pubkey match).
+    /// * **Nonce** — included in the digest, so reusing a signature with a
+    ///   different nonce recovers a different key and is rejected. There is
+    ///   deliberately no per-agent nonce ledger: the one-attestation-per-
+    ///   invoice storage guard is the on-chain replay guard, so distinct
+    ///   nonces cannot authorize a second attestation for the same invoice.
+    /// * **Risk data** — `risk_score` and `evidence_hash` are signed too;
+    ///   changing either invalidates the signature.
+    ///
+    /// The trust boundary is therefore: *anyone* may submit, but only a
+    /// signature produced by an agent whose registered pubkey matches the
+    /// recovered key, for this exact network, contract, invoice, risk data,
+    /// agent id, and nonce, can create the single stored attestation.
+
+    ///
     /// # Panics
     /// * `InvoiceError::NotFound` if the invoice does not exist, or if the
     ///   agent-registry contract has not been configured via
@@ -1192,6 +1469,8 @@ impl InvoiceContract {
     ///   `AttestationPayload`, if its `domain_separator` doesn't match this
     ///   contract's, or if its `invoice_id` doesn't match the `invoice_id`
     ///   argument.
+    /// * `InvoiceError::AttestationExpired` if `expires_at` is not strictly
+    ///   later than the current ledger timestamp.
     /// * `InvoiceError::UntrustedSigner` if the recovered signer is not an
     ///   active agent in the agent-registry, or its registered pubkey
     ///   doesn't match the recovered key.
@@ -1224,11 +1503,14 @@ impl InvoiceContract {
 
         let decoded: AttestationPayload = AttestationPayload::from_xdr(&env, &payload)
             .unwrap_or_else(|_| panic_with_error!(&env, InvoiceError::InvalidAmount));
-        if decoded.domain_separator != BytesN::from_array(&env, &ATTESTATION_DOMAIN_SEPARATOR) {
+        if decoded.domain_separator != Self::attestation_domain_separator(&env) {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
         }
         if decoded.invoice_id != invoice_id {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
+        }
+        if decoded.expires_at <= env.ledger().timestamp() {
+            panic_with_error!(&env, InvoiceError::AttestationExpired);
         }
 
         // Split the 65-byte recoverable signature into its 64-byte r||s
@@ -1268,6 +1550,13 @@ impl InvoiceContract {
         env.storage()
             .persistent()
             .extend_ttl(&attestation_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        let expiry_key = DataKey::AttestationExpiry(invoice_id.clone());
+        env.storage()
+            .persistent()
+            .set(&expiry_key, &decoded.expires_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::extend_instance_ttl(&env);
 
         events::attestation_submitted(&env, &invoice_id, &decoded.agent_id, decoded.risk_score);
@@ -1294,9 +1583,21 @@ impl InvoiceContract {
     ///   address that can self-authorize could hijack an invoice's
     ///   `funding_pool` (issue #553).
     /// * `InvoiceError::InvalidStatusTransition` if invoice status is not `Listed`.
+    /// * `InvoiceError::ListingExpired` if `now >= listed_at + expiry_window`.
+    ///   A listing is no longer fundable from its expiry deadline onward, even
+    ///   when `expire_listing` has not been called yet.
     /// * `InvoiceError::UnsupportedAsset` if the asset does not match the invoice funding asset.
     /// * `InvoiceError::InvalidAmount` if `funded_amount` is zero or exceeds
     ///   the invoice's `face_value` (issue #554).
+    ///
+    /// # Same-ledger ordering
+    /// Funding and expiry are ordered by ledger time, not by submission order.
+    /// Before the deadline, funding wins: a same-ledger `expire_listing` sees
+    /// `Funded` and fails with `InvalidStatusTransition`. At or after the
+    /// deadline, expiry wins: funding fails with `ListingExpired` regardless
+    /// of whether `expire_listing` ran first. The first call that changes the
+    /// status wins; the second observes the new status and fails, leaving no
+    /// partial state.
     ///
     /// # Returns
     /// * `bool` - `true` when funding is recorded.
@@ -1344,6 +1645,19 @@ impl InvoiceContract {
         if invoice.status != InvoiceStatus::Listed {
             panic_with_error!(&env, InvoiceError::InvalidStatusTransition);
         }
+        let expiry_window = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExpiryWindow)
+            .unwrap_or(7 * 24 * 60 * 60);
+        let deadline = invoice
+            .listed_at
+            .unwrap_or(0)
+            .checked_add(expiry_window)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
+        if env.ledger().timestamp() >= deadline {
+            panic_with_error!(&env, InvoiceError::ListingExpired);
+        }
         if funded_amount > invoice.face_value {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
         }
@@ -1367,6 +1681,7 @@ impl InvoiceContract {
             InvoiceStatus::Listed,
             InvoiceStatus::Funded,
         );
+        events::invoice_funded_v1(&env, &invoice_id, funded_amount);
         events::invoice_funded(&env, &invoice_id, funded_amount);
         true
     }
@@ -1534,6 +1849,16 @@ impl InvoiceContract {
     /// Once cumulative repayment equals `face_value`, the escrow releases the funds
     /// to the pool, the pool's repayment accounting is updated, the invoice transitions
     /// to `Repaid`, and `invoice_repaid` is emitted.
+    ///
+    /// # Early-repayment discount rounding (issue #26)
+    ///
+    /// The pool's time-proportional share of the discount is
+    /// `floor(discount * elapsed / term)`: it is rounded **down** to the whole
+    /// stroop. The buyer receives the remainder as a refund, so the buyer's net
+    /// repayment is `face_value - refund_to_buyer`, i.e.
+    /// `funded_amount + floor(discount * elapsed / term)`. Rounding in the
+    /// buyer's favour means the pool is never credited more discount than the
+    /// elapsed term justifies, and no stroop is manufactured by division.
     pub fn repay_partial(env: Env, invoice_id: BytesN<32>, amount: u128) -> bool {
         require_not_paused(&env);
         let inv_key = DataKey::Invoice(invoice_id.clone());
@@ -1604,17 +1929,16 @@ impl InvoiceContract {
                 .funded_at
                 .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
             let discount = face_value.saturating_sub(funded_amount);
-            let term = invoice.due_date.saturating_sub(funded_at);
-            let elapsed = now.saturating_sub(funded_at);
-            let earned_by_pool = if term == 0 {
-                discount
-            } else {
-                discount
-                    .checked_mul(elapsed as u128)
-                    .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow))
-                    / (term as u128)
-            };
-            let refund_to_buyer = discount.saturating_sub(earned_by_pool);
+            let earned_by_pool = Self::early_repayment_earned_discount(
+                &env,
+                discount,
+                funded_at,
+                invoice.due_date,
+                now,
+            );
+            let refund_to_buyer = discount
+                .checked_sub(earned_by_pool)
+                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
 
             // Step 2: escrow releases full face_value back to pool
             let mut escrow_args = Vec::new(&env);
@@ -1667,6 +1991,38 @@ impl InvoiceContract {
         Self::repay_partial(env, invoice_id, invoice.remaining_balance)
     }
 
+    /// Returns the discount the pool has earned by `now`, rounded down.
+    ///
+    /// Rule (issue #26): `earned = floor(discount * elapsed / term)`, where
+    /// `elapsed = now - funded_at` and `term = due_date - funded_at`, clamped
+    /// via saturating subtraction to non-negative values. `elapsed` is clamped
+    /// to `term`, so settlement after the due date still earns at most the
+    /// full discount and the buyer refund never underflows. Integer division
+    /// truncates toward zero, so the pool never earns a fractional stroop and
+    /// the unearned remainder is refunded to the buyer. When `term == 0` the
+    /// whole discount is earned (no time remains to pro-rate over).
+    ///
+    /// All multiplications are checked; overflow panics with
+    /// [`InvoiceError::MathOverflow`].
+    fn early_repayment_earned_discount(
+        env: &Env,
+        discount: u128,
+        funded_at: u64,
+        due_date: u64,
+        now: u64,
+    ) -> u128 {
+        let term = due_date.saturating_sub(funded_at);
+        if term == 0 {
+            return discount;
+        }
+        let elapsed = now.saturating_sub(funded_at).min(term);
+        discount
+            .checked_mul(elapsed as u128)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+            .checked_div(term as u128)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+    }
+
     /// Repays a confirmed invoice before its due date, returning the
     /// pro-rated discount to the buyer.
     ///
@@ -1677,6 +2033,14 @@ impl InvoiceContract {
     /// remaining discount is refunded back to the buyer. This function must
     /// be called before `due_date` — once the invoice is due, use
     /// [`Self::repay`] instead.
+    ///
+    /// # Rounding
+    ///
+    /// The pool's earned discount is `floor(discount * elapsed / term)`,
+    /// rounded **down** to the stroop (integer division truncates). The buyer
+    /// gets the remainder, so its net repayment is
+    /// `face_value - refund_to_buyer = funded_amount + earned_by_pool`.
+    /// See [`Self::early_repayment_earned_discount`].
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -1733,18 +2097,16 @@ impl InvoiceContract {
         }
 
         let _prev_status = invoice.status;
-        let term = invoice.due_date.saturating_sub(funded_at);
-        let elapsed = now.saturating_sub(funded_at);
-
-        let earned_by_pool = if term == 0 {
-            discount
-        } else {
-            discount
-                .checked_mul(elapsed as u128)
-                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow))
-                / (term as u128)
-        };
-        let refund_to_buyer = discount.saturating_sub(earned_by_pool);
+        let earned_by_pool = Self::early_repayment_earned_discount(
+            &env,
+            discount,
+            funded_at,
+            invoice.due_date,
+            now,
+        );
+        let refund_to_buyer = discount
+            .checked_sub(earned_by_pool)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
 
         let buyer = invoice.buyer.clone();
         let funding_asset = invoice.funding_asset.clone();
@@ -2011,10 +2373,7 @@ impl InvoiceContract {
     /// let window = client.get_expiry_window();
     /// ```
     pub fn get_expiry_window(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ExpiryWindow)
-            .unwrap_or(7 * 24 * 60 * 60)
+        Self::expiry_window(&env)
     }
 
     /// Expires a listing whose expiry window has passed.
@@ -2042,6 +2401,15 @@ impl InvoiceContract {
     /// * `InvoiceError::NotAuthorized` if `caller` is neither the issuer nor the admin.
     /// * `InvoiceError::ListingNotExpired` if `now < listed_at + expiry_window`.
     /// * `InvoiceError::MathOverflow` if `listed_at + expiry_window` overflows.
+    ///
+    /// # Same-ledger ordering
+    /// The deadline is inclusive: at exactly `listed_at + expiry_window` the
+    /// listing is already expired. If `mark_funded` ran first in the same
+    /// ledger, this call sees `Funded` and fails with
+    /// `InvalidStatusTransition`; if it runs first, funding then fails with
+    /// `ListingExpired`. Before the deadline the reverse holds: funding wins
+    /// and this call fails with `ListingNotExpired`. In every ordering at most
+    /// one of the two calls mutates the listing.
     ///
     /// # Returns
     /// * `bool` - `true` when the listing is expired.
@@ -2076,15 +2444,8 @@ impl InvoiceContract {
         }
 
         let listed_at = invoice.listed_at.unwrap_or(0);
-        let expiry_window = env
-            .storage()
-            .instance()
-            .get(&DataKey::ExpiryWindow)
-            .unwrap_or(7 * 24 * 60 * 60);
         let current_time = env.ledger().timestamp();
-        let deadline = listed_at
-            .checked_add(expiry_window)
-            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
+        let deadline = Self::listing_expiry_timestamp(&env, listed_at);
 
         if current_time < deadline {
             panic_with_error!(&env, InvoiceError::ListingNotExpired);
@@ -2127,13 +2488,14 @@ impl InvoiceContract {
     /// Returns `true` when `invoice_id` is currently a member of `status`'s
     /// index.
     ///
-    /// Backed by [`DataKey::StatusMembership`], so the check is O(1): a single
+    /// Backed by [`DataKey::StatusPosition`], so the check is O(1): a single
     /// persistent-storage read whose cost does not grow with the number of
-    /// invoices sharing that status. The marker is written when an invoice
+    /// invoices sharing that status. The position is written when an invoice
     /// enters a status (`create` / [`Self::list_for_financing`] and every
     /// status transition routed through `move_status_index`) and removed when
     /// it leaves, so a `false` result means the invoice is not — or is no
-    /// longer — in that status.
+    /// longer — in that status. Pre-upgrade rows without a position fall back
+    /// to the legacy membership marker until migrated.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -2179,6 +2541,41 @@ impl InvoiceContract {
     /// ```
     pub fn get_face_value(env: Env, invoice_id: BytesN<32>) -> u128 {
         Self::get_invoice(&env, invoice_id).face_value
+    }
+
+    /// Returns the amount committed when an invoice was funded.
+    ///
+    /// This is the value `mark_funded` recorded in [`Invoice::funded_amount`],
+    /// denominated in USDC stroops. The accessor is read-only: it requires no
+    /// authorization, writes no state, and does not extend TTL.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `invoice_id` - The invoice to query.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `InvoiceError::NotInitialized` if the contract has not been initialized.
+    /// * `InvoiceError::NotFound` if the invoice cannot be found.
+    /// * `InvoiceError::NotFunded` if the invoice exists but has not been
+    ///   funded yet. An invoice that has never been funded has no committed
+    ///   amount, so this is reported explicitly rather than as `0`.
+    ///
+    /// # Returns
+    /// * `u128` - The amount committed at funding, in USDC stroops.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let funded_amount = client.get_funded_amount(&invoice_id);
+    /// ```
+    pub fn get_funded_amount(env: Env, invoice_id: BytesN<32>) -> u128 {
+        let invoice = Self::get_invoice(&env, invoice_id);
+        if invoice.funded_at.is_none() {
+            panic_with_error!(&env, InvoiceError::NotFunded);
+        }
+        invoice.funded_amount
     }
 
     /// Returns the remaining balance to be repaid on an invoice.
@@ -2291,11 +2688,26 @@ impl InvoiceContract {
 
     /// Lists a page of invoices for a given status.
     ///
-    /// The status index is append-only (entries are not reclaimed when an
-    /// invoice moves to another status), so results are filtered to invoices
-    /// whose *current* status matches and a page can therefore be shorter than
-    /// `page_size`. Pagination bounds the number of invoices hydrated per call,
-    /// keeping the read within the Soroban CPU/memory budget (issue #71).
+    /// The index stores only current members: entering a status appends to the
+    /// compact slot array and leaving it swap-and-pops the departed slot using
+    /// the O(1) [`DataKey::StatusPosition`] map. A page therefore hydrates only
+    /// the requested members, never the full historical invoice list, and its
+    /// cost is bounded by `page_size` (issue #71 / #22).
+    ///
+    /// # Ordering
+    ///
+    /// Results follow the compacted slot order. This preserves insertion order
+    /// while no member leaves; a departure moves the previous last member into
+    /// the vacated slot, matching the documented swap-and-pop compaction
+    /// behavior (see `test_move_status_index_compacts_storage`).
+    ///
+    /// # Legacy rows
+    ///
+    /// Rows written before the position map existed remain in the array until
+    /// they are migrated or transition. Each page is still filtered to its
+    /// *current* status, so legacy stale rows never leak into results; such a
+    /// page can be shorter than `page_size` until
+    /// [`Self::migrate_status_index`] finishes.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -2541,6 +2953,147 @@ impl InvoiceContract {
         counts
     }
 
+    /// Migrates one status's pre-upgrade index to the bounded membership
+    /// index, one bounded page at a time.
+    ///
+    /// Call repeatedly with increasing progress until the returned `done` flag
+    /// is `true`. Each call processes at most `page_size` source slots
+    /// (`page_size <= MAX_PAGE_SIZE`), reads each invoice once, rewrites only
+    /// live members into the compact prefix, and records their O(1)
+    /// [`DataKey::StatusPosition`]. On the final page, stale trailing slots
+    /// and the old legacy markers are removed.
+    ///
+    /// # Migration note
+    ///
+    /// Upgrading from the old append-only shape does not require downtime for
+    /// correctness: transitions lazily seed a missing position with a one-time
+    /// compatibility scan, and `get_by_status` keeps filtering each page. Run
+    /// this function for every status (ideally while paused) to remove stale
+    /// historical rows and to make all transitions fully O(1) without a
+    /// lazy scan. Repeat for `Created`, `Listed`, `Funded`, `Active`,
+    /// `Confirmed`, `Repaid`, `Defaulted`, `Expired`, and `Cancelled`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `status` - The status index to migrate.
+    /// * `page_size` - Maximum source slots to scan in this call; must be in
+    ///   `1..=MAX_PAGE_SIZE`.
+    ///
+    /// # Auth
+    /// Requires authorization from the stored admin.
+    ///
+    /// # Panics
+    /// * `InvoiceError::NotInitialized` if the contract has not been initialized.
+    /// * `InvoiceError::InvalidPageSize` if `page_size` is zero or greater than
+    ///   [`MAX_PAGE_SIZE`].
+    /// * `InvoiceError::NotFound` if an indexed invoice record is missing.
+    ///
+    /// # Returns
+    /// * `(u32, bool)` - `(slots_scanned, done)` where `slots_scanned` is the
+    ///   source cursor after this call.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (cursor, done) = client.migrate_status_index(&InvoiceStatus::Created, &50);
+    /// ```
+    pub fn migrate_status_index(
+        env: Env,
+        status: InvoiceStatus,
+        page_size: u32,
+    ) -> (u32, bool) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotInitialized));
+        admin.require_auth();
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            panic_with_error!(&env, InvoiceError::InvalidPageSize);
+        }
+
+        let status_u32 = status as u32;
+        let count_key = DataKey::StatusIndexCount(status_u32);
+        let source_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0);
+
+        let cursor_key = DataKey::StatusMigrationCursor(status);
+        let kept_key = DataKey::StatusMigrationKept(status);
+        let cursor: u32 = env
+            .storage()
+            .persistent()
+            .get(&cursor_key)
+            .unwrap_or(0);
+        let mut kept: u32 = env.storage().persistent().get(&kept_key).unwrap_or(0);
+
+        let end = core::cmp::min(cursor.saturating_add(page_size), source_count);
+        for i in cursor..end {
+            let entry_key = DataKey::StatusIndexEntry(status_u32, i);
+            let id: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&entry_key)
+                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
+            let invoice: Invoice = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Invoice(id.clone()))
+                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
+
+            if invoice.status == status {
+                let target_key = DataKey::StatusIndexEntry(status_u32, kept);
+                if kept != i {
+                    env.storage().persistent().set(&target_key, &id);
+                }
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&target_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                write_status_position(&env, status, &id, kept);
+                kept += 1;
+            } else {
+                // Stale historical row: drop any membership artefacts.
+                clear_status_membership(&env, status, &id);
+            }
+        }
+
+        let done = end >= source_count;
+        if done {
+            let mut i = kept;
+            while i < source_count {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::StatusIndexEntry(status_u32, i));
+                i += 1;
+            }
+            env.storage().persistent().set(&count_key, &kept);
+            env.storage()
+                .persistent()
+                .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            let status_count_key = DataKey::StatusCount(status_u32);
+            env.storage()
+                .persistent()
+                .set(&status_count_key, &(kept as u64));
+            env.storage()
+                .persistent()
+                .extend_ttl(&status_count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage().persistent().remove(&cursor_key);
+            env.storage().persistent().remove(&kept_key);
+        } else {
+            env.storage().persistent().set(&cursor_key, &end);
+            env.storage()
+                .persistent()
+                .extend_ttl(&cursor_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            env.storage().persistent().set(&kept_key, &kept);
+            env.storage()
+                .persistent()
+                .extend_ttl(&kept_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+
+        (end, done)
+    }
+
     /// Returns the issuer address for an invoice.
     ///
     /// # Arguments
@@ -2712,11 +3265,35 @@ impl InvoiceContract {
             || candidate == &env.current_contract_address()
             || registry_contract.as_ref() == Some(candidate)
         {
-            panic_with_error!(env, InvoiceError::InvalidConfiguration);
+            panic_with_error!(env, InvoiceError::InvalidContractAddress);
         }
         for configured in other_wired_contracts {
             if &configured == candidate {
-                panic_with_error!(env, InvoiceError::InvalidConfiguration);
+                panic_with_error!(env, InvoiceError::InvalidContractAddress);
+            }
+        }
+    }
+
+    /// Rejects wiring a non-token address as a supported funding asset. The
+    /// same address set rejected by [`Self::assert_valid_wiring_address`] is
+    /// reserved; using `InvalidAsset` distinguishes a bad asset id from a bad
+    /// contract-role assignment.
+    fn assert_valid_asset(
+        env: &Env,
+        candidate: &Address,
+        admin: &Address,
+        registry_contract: Option<Address>,
+        other_wired_contracts: Vec<Address>,
+    ) {
+        if candidate == admin
+            || candidate == &env.current_contract_address()
+            || registry_contract.as_ref() == Some(candidate)
+        {
+            panic_with_error!(env, InvoiceError::InvalidAsset);
+        }
+        for configured in other_wired_contracts {
+            if &configured == candidate {
+                panic_with_error!(env, InvoiceError::InvalidAsset);
             }
         }
     }
@@ -2742,6 +3319,54 @@ impl InvoiceContract {
     }
 }
 
+/// Appends a big-endian `u32` byte length followed by the bytes themselves.
+///
+/// Used by [`duplicate_terms_digest`] so variable-width XDR-encoded addresses
+/// cannot be confused with one another or with adjacent fixed-width fields.
+fn append_length_prefixed(input: &mut Bytes, value: &Bytes) {
+    for b in value.len().to_be_bytes() {
+        input.push_back(b);
+    }
+    for b in value.iter() {
+        input.push_back(b);
+    }
+}
+
+/// Builds the deterministic `v1` duplicate-terms digest documented on
+/// [`InvoiceContract::duplicate_terms_key`].
+///
+/// Kept separate from the public entry point so the composition can be
+/// exercised directly and reused if another view needs the same warning key.
+fn duplicate_terms_digest(
+    env: &Env,
+    issuer: &Address,
+    buyer: &Address,
+    face_value: u128,
+    due_date: u64,
+    funding_asset: &Address,
+) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    for b in DUPLICATE_TERMS_DOMAIN_SEPARATOR.iter() {
+        input.push_back(*b);
+    }
+
+    let issuer_xdr = issuer.clone().to_xdr(env);
+    let buyer_xdr = buyer.clone().to_xdr(env);
+    let asset_xdr = funding_asset.clone().to_xdr(env);
+
+    append_length_prefixed(&mut input, &issuer_xdr);
+    append_length_prefixed(&mut input, &buyer_xdr);
+    for b in face_value.to_be_bytes() {
+        input.push_back(b);
+    }
+    for b in due_date.to_be_bytes() {
+        input.push_back(b);
+    }
+    append_length_prefixed(&mut input, &asset_xdr);
+
+    env.crypto().sha256(&input).into()
+}
+
 /// Checks that an address is verified in the registry, panicking with the
 /// provided error if not.
 fn require_verified(env: &Env, registry_id: &Address, addr: &Address, err: InvoiceError) {
@@ -2761,13 +3386,16 @@ fn require_verified(env: &Env, registry_id: &Address, addr: &Address, err: Invoi
 /// * `invoice_id` - The invoice ID to add.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics with `CounterOverflow` when the index has no remaining capacity.
 ///
 /// # Returns
 /// * `()` - No value is returned.
 fn extend_issuer_index(env: &Env, issuer: &Address, invoice_id: &BytesN<32>) {
     let count_key = DataKey::IssuerIndexCount(issuer.clone());
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, InvoiceError::CounterOverflow));
 
     // Check if invoice_id already exists in this issuer index
     for i in 0..count {
@@ -2784,7 +3412,7 @@ fn extend_issuer_index(env: &Env, issuer: &Address, invoice_id: &BytesN<32>) {
 
     let entry_key = DataKey::IssuerIndexEntry(issuer.clone(), count);
     env.storage().persistent().set(&entry_key, invoice_id);
-    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage().persistent().set(&count_key, &next_count);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -2801,13 +3429,16 @@ fn extend_issuer_index(env: &Env, issuer: &Address, invoice_id: &BytesN<32>) {
 /// * `invoice_id` - The invoice ID to add.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics with `CounterOverflow` when the index has no remaining capacity.
 ///
 /// # Returns
 /// * `()` - No value is returned.
 fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
     let count_key = DataKey::BuyerIndexCount(buyer.clone());
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, InvoiceError::CounterOverflow));
 
     // Check if invoice_id already exists in this buyer index
     for i in 0..count {
@@ -2824,7 +3455,7 @@ fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
 
     let entry_key = DataKey::BuyerIndexEntry(buyer.clone(), count);
     env.storage().persistent().set(&entry_key, invoice_id);
-    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage().persistent().set(&count_key, &next_count);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
@@ -2835,10 +3466,13 @@ fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
 
 /// Adds an invoice ID to the status index if not already present.
 ///
-/// Duplicate detection uses the O(1) [`DataKey::StatusMembership`] marker
-/// instead of scanning every `StatusIndexEntry` row, and the marker is written
-/// (with the usual `TTL_THRESHOLD`/`TTL_EXTEND_TO` extension) as soon as the
-/// entry is appended.
+/// Membership is the O(1) [`DataKey::StatusPosition`] map (full invoice id ->
+/// slot), so this never scans the status's historical entries. The id is
+/// appended at the current slot count and the position record is written with
+/// the usual `TTL_THRESHOLD`/`TTL_EXTEND_TO` extension. Because a leaving
+/// invoice is swap-and-popped by [`remove_from_status_index`], the slot array
+/// only ever contains current members and cannot grow with historical
+/// transitions.
 ///
 /// # Arguments
 /// * `env` - The Soroban environment.
@@ -2846,41 +3480,44 @@ fn extend_buyer_index(env: &Env, buyer: &Address, invoice_id: &BytesN<32>) {
 /// * `invoice_id` - The invoice ID to add.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics with `CounterOverflow` when the index has no remaining capacity.
 ///
 /// # Returns
 /// * `()` - No value is returned.
 fn extend_status_index(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>) {
-    // O(1) membership check — the previous implementation looped over every
-    // `StatusIndexEntry` of this status to find duplicates (issue #831).
-    if read_status_membership(env, status, invoice_id) {
+    // Position presence is authoritative membership. The legacy short-id
+    // marker is deliberately not consulted here: it is only a read fallback
+    // for data written before this index shape existed.
+    if read_status_position(env, status, invoice_id).is_some() {
         return; // Already a member, skip duplicate
     }
 
     let status_u32 = status as u32;
     let count_key = DataKey::StatusIndexCount(status_u32);
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let next_count = count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, InvoiceError::CounterOverflow));
 
     let entry_key = DataKey::StatusIndexEntry(status_u32, count);
     env.storage().persistent().set(&entry_key, invoice_id);
-    env.storage().persistent().set(&count_key, &(count + 1));
+    env.storage().persistent().set(&count_key, &next_count);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     env.storage()
         .persistent()
         .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
-    write_status_membership(env, status, invoice_id);
+    write_status_position(env, status, invoice_id, count);
 }
 
 /// Moves an invoice ID from one status index to another, with idempotency for replayed transitions.
 ///
-/// Both sides of the move are driven by the O(1) [`DataKey::StatusMembership`]
-/// marker: the target status is checked with a single storage read (the
-/// previous implementation scanned every `StatusIndexEntry` row of the target
-/// status), the marker for `from` is removed, and `extend_status_index` writes
-/// the marker for `to`. A replayed transition therefore returns early without
-/// modifying counts or indexes.
+/// Both sides of the move are O(1): the target status is checked through its
+/// [`DataKey::StatusPosition`] map, the source position is looked up directly
+/// for a swap-and-pop removal, and `extend_status_index` appends to the
+/// target. No step scans the status's historical invoice list. A replayed
+/// transition returns early without modifying counts or indexes.
 ///
 /// # Arguments
 /// * `env` - The Soroban environment.
@@ -2902,79 +3539,120 @@ fn move_status_index(env: &Env, invoice_id: &BytesN<32>, from: InvoiceStatus, to
 
     decrement_status_count(env, from);
     increment_status_count(env, to);
-    clear_status_membership(env, from, invoice_id);
     remove_from_status_index(env, from, invoice_id);
     extend_status_index(env, to, invoice_id);
 }
 
 /// Removes an invoice from the `StatusIndexEntry` array for `status` using a
 /// swap-and-pop strategy: the entry holding `invoice_id` is overwritten with
-/// the last entry in the array, and the now-trailing key is deleted from
-/// storage. `StatusIndexCount` is decremented accordingly.
+/// the last entry in the array, the moved invoice's position is rewritten, and
+/// the now-trailing key is deleted from storage. `StatusIndexCount` is
+/// decremented accordingly.
 ///
-/// This prevents the storage leak previously caused by `move_status_index`
-/// only clearing the membership marker and `StatusCount` without touching
-/// the underlying index array (issue #435).
+/// The source slot comes from [`DataKey::StatusPosition`], so a normal
+/// transition performs a constant number of reads/writes regardless of how
+/// many invoices share the status. The slot array holds only current members
+/// (plus any pre-upgrade rows awaiting migration), so it cannot grow with
+/// historical transitions (issues #22 / #435).
 ///
-/// If `invoice_id` is not found in the index (e.g. legacy data written
-/// before compaction was added), the function is a silent no-op so that
-/// existing transitions don't panic.
+/// If the position is absent — an invoice written before this storage shape
+/// existed — the function performs a one-time compatibility scan to locate the
+/// legacy slot, records the position for future O(1) transitions, and then
+/// compacts normally. If the id is not present at all, the function is a
+/// silent no-op so that legacy transitions don't panic.
 fn remove_from_status_index(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>) {
     let status_u32 = status as u32;
     let count_key = DataKey::StatusIndexCount(status_u32);
     let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
-    // Find the position of the invoice in the index.
-    let mut pos: Option<u32> = None;
-    for i in 0..count {
-        let entry_id: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::StatusIndexEntry(status_u32, i))
-            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::NotFound));
-        if entry_id == *invoice_id {
-            pos = Some(i);
-            break;
+    let pos = match read_status_position(env, status, invoice_id) {
+        Some(pos) => pos,
+        None => {
+            // Legacy compatibility path: older rows have no position map. Find
+            // the slot once, seed the map, and from then on removal is O(1).
+            let mut found: Option<u32> = None;
+            for i in 0..count {
+                let entry_id: BytesN<32> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::StatusIndexEntry(status_u32, i))
+                    .unwrap_or_else(|| panic_with_error!(env, InvoiceError::NotFound));
+                if entry_id == *invoice_id {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(pos) => {
+                    write_status_position(env, status, invoice_id, pos);
+                    pos
+                }
+                None => {
+                    clear_status_membership(env, status, invoice_id);
+                    return;
+                }
+            }
         }
-    }
-
-    let i = match pos {
-        Some(i) => i,
-        // Invoice not found in the index — nothing to compact.
-        None => return,
     };
 
+    if pos >= count {
+        // Corrupt/legacy position: do not index past the live slot array.
+        clear_status_membership(env, status, invoice_id);
+        return;
+    }
+
     let last = count - 1;
-    if i != last {
+    if pos != last {
         // Swap the found entry with the last entry.
         let last_id: BytesN<32> = env
             .storage()
             .persistent()
             .get(&DataKey::StatusIndexEntry(status_u32, last))
             .unwrap_or_else(|| panic_with_error!(env, InvoiceError::NotFound));
-        let swap_key = DataKey::StatusIndexEntry(status_u32, i);
+        let swap_key = DataKey::StatusIndexEntry(status_u32, pos);
         env.storage().persistent().set(&swap_key, &last_id);
         env.storage()
             .persistent()
             .extend_ttl(&swap_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        if read_status_position(env, status, &last_id).is_some() {
+            write_status_position(env, status, &last_id, pos);
+        } else {
+            // Legacy row without a position: only claim membership if the
+            // invoice really is in this status. Otherwise leave it as a stale
+            // row for `migrate_status_index` to drop (reads already filter it).
+            let last_invoice: Invoice = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Invoice(last_id.clone()))
+                .unwrap_or_else(|| panic_with_error!(env, InvoiceError::NotFound));
+            if last_invoice.status == status {
+                write_status_position(env, status, &last_id, pos);
+            } else {
+                clear_status_membership(env, status, &last_id);
+            }
+        }
     }
 
-    // Remove the trailing entry and update the count.
+    // Remove the trailing entry, the leaving invoice's position, and update
+    // the slot count.
     env.storage()
         .persistent()
         .remove(&DataKey::StatusIndexEntry(status_u32, last));
+    clear_status_membership(env, status, invoice_id);
     env.storage().persistent().set(&count_key, &last);
     env.storage()
         .persistent()
         .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
-/// Storage key for a status-membership marker.
+/// Storage key for the legacy status-membership marker.
 ///
 /// `DataKey::StatusMembership` is declared as `(InvoiceStatus, u64)`, so the
-/// 32-byte invoice ID is projected onto its first 8 bytes (big-endian). The
-/// projection is pure and depends only on `invoice_id`, which lets every status
-/// transition derive the marker key directly — no extra lookup required.
+/// 32-byte invoice ID is projected onto its first 8 bytes (big-endian). This
+/// marker predates the bounded index and is retained only so pre-upgrade
+/// invoices still answer [`InvoiceContract::has_status_membership`] until they
+/// are migrated or transition once. New writes never create it.
 fn status_membership_key(status: InvoiceStatus, invoice_id: &BytesN<32>) -> DataKey {
     let id_bytes = invoice_id.to_array();
     let mut short_id = [0u8; 8];
@@ -2982,30 +3660,61 @@ fn status_membership_key(status: InvoiceStatus, invoice_id: &BytesN<32>) -> Data
     DataKey::StatusMembership(status, u64::from_be_bytes(short_id))
 }
 
-/// O(1) membership probe: one persistent-storage read, independent of how many
-/// invoices share `status`.
+/// Storage key for an invoice's exact slot in its status index.
+///
+/// The full 32-byte id is used, so unlike the legacy short-id marker this map
+/// is collision-free.
+fn status_position_key(status: InvoiceStatus, invoice_id: &BytesN<32>) -> DataKey {
+    DataKey::StatusPosition(status, invoice_id.clone())
+}
+
+/// O(1) position probe: one persistent read, independent of the status size.
+fn read_status_position(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&status_position_key(status, invoice_id))
+}
+
+/// O(1) membership probe: the position map is authoritative for post-upgrade
+/// rows; the legacy short-id marker is consulted only as a read fallback for
+/// rows written before the position map existed.
 fn read_status_membership(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>) -> bool {
+    if read_status_position(env, status, invoice_id).is_some() {
+        return true;
+    }
     env.storage()
         .persistent()
         .get::<_, bool>(&status_membership_key(status, invoice_id))
         .unwrap_or(false)
 }
 
-/// Marks `invoice_id` as a member of `status`, extending the entry's TTL with
+/// Records `invoice_id` at `slot` in `status`, extending the entry's TTL with
 /// the same threshold/extension policy as the rest of invoice storage.
-fn write_status_membership(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>) {
-    let key = status_membership_key(status, invoice_id);
-    env.storage().persistent().set(&key, &true);
+fn write_status_position(
+    env: &Env,
+    status: InvoiceStatus,
+    invoice_id: &BytesN<32>,
+    slot: u32,
+) {
+    let key = status_position_key(status, invoice_id);
+    env.storage().persistent().set(&key, &slot);
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    // Complete the migration for this member: the position is authoritative.
+    env.storage()
+        .persistent()
+        .remove(&status_membership_key(status, invoice_id));
 }
 
-/// Removes the membership marker when an invoice leaves `status`.
+/// Removes both the position and the legacy marker when an invoice leaves
+/// `status`.
 ///
-/// Removing a marker that is already absent (e.g. legacy rows written before
-/// markers existed) is a silent no-op.
+/// Removing an entry that is already absent is a silent no-op.
 fn clear_status_membership(env: &Env, status: InvoiceStatus, invoice_id: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .remove(&status_position_key(status, invoice_id));
     env.storage()
         .persistent()
         .remove(&status_membership_key(status, invoice_id));
@@ -3015,6 +3724,9 @@ fn increment_status_count(env: &Env, status: InvoiceStatus) {
     let key = DataKey::StatusCount(status as u32);
     let current: u64 = env.storage().persistent().get(&key).unwrap_or(0u64);
     env.storage().persistent().set(&key, &(current + 1));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 fn decrement_status_count(env: &Env, status: InvoiceStatus) {
@@ -3024,6 +3736,9 @@ fn decrement_status_count(env: &Env, status: InvoiceStatus) {
         .checked_sub(1)
         .unwrap_or_else(|| panic_with_error!(env, InvoiceError::InvalidStatusTransition));
     env.storage().persistent().set(&key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 fn read_status_count(env: &Env, status: InvoiceStatus) -> u64 {

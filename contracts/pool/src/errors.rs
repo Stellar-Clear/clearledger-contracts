@@ -36,4 +36,20 @@ pub enum PoolError {
     /// cap bounds the worst-case cost of a single batch so a caller cannot
     /// exceed the per-transaction budget by batching.
     BatchSizeExceeded = 26,
+    /// `set_max_utilization` was given a cap above `10_000` bps (100%).
+    /// Utilization is expressed in basis points, so any larger value is not a
+    /// meaningful risk parameter.
+    InvalidUtilizationCap = 27,
+    /// A treasury address aliases the pool itself or one of the contracts in
+    /// its settlement wiring (invoice, escrow, registry, or funding asset).
+    /// Protocol fees must not be routed back into infrastructure addresses.
+    InvalidTreasury = 28,
+    /// A configured contract address aliases `admin`, the pool itself, or
+    /// another already-wired contract role.
+    InvalidContractAddress = 29,
+    /// A configured funding-asset address aliases `admin` or another contract
+    /// role, so it cannot be a distinct token contract.
+    InvalidAsset = 30,
+    /// The SEP-41 share name or symbol passed to `initialize` was empty.
+    InvalidShareMetadata = 31,
 }
