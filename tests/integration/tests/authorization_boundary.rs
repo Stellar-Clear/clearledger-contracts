@@ -58,8 +58,11 @@ fn missing_account_authorization_cannot_pause_or_unpause() {
     let env = Env::default();
     let (admin, contracts) = targets(&env);
     for target in &contracts {
+        let before = env.events().all().len();
         rejected(&env, target, "pause", vec![&env]);
         rejected(&env, target, "unpause", vec![&env]);
+        assert_eq!(env.events().all().len(), before,
+            "rejected authorization must not emit pause events");
     }
     assert_eq!(
         RegistryContractClient::new(&env, &contracts[0]).get_admin(),
