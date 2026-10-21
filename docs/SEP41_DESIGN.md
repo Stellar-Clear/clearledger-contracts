@@ -17,6 +17,17 @@ When an LP withdraws USDC, they redeem their SEP-41 LP share tokens (which are t
 
 These exact formulas, already present in `contracts/pool/src/lib.rs`, will be preserved.
 
+### Previewing a Withdrawal
+`preview_withdraw(shares)` is the read-only ABI method for the burn formula above. It returns a `WithdrawPreview`:
+
+| Field | Meaning |
+| --- | --- |
+| `usdc_out` | USDC stroops `withdraw` would pay for `shares`, using the same floor division as the write path. |
+| `available_liquidity` | Pool USDC currently available to withdraw (`total_deposits - total_funded`). |
+| `liquidity_ok` | `true` when `available_liquidity >= usdc_out`; otherwise a real withdrawal of those shares would fail with `InsufficientLiquidity`. |
+
+The preview requires no authorization and performs no storage writes, event emission, or TTL extension. It quotes pool-wide share math only; callers should also check the LP's share balance (`balance` / `get_lp_position`) and the pool's pause state before submitting a withdrawal. `withdraw` and `preview_withdraw` share one conversion helper (`usdc_for_withdraw`) so their rounding and dust guard cannot drift.
+
 ## Interface Boundary Decision
 
 ### Recommendation
