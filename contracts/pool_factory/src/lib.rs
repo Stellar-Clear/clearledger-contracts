@@ -72,6 +72,10 @@ impl PoolFactoryContract {
     /// * `env` - The Soroban environment.
     /// * `asset` - The asset the new pool instance custodies. Passed to the
     ///   pool as its `funding_asset`, the single asset that instance supports.
+    ///   For native XLM this must be the network's Stellar Asset Contract
+    ///   address (Testnet
+    ///   `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`), never
+    ///   the string `native` or an issuer account. See `docs/NATIVE_XLM.md`.
     /// * `pool_wasm_hash` - Hash of the uploaded pool Wasm to deploy. Must
     ///   already be present in the ledger.
     /// * `invoice_contract` - The invoice contract the new pool funds invoices
@@ -167,7 +171,8 @@ impl PoolFactoryContract {
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
-    /// * `asset` - The asset address to register.
+    /// * `asset` - The asset address to register. For native XLM, pass the
+    ///   network's Stellar Asset Contract address; see `register_asset`.
     /// * `pool_address` - The existing pool contract address.
     ///
     /// # Auth
@@ -236,6 +241,14 @@ impl PoolFactoryContract {
 
     /// Returns aggregated statistics across all registered pool instances.
     ///
+    /// **Deprecated for new integrations:** this view is unbounded. It walks
+    /// every registered asset and makes one cross-contract call per asset in a
+    /// single invocation, so its resource use grows with the registry and can
+    /// exceed the Soroban per-call budget. Use
+    /// [`Self::get_aggregate_stats_page`] instead and walk the result with a
+    /// cursor. This function is retained for ABI compatibility and returns the
+    /// same registration order the page API exposes.
+    ///
     /// Iterates through all registered assets, queries each pool instance's
     /// `get_stats`, and returns a vector pairing each responsive pool address
     /// with its current `PoolStats`. Pools whose call fails are skipped so one
@@ -271,7 +284,216 @@ impl PoolFactoryContract {
         aggregate
     }
 
+    /// Returns a bounded page of aggregate statistics across registered pools.
+    ///
+    /// This is the preferred aggregate-stats read. It walks at most `limit`
+    /// entries of the asset index, queries each mapped pool instance's
+    /// `get_stats`, and returns the responsive pools' stats together with a
+    /// cursor for the next page. Pools whose call fails are skipped, exactly as
+    /// in [`Self::get_aggregate_stats`], so one unavailable or invalid pool
+    /// cannot block the rest of the page.
+    ///
+    /// # Iteration semantics
+    /// The asset index is append-only. Both [`Self::register_asset`] and
+    /// [`Self::register_existing_pool`] append the newly registered asset at
+    /// index `AssetCount`, then increment `AssetCount`, so registration order is
+    /// stable: an asset's cursor never changes and is never reused.
+    ///
+    /// Start at `cursor = 0` and keep passing the returned `next_cursor` until
+    /// it is `None`. A `next_cursor` of `Some(next)` means at least one more
+    /// asset exists at index `next`; it is also the number of asset-index
+    /// entries already walked. A registration that lands between two page reads
+    /// is appended after the last cursor already returned, so it appears at the
+    /// end of the walk and cannot shift, duplicate, or skip an item already
+    /// read. Calling with `cursor` equal to the current asset count returns an
+    /// empty final page (`next_cursor == None`).
+    ///
+    /// The cursor tracks *asset-index entries*, not returned items. A page that
+    /// skips unresponsive pools can therefore contain fewer than `limit` items
+    /// while still advancing `next_cursor` by the full number of entries
+    /// walked (capped at the current asset count). This mirrors the unbounded
+    /// view's skip-on-failure behavior without ever retrying an entry.
+    /// Each invocation reads at most
+    /// [`MAX_AGGREGATE_STATS_PAGE_LIMIT`] index entries and makes at most that
+    /// many cross-contract calls.
+    ///
+    /// # ABI
+    /// `get_aggregate_stats_page(cursor: u32, limit: u32) -> AggregateStatsPage`,
+    /// where [`AggregateStatsPage`] is
+    /// `{ items: Vec<(Address, PoolStats)>, next_cursor: Option<u32> }`. Both
+    /// arguments and the result are encoded as Soroban contract types;
+    /// `next_cursor` is a 32-bit asset index, not an opaque token.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `cursor` - Zero-based index of the first asset to walk. Must be `<=`
+    ///   the current asset count; `cursor == count` returns an empty page.
+    /// * `limit` - Maximum number of asset-index entries to walk. Must be in
+    ///   `1..=MAX_AGGREGATE_STATS_PAGE_LIMIT`.
+    ///
+    /// # Auth
+    /// No authorization is required (read-only view).
+    ///
+    /// # Panics
+    /// * `InvalidAggregateStatsLimit` if `limit == 0` or
+    ///   `limit > MAX_AGGREGATE_STATS_PAGE_LIMIT`.
+    /// * `InvalidAggregateStatsCursor` if `cursor` is greater than the current
+    ///   asset count.
+    ///
+    /// # Returns
+    /// * [`AggregateStatsPage`] - Up to `limit` (pool address, stats) pairs in
+    ///   registration order plus the cursor for the next page, or `None` when
+    ///   this is the final page.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut cursor = 0;
+    /// loop {
+    ///     let page = client.get_aggregate_stats_page(&cursor, &50);
+    ///     for (pool, stats) in page.items.iter() {
+    ///         // use pool and stats
+    ///     }
+    ///     match page.next_cursor {
+    ///         Some(next) => cursor = next,
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn get_aggregate_stats_page(env: Env, cursor: u32, limit: u32) -> AggregateStatsPage {
+        if limit == 0 || limit > MAX_AGGREGATE_STATS_PAGE_LIMIT {
+            panic_with_error!(&env, PoolFactoryError::InvalidAggregateStatsLimit);
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetCount)
+            .unwrap_or(0);
+        if cursor > count {
+            panic_with_error!(&env, PoolFactoryError::InvalidAggregateStatsCursor);
+        }
+
+        let end = cursor.saturating_add(limit).min(count);
+        let mut items = Vec::new(&env);
+        let mut index = cursor;
+        while index < end {
+            let asset: Option<Address> = env.storage().instance().get(&DataKey::AssetIndex(index));
+            if let Some(asset) = asset {
+                if let Some(pool_address) = Self::get_pool_for_asset(env.clone(), asset) {
+                    let result = env.try_invoke_contract::<PoolStats, soroban_sdk::Error>(
+                        &pool_address,
+                        &Symbol::new(&env, "get_stats"),
+                        Vec::new(&env),
+                    );
+                    if let Ok(Ok(stats)) = result {
+                        items.push_back((pool_address, stats));
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        let next_cursor = if end < count { Some(end) } else { None };
+        AggregateStatsPage { items, next_cursor }
+    }
+
+    /// Lists a bounded page of registered assets.
+    ///
+    /// This is the preferred asset-list read. It replaces [`Self::list_assets`]
+    /// for integrations: the asset index is stored in instance storage, so the
+    /// unbounded view's cost grows with every registration and will eventually
+    /// exceed the Soroban per-call budget.
+    ///
+    /// # Iteration semantics
+    /// The asset index is append-only. Both `register_asset` and
+    /// `register_existing_pool` append the newly registered asset at index
+    /// `AssetCount`, then increment `AssetCount`, so registration order is
+    /// stable: an asset's cursor never changes and is never reused.
+    ///
+    /// Start at `cursor = 0` and keep passing the returned `next_cursor` until
+    /// it is `None`. A `next_cursor` of `Some(next)` means at least one more
+    /// asset exists at index `next`; it is also the number of items already
+    /// walked. A registration that lands between two page reads is appended
+    /// after the last cursor already returned, so it appears at the end of the
+    /// walk and cannot shift, duplicate, or skip an item already read. Calling
+    /// with `cursor` equal to the current asset count returns an empty final
+    /// page (`next_cursor == None`). Each invocation reads at most
+    /// [`MAX_ASSET_PAGE_LIMIT`] index entries.
+    ///
+    /// # ABI
+    /// `get_assets_page(cursor: u32, limit: u32) -> AssetPage`, where
+    /// [`AssetPage`] is `{ items: Vec<Address>, next_cursor: Option<u32> }`.
+    /// Both arguments and the result are encoded as Soroban contract types;
+    /// `next_cursor` is a 32-bit index, not an opaque token.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `cursor` - Zero-based index of the first asset to return. Must be
+    ///   `<=` the current asset count; `cursor == count` returns an empty page.
+    /// * `limit` - Maximum number of assets to return. Must be in
+    ///   `1..=MAX_ASSET_PAGE_LIMIT`.
+    ///
+    /// # Auth
+    /// No authorization is required (read-only view).
+    ///
+    /// # Panics
+    /// * `InvalidLimit` if `limit == 0` or
+    ///   `limit > MAX_ASSET_PAGE_LIMIT`.
+    /// * `InvalidCursor` if `cursor` is greater than the current asset count.
+    ///
+    /// # Returns
+    /// * [`AssetPage`] - Up to `limit` assets in registration order plus the
+    ///   cursor for the next page, or `None` when this is the final page.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut cursor = 0;
+    /// loop {
+    ///     let page = client.get_assets_page(&cursor, &50);
+    ///     for asset in page.items.iter() {
+    ///         // use asset
+    ///     }
+    ///     match page.next_cursor {
+    ///         Some(next) => cursor = next,
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn get_assets_page(env: Env, cursor: u32, limit: u32) -> AssetPage {
+        if limit == 0 || limit > MAX_ASSET_PAGE_LIMIT {
+            panic_with_error!(&env, PoolFactoryError::InvalidLimit);
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetCount)
+            .unwrap_or(0);
+        if cursor > count {
+            panic_with_error!(&env, PoolFactoryError::InvalidCursor);
+        }
+
+        let end = cursor.saturating_add(limit).min(count);
+        let mut items = Vec::new(&env);
+        let mut index = cursor;
+        while index < end {
+            if let Some(asset) = env.storage().instance().get(&DataKey::AssetIndex(index)) {
+                items.push_back(asset);
+            }
+            index += 1;
+        }
+
+        let next_cursor = if end < count { Some(end) } else { None };
+        AssetPage { items, next_cursor }
+    }
+
     /// Lists all registered assets.
+    ///
+    /// **Deprecated for new integrations:** this view is unbounded, so its
+    /// cost grows with the number of registered assets and can exceed the
+    /// Soroban per-call budget. Use [`Self::get_assets_page`] instead and walk
+    /// the list with a cursor. This function is retained for ABI compatibility
+    /// and returns the same registration order the page API exposes.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -329,7 +551,11 @@ impl PoolFactoryContract {
     }
 
     /// Records `pool_address` as `asset`'s pool and appends `asset` to the
-    /// enumeration index used by `list_assets`.
+    /// enumeration index used by `list_assets` and
+    /// `get_aggregate_stats_page`.
+    ///
+    /// The append order is what makes the aggregate-stats page API's cursors
+    /// stable: an existing index entry is never moved or rewritten.
     fn record_pool(env: &Env, asset: &Address, pool_address: &Address) {
         let count: u32 = env
             .storage()
