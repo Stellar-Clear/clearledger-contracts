@@ -60,11 +60,16 @@ if (-not $stellar) {
 # Load .env file
 $envFile = if (Test-Path .env) { ".env" } else { ".env.example" }
 Get-Content $envFile | ForEach-Object {
-    if ($_ -match '^\s*([^#=\s]+)\s*=\s*(.*?)\s*$') {
-        $value = $matches[2].Trim().Trim('"').Trim("'")
-        [Environment]::SetEnvironmentVariable($matches[1], $value)
+    $line = $_.Trim()
+    if ($line -and -not $line.StartsWith('#') -and $line -match '^\s*([^#=\s]+)\s*=\s*(.*?)\s*$') {
+        $key = $matches[1]
+        if ($key -in @('DEPLOYER_ACCOUNT', 'DEPLOY_XLM', 'USDC_ISSUER', 'XLM_ASSET', 'AGENT_REGISTRY_CONTRACT', 'STELLAR_BIN', 'STELLAR_NETWORK')) {
+            $value = $matches[2].Trim().Trim('"').Trim("'")
+            [Environment]::SetEnvironmentVariable($key, $value)
+        }
     }
 }
+$deployXlm = $env:DEPLOY_XLM -eq 'true'
 
 $stellarNetwork = [Environment]::GetEnvironmentVariable('STELLAR_NETWORK')
 if (-not $stellarNetwork) { $stellarNetwork = 'testnet' }
@@ -176,7 +181,7 @@ function Deploy-Contract {
     $contractId = & $stellar contract deploy --wasm $wasm --source $env:DEPLOYER_ACCOUNT --network $stellarNetwork 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Deploy failed for $key:"
-        Write-Host "  $contractId"
+        Write-Host "  Stellar CLI output withheld to avoid logging transaction signing material."
         Write-Host "  Fix the error above and rerun — already-deployed contracts will be skipped."
         throw "Deploy failed for $key"
     }
@@ -216,7 +221,7 @@ function Invoke-Init {
     $output = & $stellar contract invoke --id $contractId --source $env:DEPLOYER_ACCOUNT --network $stellarNetwork @initArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Initialization failed for $label:"
-        Write-Host "  $output"
+        Write-Host "  Stellar CLI output withheld to avoid logging transaction signing material."
         Write-Host "  The contract is deployed but NOT initialized."
         Write-Host "  Fix the error and rerun — this step will be retried automatically."
         throw "Init failed for $label"
@@ -328,6 +333,8 @@ Invoke-Init "escrow_usdc" $escrowUsdcId @("--", "initialize", "--admin", $deploy
 
 Invoke-Init "pool_usdc" $poolUsdcId @("--", "initialize", "--admin", $deployerAddress, "--invoice_contract", $invoiceId, "--escrow_contract", $escrowUsdcId, "--funding_asset", $usdcIssuer, "--registry_contract", $registryId, "--treasury", $deployerAddress, "--min_initial_deposit", "10000000", "--share_name", "`"ClearLedger USDC Pool Shares`"", "--share_symbol", "`"TT-USDC`"", "--share_decimals", "7")
 
+$escrowXlmId = ''
+$poolXlmId = ''
 if ($deployXlm) {
     Write-Host "`n=== Deploying XLM escrow_contract (EXPERIMENTAL) ==="
     $escrowXlmId = Deploy-Contract "escrow_xlm" "target/wasm32v1-none/release/clearledger_escrow.wasm"
@@ -397,10 +404,57 @@ NEXT_PUBLIC_POOL_USDC_CONTRACT_ID=$poolUsdcId
 NEXT_PUBLIC_POOL_XLM_CONTRACT_ID=$poolXlmId # EXPERIMENTAL
 "@ | Set-Content $envOut
 
+$deploymentMetadata = [ordered]@{
+    registry = $registryId
+    invoice = $invoiceId
+    escrow_usdc = $escrowUsdcId
+    pool_usdc = $poolUsdcId
+    escrow_xlm = $escrowXlmId
+    pool_xlm = $poolXlmId
+    updated_at = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+$deploymentMetadata | ConvertTo-Json | Set-Content -Encoding utf8 deployments.json
+
+$readmePath = Join-Path (Get-Location) 'README.md'
+if (Test-Path $readmePath) {
+    $readme = [System.IO.File]::ReadAllText($readmePath)
+    $startMarker = '<!-- START_DEPLOYED_ADDRESSES -->'
+    $endMarker = '<!-- END_DEPLOYED_ADDRESSES -->'
+    $startIndex = $readme.IndexOf($startMarker, [System.StringComparison]::Ordinal)
+    $endIndex = $readme.IndexOf($endMarker, [System.StringComparison]::Ordinal)
+    if ($startIndex -lt 0 -or $endIndex -le $startIndex) {
+        throw 'README.md deployment address markers are missing or out of order.'
+    }
+
+    $rows = @(
+        '| Contract | Address | Stellar Expert |'
+        '|----------|---------|---------------|'
+    )
+    foreach ($entry in @(
+        @{ Name = 'registry_contract'; Id = $registryId }
+        @{ Name = 'invoice_contract'; Id = $invoiceId }
+        @{ Name = 'escrow_contract'; Id = $escrowUsdcId }
+        @{ Name = 'pool_contract'; Id = $poolUsdcId }
+        @{ Name = 'escrow_xlm_contract (experimental)'; Id = $escrowXlmId }
+        @{ Name = 'pool_xlm_contract (experimental)'; Id = $poolXlmId }
+    )) {
+        if ($entry.Id) {
+            $url = "https://stellar.expert/explorer/testnet/contract/$($entry.Id)"
+            $rows += "| $($entry.Name) | ``$($entry.Id)`` | [View]($url) |"
+        }
+    }
+
+    $prefix = $readme.Substring(0, $startIndex + $startMarker.Length)
+    $suffix = $readme.Substring($endIndex)
+    $updatedReadme = "$prefix`n$([string]::Join("`n", $rows))`n$suffix"
+    [System.IO.File]::WriteAllText($readmePath, $updatedReadme, [System.Text.UTF8Encoding]::new($false))
+}
+
 Write-Host "`n==========================================="
 Write-Host "Deployment complete."
 Write-Host ""
 Write-Host "Addresses saved to: $addressesFile"
+Write-Host "Deployment metadata saved to: deployments.json"
 Write-Host "Frontend env saved to: $envOut"
 Write-Host ""
 Write-Host "Add to clearledger-app .env.local:"

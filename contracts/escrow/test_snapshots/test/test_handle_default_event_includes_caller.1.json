@@ -410,7 +410,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "History"
+                  "symbol": "HistoryCount"
                 },
                 {
                   "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
@@ -430,7 +430,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "History"
+                      "symbol": "HistoryCount"
                     },
                     {
                       "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
@@ -439,106 +439,201 @@
                 },
                 "durability": "persistent",
                 "val": {
+                  "u32": 2
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          2000000
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "HistoryEvent"
+                },
+                {
+                  "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
+                },
+                {
+                  "u32": 0
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+                "key": {
                   "vec": [
                     {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "action"
-                          },
-                          "val": {
-                            "vec": [
-                              {
-                                "symbol": "Locked"
-                              }
-                            ]
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "amount"
-                          },
-                          "val": {
-                            "u128": {
-                              "hi": 0,
-                              "lo": 1000000000
-                            }
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "caller"
-                          },
-                          "val": "void"
-                        },
-                        {
-                          "key": {
-                            "symbol": "invoice_id"
-                          },
-                          "val": {
-                            "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "timestamp"
-                          },
-                          "val": {
-                            "u64": 0
-                          }
-                        }
-                      ]
+                      "symbol": "HistoryEvent"
                     },
                     {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "action"
-                          },
-                          "val": {
-                            "vec": [
-                              {
-                                "symbol": "DefaultHandled"
-                              }
-                            ]
+                      "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
+                    },
+                    {
+                      "u32": 0
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "action"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "Locked"
                           }
-                        },
-                        {
-                          "key": {
-                            "symbol": "amount"
-                          },
-                          "val": {
-                            "u128": {
-                              "hi": 0,
-                              "lo": 1000000000
-                            }
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "caller"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "invoice_id"
-                          },
-                          "val": {
-                            "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "timestamp"
-                          },
-                          "val": {
-                            "u64": 60
-                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "amount"
+                      },
+                      "val": {
+                        "u128": {
+                          "hi": 0,
+                          "lo": 1000000000
                         }
-                      ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "caller"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "invoice_id"
+                      },
+                      "val": {
+                        "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "timestamp"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          2000000
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "HistoryEvent"
+                },
+                {
+                  "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
+                },
+                {
+                  "u32": 1
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "HistoryEvent"
+                    },
+                    {
+                      "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
+                    },
+                    {
+                      "u32": 1
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "action"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "DefaultHandled"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "amount"
+                      },
+                      "val": {
+                        "u128": {
+                          "hi": 0,
+                          "lo": 1000000000
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "caller"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "invoice_id"
+                      },
+                      "val": {
+                        "bytes": "0000000000000001000000000000000000000000000000000000000000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "timestamp"
+                      },
+                      "val": {
+                        "u64": 60
+                      }
                     }
                   ]
                 }

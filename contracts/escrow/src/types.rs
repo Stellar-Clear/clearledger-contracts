@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, BytesN};
+use soroban_sdk::{contracttype, BytesN, Vec};
 
 /// Record of an escrow lock stored for a given invoice.
 ///
@@ -7,8 +7,9 @@ use soroban_sdk::{contracttype, BytesN};
 /// - `amount` must be greater than zero — guaranteed by [`EscrowContract::lock`].
 /// - `locked_at` is set to `env.ledger().timestamp()` at lock time and is never
 ///   updated for the lifetime of the record.
-/// - A record is removed (via `persistent().remove`) when escrow is released
-///   or default-handled; after removal `get_locked` / `get_locked_at` return `0`.
+/// - Partial pool releases reduce `amount` and retain this record. Terminal
+///   release or default removes it; afterward `get_locked` / `get_locked_at`
+///   return `0`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowRecord {
@@ -23,8 +24,10 @@ pub struct EscrowRecord {
     /// a [`default`](EscrowAction::DefaultHandled) can be triggered.
     pub locked_at: u64,
     /// The invoice issuer address that is authorized to receive released funds.
-    /// Set from the `issuer` argument of [`EscrowContract::lock`] and validated
-    /// in [`EscrowContract::release_to_issuer`].
+    /// Set from the `issuer` argument of [`EscrowContract::lock`] and treated as
+    /// the sole source of truth by [`EscrowContract::release_to_issuer`]: a
+    /// caller-supplied address must match this value, and the release transfer
+    /// always uses this stored value.
     pub issuer: soroban_sdk::Address,
 }
 
@@ -46,8 +49,11 @@ pub enum EscrowAction {
 
 /// An entry in the escrow event history for a given invoice.
 ///
-/// History is stored under [`DataKey::History`] as a `Vec<EscrowEvent>`
-/// and is append-only — see [`EscrowContract::append_history`].
+/// Events are stored individually under [`DataKey::HistoryEvent`] with their
+/// append index, so a paginated read hydrates only the requested slice. The
+/// append index remains stable when older entries are pruned; `HistoryStart`
+/// identifies the oldest retained index. Full event history remains in the
+/// ledger event stream for indexers.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -61,6 +67,22 @@ pub struct EscrowEvent {
     pub timestamp: u64,
     /// The caller address that triggered this event (for DefaultHandled events).
     pub caller: Option<soroban_sdk::Address>,
+}
+
+/// One bounded page of an invoice's escrow history.
+///
+/// Returned by [`EscrowContract::get_history_page`]. Pass [`Self::next_cursor`]
+/// back to the next call to continue the walk; `None` means the walk is
+/// complete. Because the cursor is the append index and history is
+/// append-only, events added between pages never shift, duplicate, or skip
+/// previously returned entries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryPage {
+    /// Events in chronological (append) order, at most `limit` long.
+    pub items: Vec<EscrowEvent>,
+    /// Append index to pass to the next call, or `None` when the walk is complete.
+    pub next_cursor: Option<u32>,
 }
 
 /// Storage keys used by the escrow contract.
@@ -83,7 +105,19 @@ pub enum DataKey {
     /// Active escrow lock for a given invoice. The inner `BytesN<32>` is the
     /// invoice ID. Value type: [`EscrowRecord`].
     Locked(BytesN<32>),
-    /// Event history for a given invoice. The inner `BytesN<32>` is the
+    /// Legacy event history for a given invoice. The inner `BytesN<32>` is the
     /// invoice ID. Value type: `Vec<EscrowEvent>`.
+    ///
+    /// Only read as a fallback for history written before pagination. On the
+    /// first append it is migrated to [`DataKey::HistoryEvent`] entries and
+    /// removed.
     History(BytesN<32>),
+    /// A single history event at `(invoice_id, index)`. Value type:
+    /// [`EscrowEvent`]. The index is also the pagination cursor.
+    HistoryEvent(BytesN<32>, u32),
+    /// Number of history events stored for an invoice. Value type: `u32`.
+    HistoryCount(BytesN<32>),
+    /// First retained append index after automatic or manual history pruning.
+    /// The monotonically increasing `HistoryCount` remains the cursor ceiling.
+    HistoryStart(BytesN<32>),
 }

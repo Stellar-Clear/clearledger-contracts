@@ -18,7 +18,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    DataKey, EscrowAction, EscrowContract, EscrowContractClient, EscrowEvent, EscrowRecord,
+    DataKey, EscrowAction, EscrowContract, EscrowContractClient, EscrowError, EscrowEvent,
+    EscrowRecord, MAX_HISTORY_LIMIT, MAX_HISTORY_EVENTS, MIN_HISTORY_EVENTS,
 };
 
 #[contract]
@@ -104,6 +105,84 @@ mod strict {
     }
 }
 
+/// A token that aborts on any transfer. Used to prove that `lock` rejects
+/// invalid amounts before it reaches the token transfer, independent of any
+/// storage rollback the test environment performs for a failed invocation.
+mod rejecting {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct RejectingToken;
+
+    #[contractimpl]
+    impl RejectingToken {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
+            panic!("token transfer must not be called for a rejected lock");
+        }
+    }
+}
+
+fn setup_with_strict_usdc(
+    pool_balance: i128,
+) -> (
+    Env,
+    EscrowContractClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = env.register_contract(None, MockCaller);
+    let pool = env.register_contract(None, MockCaller);
+    let issuer = env.register_contract(None, MockCaller);
+    let usdc_id = env.register_contract(None, strict::StrictMockToken);
+
+    let pool_bal_key = BalanceKey(pool.clone());
+    env.as_contract(&usdc_id, || {
+        env.storage().persistent().set(&pool_bal_key, &pool_balance);
+    });
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &pool, &usdc_id);
+
+    (env, client, pool, issuer, usdc_id)
+}
+
+fn setup_with_rejecting_usdc() -> (Env, EscrowContractClient<'static>, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = env.register_contract(None, MockCaller);
+    let pool = env.register_contract(None, MockCaller);
+    let issuer = env.register_contract(None, MockCaller);
+    let usdc_id = env.register_contract(None, rejecting::RejectingToken);
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &pool, &usdc_id);
+
+    (env, client, pool, issuer)
+}
+
+fn assert_lock_rejected_with(
+    client: &EscrowContractClient,
+    invoice_id: &BytesN<32>,
+    amount: u128,
+    issuer: &Address,
+    expected: EscrowError,
+) {
+    match client.try_lock(invoice_id, &amount, issuer) {
+        Err(Ok(err)) => assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(expected as u32)
+        ),
+        _ => panic!("expected lock to fail with {:?}", expected),
+    }
+}
+
 fn setup() -> (
     Env,
     EscrowContractClient<'static>,
@@ -156,8 +235,53 @@ fn generate_invoice_id(env: &Env, counter: u64) -> BytesN<32> {
     BytesN::from_array(env, &arr)
 }
 
+fn walk_history(
+    env: &Env,
+    client: &EscrowContractClient<'_>,
+    invoice_id: &BytesN<32>,
+    limit: u32,
+) -> Vec<EscrowEvent> {
+    let mut cursor = 0u32;
+    let mut events = Vec::new(env);
+    loop {
+        let page = client.get_history_page(invoice_id, &cursor, &limit);
+        let mut index = 0;
+        while index < page.items.len() {
+            events.push_back(page.items.get(index).unwrap());
+            index += 1;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    events
+}
+
 fn get_balance(env: &Env, token_id: &Address, addr: &Address) -> i128 {
     MockTokenClient::new(env, token_id).balance(addr)
+}
+
+/// Seed a synthetic history of `count` events directly into storage.
+///
+/// Amounts are `1..=count` and timestamps are `0..count` so tests can assert
+/// exactly which suffix survived compaction.
+fn seed_history(env: &Env, contract_id: &Address, invoice_id: &BytesN<32>, count: u32) {
+    env.as_contract(contract_id, || {
+        let mut history = Vec::new(env);
+        for i in 0..count {
+            history.push_back(EscrowEvent {
+                invoice_id: invoice_id.clone(),
+                action: EscrowAction::Locked,
+                amount: i as u128 + 1,
+                timestamp: i as u64,
+                caller: None,
+            });
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::History(invoice_id.clone()), &history);
+    });
 }
 
 fn assert_last_event_three<T1, T2>(
@@ -263,7 +387,7 @@ fn test_initialize_twice_panics() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #15)")]
 fn test_initialize_panics_when_pool_equals_usdc() {
     let env = Env::default();
     env.mock_all_auths();
@@ -276,7 +400,7 @@ fn test_initialize_panics_when_pool_equals_usdc() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_initialize_panics_when_pool_equals_admin() {
     let env = Env::default();
     env.mock_all_auths();
@@ -289,7 +413,7 @@ fn test_initialize_panics_when_pool_equals_admin() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #15)")]
 fn test_initialize_panics_when_usdc_equals_admin() {
     let env = Env::default();
     env.mock_all_auths();
@@ -370,10 +494,9 @@ fn test_get_usdc_asset_panics_when_not_initialized() {
     client.get_usdc_asset();
 }
 
-// ============================================================================
+// ==============================================================
 // Lock Tests
-// ============================================================================
-
+// =====================================================================
 #[test]
 fn test_lock_stores_record_and_transfers_usdc() {
     let (env, client, _admin, pool, issuer, usdc_id) = setup();
@@ -413,11 +536,110 @@ fn test_lock_fails_amount_exceeds_i128_max() {
 
 #[test]
 fn test_lock_succeeds_at_i128_max() {
-    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
-    let invoice_id = generate_invoice_id(&env, 5);
     let amount = i128::MAX as u128;
-    let result = client.lock(&invoice_id, &amount, &issuer);
-    assert!(result);
+    let (env, client, pool, issuer, usdc_id) = setup_with_strict_usdc(i128::MAX);
+    let invoice_id = generate_invoice_id(&env, 5);
+
+    assert!(client.lock(&invoice_id, &amount, &issuer));
+
+    assert_eq!(client.get_locked(&invoice_id), amount);
+    assert_eq!(client.get_history(&invoice_id).len(), 1);
+
+    let token = strict::StrictMockTokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&pool), 0);
+    assert_eq!(token.balance(&client.address), i128::MAX);
+
+    assert_last_event_three(
+        &env,
+        "funds_locked",
+        invoice_id.clone(),
+        issuer.clone(),
+        amount,
+    );
+}
+
+#[test]
+fn test_lock_zero_amount_rejected_before_token_transfer() {
+    // The token aborts on any transfer, so this only passes if the amount is
+    // validated before `usdc.transfer` is reached.
+    let (env, client, _pool, issuer) = setup_with_rejecting_usdc();
+    let invoice_id = generate_invoice_id(&env, 6);
+
+    assert_lock_rejected_with(&client, &invoice_id, 0, &issuer, EscrowError::InvalidAmount);
+
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked_at(&invoice_id), 0);
+    assert!(client.get_history(&invoice_id).is_empty());
+}
+
+#[test]
+fn test_lock_boundary_above_max_rejected_before_token_transfer() {
+    // i128::MAX is the largest value the token can receive; MAX + 1 must be
+    // rejected before the token transfer is attempted.
+    let (env, client, _pool, issuer) = setup_with_rejecting_usdc();
+    let invoice_id = generate_invoice_id(&env, 7);
+    let amount = i128::MAX as u128 + 1;
+
+    assert_lock_rejected_with(
+        &client,
+        &invoice_id,
+        amount,
+        &issuer,
+        EscrowError::InvalidAmount,
+    );
+
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked_at(&invoice_id), 0);
+    assert!(client.get_history(&invoice_id).is_empty());
+}
+
+#[test]
+fn test_duplicate_lock_preserves_original_issuer_and_amount() {
+    let original_amount: u128 = 1_000_000_000;
+    // Seed the strict token with exactly the original amount: any second
+    // transfer would overdraw the pool and abort, so a typed AlreadyLocked
+    // error proves the duplicate check runs before the token transfer.
+    let (env, client, pool, issuer, usdc_id) = setup_with_strict_usdc(original_amount as i128);
+    let invoice_id = generate_invoice_id(&env, 8);
+    let other_issuer = Address::generate(&env);
+
+    assert!(client.lock(&invoice_id, &original_amount, &issuer));
+    let locked_at = client.get_locked_at(&invoice_id);
+    let history_len = client.get_history(&invoice_id).len();
+
+    let token = strict::StrictMockTokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&pool), 0);
+    assert_eq!(token.balance(&client.address), original_amount as i128);
+
+    assert_lock_rejected_with(
+        &client,
+        &invoice_id,
+        500_000_000,
+        &other_issuer,
+        EscrowError::AlreadyLocked,
+    );
+
+    // The failed duplicate must not overwrite the original record.
+    assert_eq!(client.get_locked(&invoice_id), original_amount);
+    assert_eq!(client.get_locked_at(&invoice_id), locked_at);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(token.balance(&pool), 0);
+    assert_eq!(token.balance(&client.address), original_amount as i128);
+
+    // The original issuer is still the only address that can receive the
+    // funds, proving the duplicate did not replace it with `other_issuer`.
+    match client.try_release_to_issuer(&invoice_id, &other_issuer) {
+        Err(Ok(err)) => assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(EscrowError::InvalidRecipient as u32)
+        ),
+        _ => panic!("expected release to a non-issuer to fail"),
+    }
+    assert_eq!(client.get_locked(&invoice_id), original_amount);
+
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(token.balance(&issuer), original_amount as i128);
 }
 
 #[test]
@@ -439,10 +661,8 @@ fn test_lock_only_callable_by_pool() {
     assert_eq!(client.get_locked(&invoice_id), amount);
 }
 
-// ============================================================================
-// Release to Issuer Tests
-// ============================================================================
-
+// =====================================================================// Release to Issuer Tests
+// =====================================================================
 #[test]
 fn test_release_to_issuer_sends_correct_amount() {
     let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
@@ -523,10 +743,117 @@ fn test_release_to_issuer_unknown_invoice_id_panics() {
     client.release_to_issuer(&unknown_id, &issuer);
 }
 
-// ============================================================================
-// Release to Pool Tests
-// ============================================================================
+#[test]
+fn test_release_to_issuer_transfers_to_stored_issuer() {
+    let (env, client, _admin, pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 52);
+    let amount: u128 = 1_000_000_000;
 
+    client.lock(&invoice_id, &amount, &issuer);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), amount as i128);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), 0);
+
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), amount as i128);
+    assert_eq!(
+        get_balance(&env, &usdc_id, &pool),
+        10_000_000_000_000i128 - amount as i128
+    );
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked_at(&invoice_id), 0);
+    assert_last_event_three(
+        &env,
+        "released_to_issuer",
+        invoice_id.clone(),
+        issuer.clone(),
+        amount,
+    );
+}
+
+#[test]
+fn test_release_to_issuer_rejects_mismatch_without_moving_funds() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 53);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    let locked_at = client.get_locked_at(&invoice_id);
+    let history_len = client.get_history(&invoice_id).len();
+    let wrong_issuer = Address::generate(&env);
+
+    assert!(client
+        .try_release_to_issuer(&invoice_id, &wrong_issuer)
+        .is_err());
+
+    assert_eq!(client.get_locked(&invoice_id), amount);
+    assert_eq!(client.get_locked_at(&invoice_id), locked_at);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), amount as i128);
+    assert_eq!(get_balance(&env, &usdc_id, &wrong_issuer), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), 0);
+
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), amount as i128);
+}
+
+#[test]
+fn test_release_to_issuer_unknown_invoice_does_not_move_funds() {
+    let (env, client, _admin, _pool, _issuer, usdc_id) = setup();
+    let unknown_id = generate_invoice_id(&env, 998);
+    let caller_supplied = Address::generate(&env);
+
+    assert!(client
+        .try_release_to_issuer(&unknown_id, &caller_supplied)
+        .is_err());
+
+    assert_eq!(client.get_locked(&unknown_id), 0);
+    assert_eq!(client.get_locked_at(&unknown_id), 0);
+    assert_eq!(client.get_history(&unknown_id).len(), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), 0);
+    assert_eq!(get_balance(&env, &usdc_id, &caller_supplied), 0);
+}
+
+#[test]
+fn test_release_to_issuer_unauthorized_does_not_move_funds() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 54);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    let history_len = client.get_history(&invoice_id).len();
+    env.set_auths(&[]);
+
+    assert!(client.try_release_to_issuer(&invoice_id, &issuer).is_err());
+
+    assert_eq!(client.get_locked(&invoice_id), amount);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), amount as i128);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), 0);
+}
+
+#[test]
+fn test_release_to_issuer_replay_does_not_move_funds() {
+    let (env, client, _admin, _pool, issuer, usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 55);
+    let amount: u128 = 1_000_000_000;
+
+    client.lock(&invoice_id, &amount, &issuer);
+    assert!(client.release_to_issuer(&invoice_id, &issuer));
+    let history_len = client.get_history(&invoice_id).len();
+    let issuer_balance = get_balance(&env, &usdc_id, &issuer);
+
+    assert!(client.try_release_to_issuer(&invoice_id, &issuer).is_err());
+
+    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_history(&invoice_id).len(), history_len);
+    assert_eq!(get_balance(&env, &usdc_id, &issuer), issuer_balance);
+    assert_eq!(get_balance(&env, &usdc_id, &client.address), 0);
+}
+
+// =====================================================================// Release to Pool Tests
+// =====================================================================
 #[test]
 fn test_release_to_pool_transfers_correct_amount() {
     let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
@@ -592,10 +919,8 @@ fn test_release_to_pool_rejects_non_invoice_contract_caller() {
     client.release_to_pool(&invoice_id, &amount);
 }
 
-// ============================================================================
-// Handle Default Tests
-// ============================================================================
-
+// =====================================================================// Handle Default Tests
+// =====================================================================
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_release_to_pool_fails_zero_repayment() {
@@ -634,7 +959,7 @@ fn test_release_to_pool_partial_repayment_succeeds() {
     let partial: u128 = 500_000_000;
     let result = client.release_to_pool(&invoice_id, &partial);
     assert!(result);
-    assert_eq!(client.get_locked(&invoice_id), 0);
+    assert_eq!(client.get_locked(&invoice_id), amount - partial);
 
     // Verify pool received exactly `partial`, not the full locked `amount`
     let pool_balance_after = get_balance(&env, &usdc_id, &pool);
@@ -928,10 +1253,8 @@ fn test_handle_default_event_includes_caller() {
     assert_eq!(last_event.caller, Some(admin));
 }
 
-// ============================================================================
-// Get Locked Tests
-// ============================================================================
-
+// =====================================================================// Get Locked Tests
+// =====================================================================
 #[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_handle_default_unauthorized_caller_panics() {
@@ -988,6 +1311,52 @@ fn test_get_locked_returns_zero_after_release_to_issuer() {
 }
 
 #[test]
+fn prop_partial_pool_releases_conserve_initial_lock_and_residual() {
+    let strategy = (
+        proptest::collection::vec(1u128..10_000, 1..16),
+        1u128..10_000,
+    );
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(16));
+    runner
+        .run(&strategy, |(chunks, tail)| {
+            let (env, client, _admin, pool, issuer, usdc) = setup();
+            let id = generate_invoice_id(&env, 530);
+            let initial = chunks.iter().copied().sum::<u128>() + tail;
+            client.lock(&id, &initial, &issuer);
+            let locked_at = client.get_locked_at(&id);
+            let pool_after_lock = get_balance(&env, &usdc, &pool);
+            let mut released = 0u128;
+            for (i, amount) in chunks.iter().enumerate() {
+                prop_assert!(client.release_to_pool(&id, amount));
+                released += amount;
+                let residual = client.get_locked(&id);
+                prop_assert_eq!(released + residual, initial);
+                prop_assert_eq!(get_balance(&env, &usdc, &client.address), residual as i128);
+                prop_assert_eq!(
+                    get_balance(&env, &usdc, &pool) - pool_after_lock,
+                    released as i128
+                );
+                prop_assert_eq!(client.get_locked_at(&id), locked_at);
+                let history = client.get_history(&id);
+                prop_assert_eq!(history.len(), i as u32 + 2);
+                prop_assert_eq!(history.get(history.len() - 1).unwrap().amount, *amount);
+            }
+            prop_assert!(client.try_release_to_pool(&id, &0).is_err());
+            prop_assert_eq!(client.get_locked(&id), tail);
+            prop_assert!(client.release_to_pool(&id, &tail));
+            prop_assert_eq!(client.get_locked(&id), 0);
+            prop_assert_eq!(get_balance(&env, &usdc, &client.address), 0);
+            prop_assert!(client.try_release_to_pool(&id, &1).is_err());
+            prop_assert_eq!(
+                get_balance(&env, &usdc, &pool) - pool_after_lock,
+                initial as i128
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn test_get_locked_returns_zero_after_release_to_pool() {
     let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
     let invoice_id = generate_invoice_id(&env, 12);
@@ -1034,10 +1403,8 @@ fn test_get_locked_at_returns_zero_after_release() {
     assert_eq!(client.get_locked_at(&invoice_id), 0);
 }
 
-// ============================================================================
-// Integration Tests
-// ============================================================================
-
+// =====================================================================// Integration Tests
+// =====================================================================
 #[test]
 fn test_multiple_invoices_independent() {
     let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
@@ -1103,6 +1470,314 @@ fn test_get_history_returns_action_log() {
 }
 
 #[test]
+fn test_get_history_page_empty_returns_no_items() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 50);
+
+    let page = client.get_history_page(&invoice_id, &0, &10);
+
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_history_page_first_page_and_cursor() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 51);
+
+    for round in 0..3u128 {
+        let amount = 1_000_000_000 + round;
+        client.lock(&invoice_id, &amount, &issuer);
+        client.release_to_pool(&invoice_id, &(amount / 2));
+        client.release_to_pool(&invoice_id, &(amount - amount / 2));
+    }
+
+    let history = client.get_history(&invoice_id);
+    let page = client.get_history_page(&invoice_id, &0, &2);
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap(), history.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap(), history.get(1).unwrap());
+    assert_eq!(page.next_cursor, Some(2));
+}
+
+#[test]
+fn test_get_history_page_multi_page_walk_has_no_gaps_or_duplicates() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 52);
+
+    for round in 0..3u128 {
+        let amount = 1_000_000_000 + round;
+        client.lock(&invoice_id, &amount, &issuer);
+        client.release_to_pool(&invoice_id, &(amount / 2));
+        client.release_to_pool(&invoice_id, &(amount - amount / 2));
+    }
+    client.lock(&invoice_id, &999, &issuer);
+
+    let expected = client.get_history(&invoice_id);
+    let walked = walk_history(&env, &client, &invoice_id, 2);
+
+    assert_eq!(expected.len(), 10);
+    assert_eq!(walked, expected);
+    assert_eq!(walked.get(0).unwrap().action, EscrowAction::Locked);
+    assert_eq!(walked.get(9).unwrap().action, EscrowAction::Locked);
+}
+
+#[test]
+fn test_get_history_page_exact_max_limit_and_final_cursor() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 53);
+    let amount = 1_000_000u128;
+
+    for _ in 0..(MAX_HISTORY_EVENTS / 3 + 1) {
+        client.lock(&invoice_id, &amount, &issuer);
+        client.release_to_pool(&invoice_id, &(amount / 2));
+        client.release_to_pool(&invoice_id, &(amount - amount / 2));
+    }
+
+    assert_eq!(client.get_history(&invoice_id).len(), MAX_HISTORY_EVENTS);
+
+    let exact = client.get_history_page(&invoice_id, &0, &MAX_HISTORY_LIMIT);
+    assert_eq!(exact.items.len(), MAX_HISTORY_EVENTS);
+    assert!(exact.next_cursor.is_none());
+
+    // The oldest event is evicted without shifting the absolute append cursor.
+    client.lock(&invoice_id, &amount, &issuer);
+    let retained = client.get_history(&invoice_id);
+    assert_eq!(retained.len(), MAX_HISTORY_EVENTS);
+    assert_eq!(retained.get(0).unwrap().action, EscrowAction::ReleasedToPool);
+
+    let after_prune = client.get_history_page(&invoice_id, &0, &MAX_HISTORY_LIMIT);
+    assert_eq!(after_prune.items.len(), MAX_HISTORY_EVENTS);
+    assert!(after_prune.next_cursor.is_none());
+
+    let at_end = client.get_history_page(&invoice_id, &(MAX_HISTORY_EVENTS + 2), &10);
+    assert!(at_end.items.is_empty());
+    assert!(at_end.next_cursor.is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_get_history_page_rejects_zero_limit() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 54);
+
+    client.get_history_page(&invoice_id, &0, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_get_history_page_rejects_limit_above_max() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 55);
+
+    client.get_history_page(&invoice_id, &0, &(MAX_HISTORY_LIMIT + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_get_history_page_rejects_cursor_past_end() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 56);
+
+    client.lock(&invoice_id, &1_000_000u128, &issuer);
+    client.get_history_page(&invoice_id, &2, &10);
+}
+
+#[test]
+fn test_get_history_page_appends_and_partial_release_between_pages() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 57);
+
+    client.lock(&invoice_id, &1_000u128, &issuer);
+    client.release_to_pool(&invoice_id, &100u128);
+
+    let first = client.get_history_page(&invoice_id, &0, &1);
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items.get(0).unwrap().action, EscrowAction::Locked);
+    assert_eq!(first.items.get(0).unwrap().amount, 1_000);
+    assert_eq!(first.next_cursor, Some(1));
+
+    let partial = 400u128;
+    client.release_to_pool(&invoice_id, &partial);
+    client.release_to_pool(&invoice_id, &500u128);
+    client.lock(&invoice_id, &200u128, &issuer);
+
+    let second = client.get_history_page(&invoice_id, &first.next_cursor.unwrap(), &1);
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(
+        second.items.get(0).unwrap().action,
+        EscrowAction::ReleasedToPool
+    );
+    assert_eq!(second.items.get(0).unwrap().amount, 100);
+    assert_eq!(second.next_cursor, Some(2));
+
+    let third = client.get_history_page(&invoice_id, &second.next_cursor.unwrap(), &1);
+    assert_eq!(third.items.get(0).unwrap().amount, partial);
+    assert_eq!(third.next_cursor, Some(3));
+
+    let fourth = client.get_history_page(&invoice_id, &third.next_cursor.unwrap(), &1);
+    assert_eq!(fourth.items.len(), 1);
+    assert_eq!(fourth.items.get(0).unwrap().action, EscrowAction::ReleasedToPool);
+    assert_eq!(fourth.items.get(0).unwrap().amount, 500);
+    assert_eq!(fourth.next_cursor, Some(4));
+
+    let fifth = client.get_history_page(&invoice_id, &fourth.next_cursor.unwrap(), &1);
+    assert_eq!(fifth.items.get(0).unwrap().action, EscrowAction::Locked);
+    assert_eq!(fifth.items.get(0).unwrap().amount, 200);
+    assert!(fifth.next_cursor.is_none());
+
+    let expected = client.get_history(&invoice_id);
+    let walked = walk_history(&env, &client, &invoice_id, 1);
+    assert_eq!(expected.len(), 5);
+    assert_eq!(walked, expected);
+}
+
+#[test]
+fn test_compact_history_below_threshold_is_unchanged() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 200);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    let removed = client.compact_history(&invoice_id, &8);
+
+    assert_eq!(removed, 0);
+    let history = client.get_history(&invoice_id);
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.get(0).unwrap().amount, 1);
+    assert_eq!(history.get(3).unwrap().amount, 4);
+}
+
+#[test]
+fn test_compact_history_at_threshold_is_unchanged() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 201);
+    seed_history(&env, &client.address, &invoice_id, 5);
+
+    let removed = client.compact_history(&invoice_id, &5);
+
+    assert_eq!(removed, 0);
+    assert_eq!(client.get_history(&invoice_id).len(), 5);
+}
+
+#[test]
+fn test_compact_history_above_threshold_prunes_oldest_and_preserves_order() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 202);
+    seed_history(&env, &client.address, &invoice_id, 10);
+
+    let removed = client.compact_history(&invoice_id, &4);
+
+    assert_eq!(removed, 6);
+    let history = client.get_history(&invoice_id);
+    assert_eq!(history.len(), 4);
+    for (index, expected_amount) in [7u128, 8, 9, 10].iter().enumerate() {
+        let event = history.get(index as u32).unwrap();
+        assert_eq!(event.amount, *expected_amount);
+        assert_eq!(event.timestamp, 6 + index as u64);
+    }
+}
+
+#[test]
+fn test_compact_history_is_idempotent() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 203);
+    seed_history(&env, &client.address, &invoice_id, 12);
+
+    assert_eq!(client.compact_history(&invoice_id, &4), 8);
+    assert_eq!(client.compact_history(&invoice_id, &4), 0);
+    assert_eq!(client.get_history(&invoice_id).len(), 4);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_compact_history_missing_invoice_panics_not_found() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 204);
+
+    client.compact_history(&invoice_id, &4);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_compact_history_rejects_zero_retention() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 205);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    client.compact_history(&invoice_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_compact_history_rejects_retention_above_cap() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 206);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    client.compact_history(&invoice_id, &(MAX_HISTORY_EVENTS + 1));
+}
+
+#[test]
+fn test_compact_history_accepts_minimum_retention() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 207);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    assert_eq!(client.compact_history(&invoice_id, &MIN_HISTORY_EVENTS), 3);
+    assert_eq!(client.get_history(&invoice_id).len(), MIN_HISTORY_EVENTS);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth")]
+fn test_compact_history_requires_admin_authorization() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup_without_auths();
+    let invoice_id = generate_invoice_id(&env, 206);
+    seed_history(&env, &client.address, &invoice_id, 4);
+
+    client.compact_history(&invoice_id, &2);
+}
+
+#[test]
+fn test_compact_history_emits_event() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 207);
+    seed_history(&env, &client.address, &invoice_id, 6);
+
+    client.compact_history(&invoice_id, &2);
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.last().expect("expected compaction event");
+    assert_eq!(contract, client.address);
+    assert_eq!(
+        Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(&env, "history_compacted")
+    );
+    assert_eq!(
+        BytesN::<32>::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+        invoice_id
+    );
+    let (retained, removed): (u32, u32) = TryFromVal::try_from_val(&env, &data).unwrap();
+    assert_eq!((retained, removed), (2, 4));
+}
+
+#[test]
+fn test_append_history_automatically_compacts_at_cap() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 208);
+    seed_history(&env, &client.address, &invoice_id, MAX_HISTORY_EVENTS);
+
+    client.lock(&invoice_id, &1_000_000_000, &issuer);
+
+    let history = client.get_history(&invoice_id);
+    assert_eq!(history.len(), MAX_HISTORY_EVENTS);
+    assert_eq!(history.get(0).unwrap().amount, 2);
+    let last = history.last().unwrap();
+    assert_eq!(last.action, EscrowAction::Locked);
+    assert_eq!(last.amount, 1_000_000_000);
+}
+
+#[test]
 #[should_panic]
 fn test_lock_requires_pool_authorization() {
     let (env, client, _admin, _pool, issuer, _usdc_id) = setup_without_auths();
@@ -1139,10 +1814,8 @@ fn test_handle_default_requires_pool_authorization() {
     client.handle_default(&invoice_id, &pool);
 }
 
-// ============================================================================
-// Pre-initialization tests — typed NotInitialized (Contract error #6)
-// ============================================================================
-
+// =====================================================================// Pre-initialization tests — typed NotInitialized (Contract error #6)
+// =====================================================================
 /// `lock` must panic with `NotInitialized` rather than the cryptic
 /// host-side `Option::unwrap()` error when called before `initialize()`.
 #[test]
@@ -1382,8 +2055,7 @@ fn prop_escrow_balance_equals_sum_of_locked_records() {
         })
         .unwrap();
 }
-// ============== ISSUE #716: EMERGENCY PAUSE / UNPAUSE ==============
-
+// ============== ISSUE #716: EMERGENCY PAUSE / UNPAUSE =======
 #[test]
 fn test_pause_blocks_state_changes_and_unpause_restores_them() {
     let (env, client, _admin, pool, issuer, usdc_id) = setup();
@@ -1467,6 +2139,94 @@ fn test_unpause_requires_admin_authorization() {
         },
     }]);
     assert!(client.try_unpause().is_err());
+}
+
+#[test]
+fn test_pause_matrix_preserves_balances_records_history_and_events() {
+    use soroban_sdk::xdr::ToXdr;
+    for operation in 0..4 {
+        let (env, client, admin, pool, issuer, usdc) = setup();
+        let id = generate_invoice_id(&env, 550 + operation);
+        let second = generate_invoice_id(&env, 560 + operation);
+        let amount = 1_000_000u128;
+        client.lock(&id, &amount, &issuer);
+        // Default is otherwise eligible, so the breaker is the sole blocker.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60);
+        client.pause();
+        let history = client.get_history(&id).to_xdr(&env);
+        let balances = (
+            get_balance(&env, &usdc, &pool),
+            get_balance(&env, &usdc, &client.address),
+            get_balance(&env, &usdc, &issuer),
+        );
+        let locked_at = client.get_locked_at(&id);
+        let events = env.events().all().len();
+        let rejected = match operation {
+            0 => client.try_lock(&second, &amount, &issuer).is_err(),
+            1 => client.try_release_to_issuer(&id, &issuer).is_err(),
+            2 => client.try_release_to_pool(&id, &amount).is_err(),
+            _ => client.try_handle_default(&id, &pool).is_err(),
+        };
+        assert!(rejected);
+        assert_eq!(client.get_locked(&id), amount);
+        assert_eq!(client.get_locked(&second), 0);
+        assert_eq!(client.get_locked_at(&id), locked_at);
+        assert_eq!(client.get_history(&id).to_xdr(&env), history);
+        assert_eq!(
+            (
+                get_balance(&env, &usdc, &pool),
+                get_balance(&env, &usdc, &client.address),
+                get_balance(&env, &usdc, &issuer)
+            ),
+            balances
+        );
+        assert_eq!(env.events().all().len(), events);
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_pool_contract(), pool);
+        assert_eq!(client.get_usdc_asset(), usdc);
+        assert!(client.get_history(&second).is_empty());
+        client.unpause();
+        let succeeded = match operation {
+            0 => client.lock(&second, &amount, &issuer),
+            1 => client.release_to_issuer(&id, &issuer),
+            2 => client.release_to_pool(&id, &amount),
+            _ => client.handle_default(&id, &pool),
+        };
+        assert!(succeeded);
+        if operation == 0 {
+            assert_eq!(client.get_locked(&second), amount);
+        } else {
+            assert_eq!(client.get_locked(&id), 0);
+        }
+    }
+}
+
+#[test]
+fn test_initialize_is_blocked_by_stored_pause_and_recoverable_after_unpause() {
+    // Public pause requires initialization. Seed the shared breaker on a fresh
+    // deployment to independently test initialize's own pause guard.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let pool = Address::generate(&env);
+    let token = Address::generate(&env);
+    let id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &id);
+    env.as_contract(&id, || clearledger_pause::set_paused(&env, true));
+    let events = env.events().all().len();
+    assert!(client.try_initialize(&admin, &pool, &token).is_err());
+    assert_eq!(env.events().all().len(), events);
+    env.as_contract(&id, || {
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+        assert!(!env.storage().instance().has(&DataKey::PoolContract));
+        assert!(!env.storage().instance().has(&DataKey::UsdcAsset));
+        clearledger_pause::set_paused(&env, false);
+    });
+    client.initialize(&admin, &pool, &token);
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_pool_contract(), pool);
+    assert_eq!(client.get_usdc_asset(), token);
+    assert!(client.try_initialize(&admin, &pool, &token).is_err());
 }
 
 #[test]

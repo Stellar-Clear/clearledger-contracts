@@ -15,4 +15,7 @@ pub enum RegistryError {
     /// registration entry points. Pagination must be requested in bounded
     /// pages so a single call can never walk the whole index.
     PageSizeExceeded = 8,
+    /// An admin-transfer entry point was given the registry contract's own
+    /// address, which can never be a valid external admin/controller.
+    InvalidAddress = 10,
 }

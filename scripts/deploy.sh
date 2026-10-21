@@ -18,6 +18,7 @@
 # step whose address was already saved.
 
 set -euo pipefail
+umask 077
 
 # Load configuration from .env (falling back to .env.example) using safe
 # line-by-line parsing. Unlike `source`, this never executes arbitrary shell
@@ -53,6 +54,11 @@ load_env() {
         # (e.g. keys with spaces or special characters) is skipped.
         case "$key" in
           *[!A-Za-z0-9_]*|'') continue ;;
+        esac
+        # Keep unrelated .env values out of the Stellar CLI child process.
+        case "$key" in
+          DEPLOYER_ACCOUNT|DEPLOY_XLM|USDC_ISSUER|XLM_ASSET|AGENT_REGISTRY_CONTRACT|STELLAR_BIN) ;;
+          *) continue ;;
         esac
         export "$key=$value"
         ;;
@@ -163,6 +169,7 @@ if [ "$FRESH" = true ]; then
 fi
 
 touch "$ADDRESSES_FILE"
+chmod 600 "$ADDRESSES_FILE"
 
 # Write or overwrite a key in the addresses file
 save_address() {
@@ -256,7 +263,7 @@ deploy_contract() {
       --source "$DEPLOYER_ACCOUNT" \
       --network "$STELLAR_NETWORK" 2>&1); then
     echo "ERROR: Deploy failed for $key:" >&2
-    echo "  $deploy_output" >&2
+    echo "  Stellar CLI output withheld to avoid logging transaction signing material." >&2
     echo "  Fix the error above and rerun — already-deployed contracts will be skipped." >&2
     return 1
   fi
@@ -316,7 +323,7 @@ invoke_init() {
       --network testnet \
       "$@" 2>&1); then
     echo "ERROR: Initialization failed for $label:"
-    echo "  $output"
+    echo "  Stellar CLI output withheld to avoid logging transaction signing material."
     echo "  The contract is deployed but NOT initialized."
     echo "  Fix the error and rerun — this step will be retried automatically."
     return 1
@@ -632,10 +639,12 @@ cat > "$JSON_OUT" <<EOF
   "updated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 EOF
+chmod 600 "$ENV_OUT" "$JSON_OUT" "$ADDRESSES_FILE"
 
 if [ -f "scripts/maintainer/update-readme-addresses.sh" ]; then
   bash scripts/maintainer/update-readme-addresses.sh
 fi
+python3 scripts/check_deployment_metadata.py
 
 echo ""
 echo "==========================================="
