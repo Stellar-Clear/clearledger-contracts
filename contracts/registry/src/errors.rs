@@ -19,10 +19,13 @@ pub enum RegistryError {
     /// pagination requires a positive limit so every call makes progress;
     /// use the cursor alone to detect the end of the list.
     InvalidPageSize = 9,
+    /// An admin-transfer entry point was given the registry contract's own
+    /// address, which can never be a valid external admin/controller.
+    InvalidAddress = 10,
     /// The `list_profiles_page` cursor is past the end of the role's current
     /// enumeration index. Cursors are opaque positions returned as
     /// `ProfilePage::next_cursor`; a cursor beyond the current
     /// `get_profile_count(role)` cannot be resumed and is rejected instead of
     /// silently returning an empty page.
-    InvalidCursor = 10,
+    InvalidCursor = 11,
 }

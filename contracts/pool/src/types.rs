@@ -64,6 +64,75 @@ pub struct LPPosition {
     pub deposit_count: u32,
 }
 
+/// Eligibility or capacity reason reported by [`FundingPreview`].
+///
+/// The variants mirror the first check `fund_invoice` would fail, so a caller
+/// can tell an ineligible invoice (unlisted, unverified, wrong asset, ...) from
+/// an eligible one the pool simply cannot afford to fund right now. Each
+/// non-`Eligible` variant corresponds to the same-named `PoolError` code that a
+/// real `fund_invoice` call would raise.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FundingStatus {
+    /// Every funding check passes; `fund_invoice` would succeed.
+    Eligible,
+    /// A `FundedInvoice` entry already exists for this invoice (`AlreadyFunded`, #16).
+    AlreadyFunded,
+    /// The invoice is not in `Listed` status (`InvoiceNotListed`, #8).
+    InvoiceNotListed,
+    /// The issuer's registry verification was revoked (`IssuerNotVerified`, #18).
+    IssuerNotVerified,
+    /// The buyer's registry verification was revoked (`BuyerNotVerified`, #19).
+    BuyerNotVerified,
+    /// The invoice's funding asset differs from the pool's (`AssetMismatch`, #11).
+    AssetMismatch,
+    /// The discount math rounds the funded amount to zero (`InvalidAmount`, #4).
+    InvalidAmount,
+    /// Available liquidity is smaller than the quoted funded amount
+    /// (`InsufficientLiquidity`, #5).
+    InsufficientLiquidity,
+    /// Post-funding utilization would exceed `max_utilization_bps`
+    /// (`UtilizationCapExceeded`, #12).
+    UtilizationCapExceeded,
+    /// The quoted amount or utilization calculation overflows `u128`
+    /// (`Overflow`, #13).
+    Overflow,
+}
+
+/// Read-only quote returned by `preview_fund`.
+///
+/// All amounts are denominated in the pool's funding asset's base units
+/// (stroops for a 7-decimal asset) and use the same floor-rounded discount
+/// math as `fund_invoice`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingPreview {
+    /// USDC (in stroops) `fund_invoice` would commit for this invoice, equal to
+    /// `face_value * (10_000 - discount_bps) / 10_000` with the same floor
+    /// division as the write path. Zero when the quote could not be computed
+    /// (`InvalidAmount` / `Overflow`) or an earlier eligibility check failed.
+    pub funded_amount: u128,
+    /// Pool liquidity (in stroops) the funding would consume. Equal to
+    /// `funded_amount`; named separately so callers can reason about capacity
+    /// without assuming the discount formula.
+    pub required_capacity: u128,
+    /// Pool liquidity (in stroops) currently available for new funding, equal
+    /// to `total_deposits - total_funded`. Zero when an earlier eligibility
+    /// check failed before the pool totals were read.
+    pub available_liquidity: u128,
+    /// Utilization (in basis points) the pool would be at after funding. Zero
+    /// when the quote stopped at an earlier eligibility, liquidity, or overflow
+    /// check.
+    pub utilization_bps_after: u32,
+    /// The pool's configured utilization cap in basis points. Zero when an
+    /// earlier eligibility check failed before the pool totals were read.
+    pub max_utilization_bps: u32,
+    /// `true` only when `status` is `FundingStatus::Eligible`.
+    pub eligible: bool,
+    /// The first eligibility or capacity reason that would stop `fund_invoice`.
+    pub status: FundingStatus,
+}
+
 /// Read-only quote returned by `preview_withdraw`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,4 +207,24 @@ pub enum DataKey {
     /// `docs/SEP41_DESIGN.md` requires shares to carry the funding asset's
     /// decimals, and under the factory model each instance has its own.
     ShareDecimals,
+}
+
+/// Versioned read-only pool configuration. Existing scalar getters remain available.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PoolConfigV1 {
+    pub version: u32,
+    pub funding_asset: Address,
+    pub min_initial_deposit: u128,
+    pub max_utilization_bps: u32,
+    pub max_batch_size: u32,
+    pub max_protocol_fee_bps: u32,
+    /// Effective settlement fee, distinct from the legacy initializer fee key.
+    pub protocol_fee_bps: u32,
+    pub initialization_fee_bps: u32,
+    pub treasury: Address,
+    pub invoice_contract: Address,
+    pub escrow_contract: Address,
+    pub registry_contract: Address,
+    pub paused: bool,
 }

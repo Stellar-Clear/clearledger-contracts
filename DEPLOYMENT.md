@@ -11,6 +11,7 @@ smart contracts on Stellar.
 | Rust | 1.85.0 | `rustup toolchain install 1.85.0` |
 | wasm32v1-none target | — | `rustup target add wasm32v1-none --toolchain 1.85.0` |
 | Stellar CLI | latest | See [Stellar CLI docs](https://github.com/stellar/stellar-cli) |
+| Python | 3 | Used by deployment metadata checks (`python3`) |
 | jq | latest | Required by `scripts/maintainer/update-readme-addresses.sh`, run automatically at the end of `deploy.sh`. See [jq docs](https://jqlang.github.io/jq/download/) |
 
 The repo ships `rust-toolchain.toml` pinning channel `1.85.0` and
@@ -27,9 +28,36 @@ Copy `.env.example` to `.env` and fill in:
 | Variable | Description |
 |----------|-------------|
 | `DEPLOYER_ACCOUNT` | Key alias for the deployer (default: `deployer`) |
-| `USDC_ISSUER` | Stellar address of the USDC issuer on testnet |
-| `XLM_ASSET` | XLM asset contract address (or native) - EXPERIMENTAL/INCOMPLETE |
+| `USDC_ISSUER` | Legacy name: selected Testnet asset SAC **C-address**, not the issuing G-account |
+| `XLM_ASSET` | Native XLM SAC contract address. Testnet: `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`. See [Native XLM](docs/NATIVE_XLM.md). |
 | `DEPLOY_XLM` | Set to `true` to opt in to experimental XLM contracts; defaults to the supported USDC workflow |
+
+See [Testnet asset configuration](docs/testnet-assets.md) for issuer identity,
+SAC addresses, precision, trustlines and explorer references.
+
+## Native XLM via the Stellar Asset Contract
+
+Native XLM is supported through its Stellar Asset Contract (SAC), not through an
+issuer account. `XLM_ASSET` must be the network-specific SAC `C...` address, and
+the pool's `funding_asset`, the XLM escrow's asset, and the invoice allow-list
+entry must all use that same address. XLM uses 7 decimals (stroops), and the
+native SAC has no issuer or administrator.
+
+The canonical Testnet address is:
+
+```
+CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
+
+Do not use the `native` keyword or a `XLM:G...` asset identifier in a Soroban
+`Address` field. For address derivation, verification commands, factory
+initialization requirements, and current limitations, see
+[docs/NATIVE_XLM.md](docs/NATIVE_XLM.md).
+
+XLM deployment remains opt-in (`DEPLOY_XLM=true`) and the frontend does not yet
+expose an XLM pool. The bundled scripts deploy a dedicated XLM pool directly;
+routing an XLM pool through `pool_factory::register_asset` is supported but
+currently manual.
 
 ### Signing-Key and Log Handling
 
@@ -121,10 +149,10 @@ because each contract references others:
    └─ needs: invoice_contract, escrow_contract, USDC asset
 
 5. escrow_contract (XLM) [EXPERIMENTAL]
-   └─ needs: pool_contract, XLM asset
+   └─ needs: pool_contract, native XLM SAC address
 
 6. pool_contract (XLM) [EXPERIMENTAL]
-   └─ needs: invoice_contract, escrow_contract, XLM asset
+   └─ needs: invoice_contract, escrow_contract, native XLM SAC address
 
 7. Wire pool into invoice
    └─ invoice.set_pool_contract(pool_usdc)
@@ -151,22 +179,31 @@ call `is_verified()` on it during initialization.
 
 ## Multi-sig Admin
 
+For the end-to-end Testnet runbook, including signer creation, threshold
+setup, contract initialization, signer rotation, pause/upgrade/ownership
+actions, and emergency recovery, see
+[docs/MULTISIG_ADMIN.md](docs/MULTISIG_ADMIN.md). This section is a short
+summary; the runbook is authoritative for command syntax.
+
 Each protocol contract with an `admin` parameter accepts a Stellar account
 address as its admin. A classic Stellar account can require multiple signers
 for authorization by configuring its signer weights and thresholds; Soroban
 then checks the account's configured threshold when the admin authorizes a
-contract call. Configure this before
-deploying contracts and pass the multisig account's `G...` address as `admin`
-to each `initialize()` call. Keep the individual signer secret keys separate.
-The bundled deployment scripts currently set admin to the deployer's address;
-for a multisig deployment, initialize each contract with the multisig address
-and submit those initialization transactions with the multisig threshold met.
+contract call. Configure this before or immediately after deploying contracts
+and pass the multisig account's `G...` address as `admin` to each
+`initialize()` call. Keep the individual signer secret keys separate. The
+bundled deployment scripts currently set admin to the deployer's address; for
+a multisig deployment, initialize each contract with the multisig address and
+submit those initialization transactions with the multisig threshold met. The
+runbook shows both a bootstrap-then-harden flow that reuses `deploy.sh` and a
+manual flow that initializes an already-hardened account.
 
 ### Testnet Example: 3-of-5
 
-Create and fund five testnet signer accounts, then use Stellar Laboratory's
-Testnet transaction builder to submit `Set Options` operations from the admin
-account with these settings:
+Create and fund five testnet signer accounts, then submit `Set Options`
+operations from the admin account with these settings. The exact
+`stellar tx new set-options` ceremony is in
+[docs/MULTISIG_ADMIN.md#1-create-the-3-of-5-admin-account](docs/MULTISIG_ADMIN.md#1-create-the-3-of-5-admin-account).
 
 | Signer | Weight |
 |--------|--------|
@@ -322,6 +359,19 @@ You can also verify on [Stellar Expert Testnet](https://stellar.expert/explorer/
 To confirm the deployed bytecode matches your local build, compare hashes as
 described in the [WASM artifact contributor guide](docs/developer-guide/wasm-artifacts.md#compare-wasm-hashes).
 
+### Deployment Metadata Consistency
+
+`deploy.sh` validates the generated `deployments.json`, `.env.deployed`, and
+`.deployed-addresses` against each other and the README address table before it
+reports completion. CI also checks that the README markers and required address
+rows are present; locally generated files are compared whenever they exist.
+Run the same checks manually with:
+
+```bash
+python3 scripts/check_deployment_metadata.py
+python3 -m unittest scripts.test_deployment_metadata
+```
+
 ## Contract Address Lifecycle & Rotation Policy
 
 Testnet contract addresses are ephemeral and may be rotated at any time during development. When rotated, old addresses will drift silently and are no longer maintained.
@@ -354,6 +404,48 @@ Integrators and contributors should:
 2. Regularly pull the latest changes from the `main` branch to synchronize with the current testnet environment.
 3. Check `README.md` for the current canonical testnet addresses rather than hardcoding them in local environments.
 
+### Safe Testnet Address Rotation Checklist
+
+The bundled deployment scripts support Testnet only. Keep `STELLAR_NETWORK=testnet`
+and use Testnet RPC, Horizon, and explorer endpoints; a configured `USDC_ISSUER`
+must be the Testnet issuer/address, not a Mainnet asset. Validate the deployment
+configuration without building or submitting transactions:
+
+```bash
+bash scripts/deploy.sh --validate-env
+```
+
+On Windows, use `powershell ./scripts/deploy.ps1 -ValidateEnv`. The preflight
+checks the network, deployer key alias, Stellar StrKey formats, and the
+experimental XLM opt-in/asset pair. `XLM_ASSET` is required only when
+`DEPLOY_XLM=true`; XLM contracts remain experimental and are not supported by
+the frontend.
+
+For a full address rotation, run `bash scripts/deploy.sh --fresh` or
+`powershell ./scripts/deploy.ps1 -Fresh`. For a single-contract replacement,
+use `--only <contract>` with the Bash script. After deployment:
+
+1. Review `.deployed-addresses`, `deployments.json`, and `.env.deployed`; ensure
+   all IDs are Testnet contract StrKeys (`C...`) and the issuer remains the
+   intended Testnet account/asset.
+2. Refresh the checked-in README address table with
+   `scripts/maintainer/update-readme-addresses.sh` after the deployment outputs
+   are current.
+3. Update the frontend's `clearledger-app/.env.local` contract ID settings to
+   match the corresponding `*_CONTRACT_ID` entries in `.env.example`. Restart
+   the frontend after changing its environment.
+4. Update the indexer's deployment environment in its own service/repository
+   with the same Testnet contract IDs and Testnet RPC endpoint. This repository
+   does not define indexer environment-variable names or manage indexer config;
+   do not copy Mainnet IDs or infer that README updates propagate downstream.
+5. Check deployment references in the application, indexer, README, and
+   operator environment for old contract IDs. Verify new contracts on
+   [Stellar Expert Testnet](https://stellar.expert/explorer/testnet) using
+   `https://stellar.expert/explorer/testnet/contract/<CONTRACT_ID>`.
+
+Do not treat Testnet deployment, test assets, or explorer visibility as evidence
+of Mainnet readiness or financial performance.
+
 ## Rollback
 
 There is no automated rollback. To redeploy from scratch:
@@ -381,4 +473,5 @@ To manually invalidate old deployments:
 | `DEPLOYER_ACCOUNT not set` | Copy `.env.example` to `.env` and fill in values |
 | Deploy hangs waiting for contract | Check network connection; testnet may be slow |
 | `400` from Friendbot | Account likely already funded — this is normal |
+| `contract not found` for `XLM_ASSET` | Re-derive the SAC address with `stellar contract id asset --network testnet --asset native`; use the `C...` address, never a `G...` issuer. See [docs/NATIVE_XLM.md](docs/NATIVE_XLM.md). |
 | Contract not found on verify | Wait longer after deploy; re-run `verify.sh` |

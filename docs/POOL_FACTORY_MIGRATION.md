@@ -34,15 +34,30 @@ stellar contract invoke \
 
 ### 3. Verify registration
 
-Call `list_assets()` on the factory to confirm the USDC asset is registered:
+Call `get_assets_page(cursor, limit)` on the factory to confirm the USDC asset
+is registered. This is the bounded asset-list read: `limit` must be between 1
+and `MAX_ASSET_PAGE_LIMIT` (50), and the response contains the page's `items`
+plus a `next_cursor`.
 
 ```bash
 stellar contract invoke \
   --id <factory_contract_id> \
-  list_assets
+  get_assets_page \
+  --cursor 0 \
+  --limit 50
 ```
 
-The response should include the USDC asset address.
+Start at cursor `0` and keep passing the returned `next_cursor` until it is
+`null`/`None`. Cursors are zero-based positions in the append-only asset index,
+so they stay valid across registrations. If a new asset is registered between
+two reads, it lands after the last cursor already returned and appears at the
+end of the walk; it never shifts or duplicates an item already seen. A cursor
+equal to the current asset count returns an empty final page. Out-of-range
+cursors panic with `InvalidCursor` (error 11), and zero or oversized limits
+panic with `InvalidLimit` (error 10).
+
+`list_assets()` remains available and returns the same registration order for
+ABI compatibility, but it is unbounded and deprecated for new integrations.
 
 ### 4. Verify pool lookup
 

@@ -66,6 +66,7 @@ A security audit is planned prior to any mainnet deployment.
 ## Further Reading
 
 - [Threat Model](./docs/THREAT_MODEL.md) — detailed trust assumptions, auth gates, and attack vectors
+- [Attestation Signing](./docs/ATTESTATIONS.md) — signed preimage, network/contract domain separation, and replay boundary for Underwrite attestations
 - [Pre-Mainnet Audit Scope](./docs/MAINNET_AUDIT_SCOPE.md) — code map, known-risk inventory, and independent-audit questions; not an audit or readiness claim
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout and TTL management
 - [Registry Metadata Privacy](./docs/METADATA_PRIVACY.md) — public visibility, prohibited personal data, and deletion limits

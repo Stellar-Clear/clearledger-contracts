@@ -21,6 +21,11 @@ jobs:
       - name: Deployment script smoke tests
         run: bash scripts/test-deploy.sh
 
+      - name: Validate deployment metadata
+        run: |
+          python3 scripts/check_deployment_metadata.py
+          python3 -m unittest scripts.test_deployment_metadata
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:

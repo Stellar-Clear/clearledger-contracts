@@ -80,10 +80,10 @@ pub fn invoice_defaulted(env: &Env, invoice_id: &BytesN<32>, loss_amount: u128) 
     );
 }
 
-pub fn max_utilization_updated(env: &Env, old_cap_bps: u32, new_cap_bps: u32) {
+pub fn max_utilization_updated(env: &Env, admin: &Address, old_cap_bps: u32, new_cap_bps: u32) {
     env.events().publish(
         (Symbol::new(env, "max_utilization_updated"),),
-        (old_cap_bps, new_cap_bps),
+        (admin.clone(), old_cap_bps, new_cap_bps),
     );
 }
 
@@ -108,10 +108,16 @@ pub fn unpaused(env: &Env, admin: &Address) {
         .publish((Symbol::new(env, "unpaused"), admin.clone()), ());
 }
 
-pub fn protocol_fee_updated(env: &Env, old_fee_bps: u32, new_fee_bps: u32, treasury: &Address) {
+pub fn protocol_fee_updated(
+    env: &Env,
+    admin: &Address,
+    old_fee_bps: u32,
+    new_fee_bps: u32,
+    treasury: &Address,
+) {
     env.events().publish(
         (Symbol::new(env, "protocol_fee_updated"),),
-        (old_fee_bps, new_fee_bps, treasury.clone()),
+        (admin.clone(), old_fee_bps, new_fee_bps, treasury.clone()),
     );
 }
 

@@ -37,6 +37,23 @@ struct PoolTotals {
     max_utilization_bps: u32,
 }
 
+/// Result of the shared funding-quote evaluation used by both `fund_invoice`
+/// and `preview_fund`. Only the fields `fund_invoice` needs for its writes are
+/// retained beyond the public quote.
+#[derive(Clone)]
+struct FundingEvaluation {
+    funded_amount: u128,
+    available_liquidity: u128,
+    total_funded: u128,
+    active_invoices: u32,
+    utilization_bps_after: u32,
+    max_utilization_bps: u32,
+    status: FundingStatus,
+    invoice_contract: Option<Address>,
+    issuer: Option<Address>,
+    funding_asset: Option<Address>,
+}
+
 #[contractimpl]
 impl PoolContract {
     /// Initializes the pool contract with admin and external contract references.
@@ -84,10 +101,14 @@ impl PoolContract {
     ///
     /// # Panics
     /// * `AlreadyInitialized` if the contract has already been initialized.
-    /// * `InvalidConfiguration` if core contract addresses collide, if
-    ///   `treasury` equals the pool itself or any settlement contract address,
-    ///   or if `share_name`/`share_symbol` is empty (a wallet that cannot render
-    ///   the share token is treated as a misconfigured deploy).
+    /// * `InvalidContractAddress` if core contract addresses collide.
+    /// * `InvalidAsset` if `funding_asset` aliases `admin` or another wired
+    ///   contract role.
+    /// * `InvalidTreasury` if `treasury` equals the pool itself or any
+    ///   settlement contract address.
+    /// * `InvalidShareMetadata` if `share_name` or `share_symbol` is empty
+    ///   (a wallet that cannot render the share token is treated as a
+    ///   misconfigured deploy).
     /// * `EscrowAssetMismatch` if `escrow_contract`'s configured USDC asset
     ///   does not match `funding_asset`.
     ///
@@ -122,21 +143,24 @@ impl PoolContract {
         if Self::admin(&env).is_some() {
             panic_with_error!(&env, PoolError::AlreadyInitialized);
         }
-        if admin == invoice_contract
-            || admin == escrow_contract
-            || admin == funding_asset
-            || admin == registry_contract
-            || invoice_contract == escrow_contract
-            || invoice_contract == funding_asset
-            || invoice_contract == registry_contract
-            || escrow_contract == funding_asset
-            || escrow_contract == registry_contract
+        if funding_asset == admin
+            || funding_asset == invoice_contract
+            || funding_asset == escrow_contract
             || funding_asset == registry_contract
         {
-            panic_with_error!(&env, PoolError::InvalidConfiguration);
+            panic_with_error!(&env, PoolError::InvalidAsset);
+        }
+        if admin == invoice_contract
+            || admin == escrow_contract
+            || admin == registry_contract
+            || invoice_contract == escrow_contract
+            || invoice_contract == registry_contract
+            || escrow_contract == registry_contract
+        {
+            panic_with_error!(&env, PoolError::InvalidContractAddress);
         }
         if share_name.is_empty() || share_symbol.is_empty() {
-            panic_with_error!(&env, PoolError::InvalidConfiguration);
+            panic_with_error!(&env, PoolError::InvalidShareMetadata);
         }
         Self::assert_valid_treasury(
             &env,
@@ -553,7 +577,14 @@ impl PoolContract {
     /// * `MinimumDeposit` if the deposit is too small to mint at least 1 share
     ///   at the current share price (prevents 0-share dust deposits).
     /// * `Overflow` if `usdc_amount * total_shares` would overflow `u128`
-    ///   while computing the proportional share price.
+    ///   while computing the proportional share price, or if `usdc_amount`
+    ///   exceeds the funding asset's `i128` transfer range.
+    ///
+    /// # Token failure
+    /// The funding asset's `transfer` runs before any share or total write. If
+    /// the SAC call fails, the whole invocation reverts: no shares are minted
+    /// and pool totals stay unchanged. The pool does not read token balances,
+    /// so a malformed `balance()` response is never part of its accounting.
     ///
     /// # Returns
     /// * `u128` - The number of shares issued.
@@ -571,7 +602,11 @@ impl PoolContract {
 
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
-        usdc.transfer(&lp, &env.current_contract_address(), &(usdc_amount as i128));
+        usdc.transfer(
+            &lp,
+            &env.current_contract_address(),
+            &Self::token_amount(&env, usdc_amount),
+        );
 
         Self::_mint(&env, &lp, shares_to_issue);
         env.storage()
@@ -760,7 +795,7 @@ impl PoolContract {
         usdc.transfer(
             &env.current_contract_address(),
             &lp,
-            &(usdc_to_return as i128),
+            &Self::token_amount(&env, usdc_to_return),
         );
 
         let remaining_shares = Self::_burn(&env, &lp, shares);
@@ -1184,8 +1219,17 @@ impl PoolContract {
     /// * `InvalidAmount` if the computed funded amount is zero.
     /// * `InsufficientLiquidity` if the pool does not have enough funds.
     /// * `UtilizationCapExceeded` if funding would push utilization above the cap.
-    /// * `Overflow` if `face_value * (10000 - discount_bps)` or the resulting
-    ///   utilization calculation overflows `u128`.
+    /// * `Overflow` if `face_value * (10000 - discount_bps)`, the resulting
+    ///   utilization calculation, or the funded amount's conversion to the
+    ///   funding asset's `i128` transfer range overflows `u128`.
+    ///
+    /// # Token failure
+    /// Pool accounting is written before the escrow/invoice interactions
+    /// (checks-effects-interactions), but Soroban reverts the whole invocation
+    /// if `escrow::lock`'s SAC transfer fails. The `FundedInvoice` entry,
+    /// counters, and invoice status therefore roll back together; a failed
+    /// call can simply be retried and a successful one still hits
+    /// `AlreadyFunded` on replay.
     ///
     /// # Returns
     /// * `bool` - `true` when the invoice is funded.
@@ -1210,114 +1254,49 @@ impl PoolContract {
     /// listed, already funded, unverified issuer/buyer, asset mismatch) panic in
     /// both modes — those are caller errors, not capacity.
     fn fund_one(env: Env, invoice_id: BytesN<32>, stop_on_capacity: bool) -> bool {
-        let invoice_contract = Self::invoice_contract(&env)
-            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let evaluation = Self::evaluate_funding(&env, &invoice_id);
+        if evaluation.status != FundingStatus::Eligible {
+            if stop_on_capacity
+                && matches!(
+                    evaluation.status,
+                    FundingStatus::InsufficientLiquidity | FundingStatus::UtilizationCapExceeded
+                )
+            {
+                return false;
+            }
+            let error = Self::funding_error(evaluation.status)
+                .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+            panic_with_error!(&env, error);
+        }
 
-        // The pool's own idempotency guard runs before any cross-contract read
-        // (and before the invoice-status gate below) so a replay of an
-        // already-recorded funding always surfaces the precise `AlreadyFunded`
-        // error instead of a generic `InvoiceNotListed`. The funding entry is
-        // the authoritative record that this invoice was already funded here.
-        // Refs: issue #444.
+        let funded_amount = evaluation.funded_amount;
         let funded_key = DataKey::FundedInvoice(invoice_id.clone());
-        if env.storage().persistent().has(&funded_key) {
-            panic_with_error!(&env, PoolError::AlreadyFunded);
-        }
 
-        let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let (invoice_status, face_value, discount_bps): (u32, u128, u32) = env.invoke_contract(
-            &invoice_contract,
-            &Symbol::new(&env, "get_funding_terms"),
-            args,
-        );
-        if invoice_status != 1 {
-            panic_with_error!(&env, PoolError::InvoiceNotListed);
-        }
-
-        let registry_id = Self::registry_contract(&env);
-        let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let issuer: Address =
-            env.invoke_contract(&invoice_contract, &Symbol::new(&env, "get_issuer"), args);
-        let mut args = Vec::new(&env);
-        args.push_back(issuer.into_val(&env));
-        let issuer_verified: bool =
-            env.invoke_contract(&registry_id, &Symbol::new(&env, "is_verified"), args);
-        if !issuer_verified {
-            panic_with_error!(&env, PoolError::IssuerNotVerified);
-        }
-
-        let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let buyer: Address =
-            env.invoke_contract(&invoice_contract, &Symbol::new(&env, "get_buyer"), args);
-        let mut args = Vec::new(&env);
-        args.push_back(buyer.into_val(&env));
-        let buyer_verified: bool =
-            env.invoke_contract(&registry_id, &Symbol::new(&env, "is_verified"), args);
-        if !buyer_verified {
-            panic_with_error!(&env, PoolError::BuyerNotVerified);
-        }
-
-        let mut args = Vec::new(&env);
-        args.push_back(invoice_id.clone().into_val(&env));
-        let invoice_asset: Address = env.invoke_contract(
-            &invoice_contract,
-            &Symbol::new(&env, "get_funding_asset"),
-            args,
-        );
-        let usdc_id = Self::funding_asset(&env);
-        if invoice_asset != usdc_id {
-            panic_with_error!(&env, PoolError::AssetMismatch);
-        }
-
-        // `face_value` is read from the invoice contract via a cross-contract
-        // call and is not bounded by this pool, so the scaling multiplication
-        // must be guarded just like the utilization check below (#585).
-        let funded_amount = face_value
-            .checked_mul(10000 - discount_bps as u128)
-            .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow))
-            // Integer division floors; any fractional stroop is excluded from
-            // the funded principal and remains part of the invoice discount.
-            / 10000;
-        if funded_amount == 0 {
-            panic_with_error!(&env, PoolError::InvalidAmount);
-        }
-
-        let totals = Self::totals(&env);
-        let total_deposits = totals.deposits;
-        let total_funded = totals.funded;
-        let available = total_deposits - total_funded;
-        if funded_amount > available {
-            if stop_on_capacity {
-                return false;
-            }
-            panic_with_error!(&env, PoolError::InsufficientLiquidity);
-        }
-
-        let max_utilization_bps = totals.max_utilization_bps;
-        let new_total_funded = total_funded + funded_amount;
-        let utilization_after =
-            Self::utilization_bps_or_panic(&env, new_total_funded, total_deposits);
-        if utilization_after > max_utilization_bps {
-            if stop_on_capacity {
-                return false;
-            }
-            panic_with_error!(&env, PoolError::UtilizationCapExceeded);
-        }
+        let invoice_contract = evaluation
+            .invoice_contract
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let issuer = evaluation
+            .issuer
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let usdc_id = evaluation
+            .funding_asset
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
 
         // --- Checks-effects-interactions: commit pool state BEFORE any
         // cross-contract calls so a reentrant callback into this contract
         // always sees the updated TotalFunded / ActiveInvoiceCount /
         // FundedInvoice, preventing double-funding via stale state.
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalFunded, &(total_funded + funded_amount));
-        let active_count = totals.active_invoices;
-        env.storage()
-            .instance()
-            .set(&DataKey::ActiveInvoiceCount, &(active_count + 1));
+        env.storage().instance().set(
+            &DataKey::TotalFunded,
+            &(evaluation.total_funded + funded_amount),
+        );
+        env.storage().instance().set(
+            &DataKey::ActiveInvoiceCount,
+            &(evaluation.active_invoices + 1),
+        );
 
         env.storage().persistent().set(&funded_key, &funded_amount);
         env.storage()
@@ -1347,6 +1326,162 @@ impl PoolContract {
         events::invoice_funded(&env, &invoice_id, funded_amount);
         Self::extend_instance_ttl(&env);
         true
+    }
+
+    /// Shared eligibility, discount, liquidity, and utilization evaluation for
+    /// both `fund_invoice` and `preview_fund`.
+    ///
+    /// This helper performs every read and arithmetic step of funding up to the
+    /// state writes, in exactly the same order as the original `fund_one` body,
+    /// and reports the first failing check as a [`FundingStatus`] instead of
+    /// panicking. `fund_one` turns that status back into the corresponding
+    /// typed `PoolError`, so funding error behavior is unchanged.
+    fn evaluate_funding(env: &Env, invoice_id: &BytesN<32>) -> FundingEvaluation {
+        let mut evaluation = FundingEvaluation {
+            funded_amount: 0,
+            available_liquidity: 0,
+            total_funded: 0,
+            active_invoices: 0,
+            utilization_bps_after: 0,
+            max_utilization_bps: 0,
+            status: FundingStatus::Eligible,
+            invoice_contract: None,
+            issuer: None,
+            funding_asset: None,
+        };
+
+        let invoice_contract = Self::invoice_contract(env)
+            .unwrap_or_else(|| panic_with_error!(env, PoolError::NotInitialized));
+        evaluation.invoice_contract = Some(invoice_contract.clone());
+
+        // The pool's own idempotency guard runs before any cross-contract read
+        // (and before the invoice-status gate below) so a replay of an
+        // already-recorded funding always surfaces the precise `AlreadyFunded`
+        // error instead of a generic `InvoiceNotListed`. The funding entry is
+        // the authoritative record that this invoice was already funded here.
+        // Refs: issue #444.
+        let funded_key = DataKey::FundedInvoice(invoice_id.clone());
+        if env.storage().persistent().has(&funded_key) {
+            evaluation.status = FundingStatus::AlreadyFunded;
+            return evaluation;
+        }
+
+        let mut args = Vec::new(env);
+        args.push_back(invoice_id.clone().into_val(env));
+        let (invoice_status, face_value, discount_bps): (u32, u128, u32) = env.invoke_contract(
+            &invoice_contract,
+            &Symbol::new(env, "get_funding_terms"),
+            args,
+        );
+        if invoice_status != 1 {
+            evaluation.status = FundingStatus::InvoiceNotListed;
+            return evaluation;
+        }
+
+        let registry_id = Self::registry_contract(env);
+        let mut args = Vec::new(env);
+        args.push_back(invoice_id.clone().into_val(env));
+        let issuer: Address =
+            env.invoke_contract(&invoice_contract, &Symbol::new(env, "get_issuer"), args);
+        let mut args = Vec::new(env);
+        args.push_back(issuer.clone().into_val(env));
+        let issuer_verified: bool =
+            env.invoke_contract(&registry_id, &Symbol::new(env, "is_verified"), args);
+        if !issuer_verified {
+            evaluation.status = FundingStatus::IssuerNotVerified;
+            return evaluation;
+        }
+
+        let mut args = Vec::new(env);
+        args.push_back(invoice_id.clone().into_val(env));
+        let buyer: Address =
+            env.invoke_contract(&invoice_contract, &Symbol::new(env, "get_buyer"), args);
+        let mut args = Vec::new(env);
+        args.push_back(buyer.into_val(env));
+        let buyer_verified: bool =
+            env.invoke_contract(&registry_id, &Symbol::new(env, "is_verified"), args);
+        if !buyer_verified {
+            evaluation.status = FundingStatus::BuyerNotVerified;
+            return evaluation;
+        }
+
+        let mut args = Vec::new(env);
+        args.push_back(invoice_id.clone().into_val(env));
+        let invoice_asset: Address = env.invoke_contract(
+            &invoice_contract,
+            &Symbol::new(env, "get_funding_asset"),
+            args,
+        );
+        let usdc_id = Self::funding_asset(env);
+        if invoice_asset != usdc_id {
+            evaluation.status = FundingStatus::AssetMismatch;
+            return evaluation;
+        }
+
+        // `face_value` is read from the invoice contract via a cross-contract
+        // call and is not bounded by this pool, so the scaling multiplication
+        // must be guarded just like the utilization check below (#585).
+        let funded_amount = match face_value.checked_mul(10000 - discount_bps as u128) {
+            Some(scaled) => scaled / 10000,
+            None => {
+                evaluation.status = FundingStatus::Overflow;
+                return evaluation;
+            }
+        };
+        evaluation.funded_amount = funded_amount;
+        if funded_amount == 0 {
+            evaluation.status = FundingStatus::InvalidAmount;
+            return evaluation;
+        }
+
+        let totals = Self::totals(env);
+        let total_deposits = totals.deposits;
+        let total_funded = totals.funded;
+        let available = total_deposits - total_funded;
+        evaluation.available_liquidity = available;
+        evaluation.total_funded = total_funded;
+        evaluation.active_invoices = totals.active_invoices;
+        evaluation.max_utilization_bps = totals.max_utilization_bps;
+        evaluation.issuer = Some(issuer);
+        evaluation.funding_asset = Some(usdc_id);
+
+        if funded_amount > available {
+            evaluation.status = FundingStatus::InsufficientLiquidity;
+            return evaluation;
+        }
+
+        let new_total_funded = total_funded + funded_amount;
+        let utilization_after =
+            match Self::utilization_bps_checked(env, new_total_funded, total_deposits) {
+                Ok(utilization) => utilization,
+                Err(_) => {
+                    evaluation.status = FundingStatus::Overflow;
+                    return evaluation;
+                }
+            };
+        evaluation.utilization_bps_after = utilization_after;
+        if utilization_after > totals.max_utilization_bps {
+            evaluation.status = FundingStatus::UtilizationCapExceeded;
+        }
+
+        evaluation
+    }
+
+    /// Maps a failed [`FundingStatus`] back to the typed `PoolError` that
+    /// `fund_invoice` has always raised for that check.
+    fn funding_error(status: FundingStatus) -> Option<PoolError> {
+        match status {
+            FundingStatus::Eligible => None,
+            FundingStatus::AlreadyFunded => Some(PoolError::AlreadyFunded),
+            FundingStatus::InvoiceNotListed => Some(PoolError::InvoiceNotListed),
+            FundingStatus::IssuerNotVerified => Some(PoolError::IssuerNotVerified),
+            FundingStatus::BuyerNotVerified => Some(PoolError::BuyerNotVerified),
+            FundingStatus::AssetMismatch => Some(PoolError::AssetMismatch),
+            FundingStatus::InvalidAmount => Some(PoolError::InvalidAmount),
+            FundingStatus::InsufficientLiquidity => Some(PoolError::InsufficientLiquidity),
+            FundingStatus::UtilizationCapExceeded => Some(PoolError::UtilizationCapExceeded),
+            FundingStatus::Overflow => Some(PoolError::Overflow),
+        }
     }
 
     /// Funds several listed invoices in one call, applying `fund_invoice`'s
@@ -1413,6 +1548,77 @@ impl PoolContract {
             funded.push_back(invoice_id.clone());
         }
         funded
+    }
+
+    /// Previews funding a listed invoice without committing any pool capital.
+    ///
+    /// The quote runs the exact same eligibility, discount, asset, liquidity,
+    /// and utilization checks as [`Self::fund_invoice`], in the same order, and
+    /// returns the funded amount plus the pool capacity it would consume. It
+    /// exists for frontends, keepers, and indexers that need to show an
+    /// invoice's funding terms and whether the pool can currently fund it
+    /// without submitting a transaction that may revert.
+    ///
+    /// # Eligibility and capacity status
+    /// [`FundingPreview::status`] reports the *first* check that would stop
+    /// `fund_invoice`:
+    /// * `AlreadyFunded` — this pool already has a `FundedInvoice` entry.
+    /// * `InvoiceNotListed` — the invoice is not in `Listed` status.
+    /// * `IssuerNotVerified` / `BuyerNotVerified` — registry verification was
+    ///   revoked after listing.
+    /// * `AssetMismatch` — the invoice funds a different asset than this pool.
+    /// * `InvalidAmount` — the discount math rounds the funded amount to zero.
+    /// * `InsufficientLiquidity` — `funded_amount > available_liquidity`.
+    /// * `UtilizationCapExceeded` — post-funding utilization exceeds the cap.
+    /// * `Overflow` — the discount or utilization calculation overflowed
+    ///   `u128`.
+    ///
+    /// `Eligible` means `fund_invoice` would succeed at the observed ledger
+    /// state, assuming the pool is not paused. Pause state is deliberately not
+    /// checked: like the other read-only views, the preview stays callable
+    /// while paused. For a successful quote (and for the two capacity statuses)
+    /// `available_liquidity`, `utilization_bps_after`, and
+    /// `max_utilization_bps` are populated; earlier eligibility failures leave
+    /// them at zero because funding would stop before reading pool totals.
+    ///
+    /// # Auth
+    /// No authorization is required. The method only performs storage reads and
+    /// cross-contract view calls (`get_funding_terms`, `get_issuer`,
+    /// `get_buyer`, `get_funding_asset`, and registry `is_verified`).
+    ///
+    /// # State and TTL
+    /// This is strictly read-only: it writes no storage, emits no events, and
+    /// performs no TTL extension (including on the pool's instance entry).
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the pool has not been initialized.
+    /// * Propagates the invoice contract's lookup errors (for example
+    ///   `InvoiceError::NotFound`) when `invoice_id` does not exist.
+    ///
+    /// # Returns
+    /// * [`FundingPreview`] - The quoted `funded_amount`, `required_capacity`,
+    ///   available liquidity, post-funding utilization, and eligibility status.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let preview = client.preview_fund(&invoice_id);
+    /// if preview.eligible {
+    ///     // preview.funded_amount is what fund_invoice(&invoice_id) would commit.
+    /// }
+    /// ```
+    pub fn preview_fund(env: Env, invoice_id: BytesN<32>) -> FundingPreview {
+        Self::require_initialized(&env);
+        let evaluation = Self::evaluate_funding(&env, &invoice_id);
+
+        FundingPreview {
+            funded_amount: evaluation.funded_amount,
+            required_capacity: evaluation.funded_amount,
+            available_liquidity: evaluation.available_liquidity,
+            utilization_bps_after: evaluation.utilization_bps_after,
+            max_utilization_bps: evaluation.max_utilization_bps,
+            eligible: evaluation.status == FundingStatus::Eligible,
+            status: evaluation.status,
+        }
     }
 
     /// Receives invoice repayment and updates pool liquidity metrics.
@@ -1520,7 +1726,11 @@ impl PoolContract {
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
         if refund > 0 {
-            usdc.transfer(&env.current_contract_address(), &buyer, &(refund as i128));
+            usdc.transfer(
+                &env.current_contract_address(),
+                &buyer,
+                &Self::token_amount(&env, refund),
+            );
         }
 
         true
@@ -1954,6 +2164,8 @@ impl PoolContract {
     /// Requires authorization from `admin` (via `admin.require_auth()`).
     ///
     /// # Panics
+    /// * `InvalidUtilizationCap` if `new_cap_bps` exceeds `10_000` bps
+    ///   (100%). The cap is validated before any storage write.
     /// * `InvalidConfiguration` if `new_cap_bps` is zero. A zero cap would
     ///   make every positive funding attempt fail and is therefore not a
     ///   valid operating configuration.
@@ -1973,13 +2185,13 @@ impl PoolContract {
             panic_with_error!(&env, PoolError::InvalidConfiguration);
         }
         if new_cap_bps > 10000 {
-            panic_with_error!(&env, PoolError::InvalidAmount);
+            panic_with_error!(&env, PoolError::InvalidUtilizationCap);
         }
         let old_cap_bps = Self::totals(&env).max_utilization_bps;
         env.storage()
             .instance()
             .set(&DataKey::MaxUtilizationBps, &new_cap_bps);
-        events::max_utilization_updated(&env, old_cap_bps, new_cap_bps);
+        events::max_utilization_updated(&env, &admin, old_cap_bps, new_cap_bps);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -2000,8 +2212,9 @@ impl PoolContract {
     /// # Panics
     /// * `NotInitialized` if the pool is not initialized.
     /// * `FeeTooHigh` if `fee_bps` exceeds `MAX_PROTOCOL_FEE_BPS` (2000 bps).
-    /// * `InvalidConfiguration` if `treasury` is the pool, invoice, escrow,
-    ///   registry, or funding-asset address.
+    /// * `InvalidTreasury` if `treasury` is the pool, invoice, escrow,
+    ///   registry, or funding-asset address. Validation runs before either
+    ///   stored value is changed.
     ///
     /// # Returns
     /// * `bool` - `true` when the fee is updated.
@@ -2038,7 +2251,7 @@ impl PoolContract {
         env.storage()
             .instance()
             .set(&DataKey::TreasuryAddress, &treasury);
-        events::protocol_fee_updated(&env, old_fee_bps, fee_bps, &treasury);
+        events::protocol_fee_updated(&env, &admin, old_fee_bps, fee_bps, &treasury);
         Self::extend_instance_ttl(&env);
         true
     }
@@ -2049,6 +2262,36 @@ impl PoolContract {
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0u32)
+    }
+
+    /// Returns configuration schema version 1 in one call.
+    ///
+    /// Permissionless and available while paused; rejects uninitialized pools.
+    /// Existing getters and stored keys are unchanged. Settlement uses
+    /// `protocol_fee_bps`; `initialization_fee_bps` exposes the legacy fee key.
+    pub fn get_config_v1(env: Env) -> PoolConfigV1 {
+        Self::require_initialized(&env);
+        let invoice_contract = Self::invoice_contract(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let escrow_contract = Self::escrow_contract(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let config = PoolConfigV1 {
+            version: 1,
+            funding_asset: Self::funding_asset(&env),
+            min_initial_deposit: Self::min_initial_deposit(&env),
+            max_utilization_bps: Self::totals(&env).max_utilization_bps,
+            max_batch_size: MAX_BATCH_SIZE,
+            max_protocol_fee_bps: MAX_PROTOCOL_FEE_BPS,
+            protocol_fee_bps: Self::get_protocol_fee_bps(env.clone()),
+            initialization_fee_bps: Self::fee_bps(&env).unwrap_or(0),
+            treasury: Self::get_treasury(env.clone()),
+            invoice_contract,
+            escrow_contract,
+            registry_contract: Self::registry_contract(&env),
+            paused: clearledger_pause::is_paused(&env),
+        };
+        Self::extend_instance_ttl(&env);
+        config
     }
 
     /// Returns the configured treasury address.
@@ -2063,15 +2306,27 @@ impl PoolContract {
     }
 
     fn utilization_bps_or_panic(env: &Env, total_funded: u128, total_deposits: u128) -> u32 {
+        Self::utilization_bps_checked(env, total_funded, total_deposits)
+            .unwrap_or_else(|error| panic_with_error!(env, error))
+    }
+
+    /// Non-panicking form of [`Self::utilization_bps_or_panic`] shared with
+    /// `preview_fund`, so the preview can report `FundingStatus::Overflow`
+    /// instead of reverting on the same arithmetic funding would reject.
+    fn utilization_bps_checked(
+        _env: &Env,
+        total_funded: u128,
+        total_deposits: u128,
+    ) -> Result<u32, PoolError> {
         if total_deposits == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let scaled_funded = total_funded
             .checked_mul(10_000)
-            .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow));
+            .ok_or(PoolError::Overflow)?;
 
-        scaled_funded.checked_div(total_deposits).unwrap_or(0) as u32
+        Ok(scaled_funded.checked_div(total_deposits).unwrap_or(0) as u32)
     }
 
     fn require_initialized(env: &Env) {
@@ -2096,7 +2351,7 @@ impl PoolContract {
             || treasury == funding_asset
             || treasury == registry_contract
         {
-            panic_with_error!(env, PoolError::InvalidConfiguration);
+            panic_with_error!(env, PoolError::InvalidTreasury);
         }
     }
 
@@ -2314,7 +2569,7 @@ impl PoolContract {
                 usdc.transfer(
                     &env.current_contract_address(),
                     &treasury,
-                    &(protocol_cut as i128),
+                    &Self::token_amount(env, protocol_cut),
                 );
             }
         }
@@ -2353,6 +2608,23 @@ impl PoolContract {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Converts a pool `u128` amount into the `i128` expected by the SEP-41
+    /// funding-asset `transfer` interface.
+    ///
+    /// `as i128` is a truncating cast: values above `i128::MAX` become
+    /// negative, which a non-conforming token could interpret as a credit
+    /// instead of a debit. The pool rejects them with the typed
+    /// `PoolError::Overflow` before any token call or state write.
+    ///
+    /// Trust boundary: the configured funding asset is assumed to be a SAC
+    /// that honours SEP-41 transfer semantics. The pool does not read
+    /// `balance()` to verify transfers, and a token that reports malformed
+    /// balances cannot influence accounting because those responses are never
+    /// consumed.
+    fn token_amount(env: &Env, amount: u128) -> i128 {
+        i128::try_from(amount).unwrap_or_else(|_| panic_with_error!(env, PoolError::Overflow))
     }
 
     /// Internal helper to mint LP shares (scoped for SEP-41 share issuance).

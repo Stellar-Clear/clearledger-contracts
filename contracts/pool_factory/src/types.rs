@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -14,6 +14,23 @@ pub enum DataKey {
     /// instance came to exist.
     PoolForAsset(Address),
 }
+
+/// One bounded page of the factory's registered asset list.
+///
+/// Returned by [`PoolFactoryContract::get_assets_page`](crate::PoolFactoryContract::get_assets_page).
+/// `items` preserves registration order, and `next_cursor` is the cursor to
+/// pass to the next call, or `None` when the walk is complete. Because the
+/// underlying index is append-only, cursors are stable across registrations:
+/// an asset appended between two reads is returned at the end of the walk.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetPage {
+    /// Assets in registration order, at most `limit` long.
+    pub items: Vec<Address>,
+    /// Zero-based index to pass to the next call, or `None` on the final page.
+    pub next_cursor: Option<u32>,
+}
+
 
 /// One bounded page of aggregate pool statistics.
 ///

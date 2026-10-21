@@ -20,9 +20,22 @@ pub enum EscrowError {
     InvalidRecipient = 7,
     /// Returned when attempting to initialize with colliding addresses (e.g., pool_contract == usdc_asset).
     InvalidConfig = 8,
+    /// Returned when a paginated history read requests a zero limit or a limit
+    /// above [`MAX_HISTORY_LIMIT`](crate::MAX_HISTORY_LIMIT).
+    InvalidLimit = 14,
+    /// Returned when a paginated history read is given a cursor beyond the
+    /// number of recorded events.
+    InvalidCursor = 15,
+
     /// Returned when the requested history retention is outside the supported
     /// range (`MIN_HISTORY_EVENTS..=MAX_HISTORY_EVENTS`).
     ///
     /// Codes 9-12 are reserved by open issues #83 and #50.
     InvalidRetention = 13,
+    /// Returned when `initialize` is given a pool/admin address that aliases
+    /// another configured contract role.
+    InvalidContractAddress = 16,
+    /// Returned when `initialize` is given a `usdc_asset` that aliases the
+    /// admin, pool, or this escrow contract instead of a distinct token.
+    InvalidAsset = 17,
 }

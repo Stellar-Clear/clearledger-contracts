@@ -5,6 +5,7 @@
 #   powershell ./scripts/deploy.ps1              # Normal deploy (skips already-deployed contracts)
 #   powershell ./scripts/deploy.ps1 -Fresh        # Ignore saved addresses and redeploy everything
 #   powershell ./scripts/deploy.ps1 -DryRun       # Show what would be deployed without actually deploying
+#   powershell ./scripts/deploy.ps1 -ValidateEnv  # Validate configuration without deploying
 #   powershell ./scripts/deploy.ps1 -Help         # Show this help
 #
 # Deployed addresses are persisted to .deployed-addresses after each successful
@@ -20,12 +21,14 @@ $ErrorActionPreference = 'Stop'
 $fresh = $false
 $resume = $false
 $dryRun = $false
+$validateEnv = $false
 
 foreach ($arg in $args) {
     switch -Wildcard ($arg) {
         '-fresh'    { $fresh = $true }
         '-resume'   { $resume = $true }
         '-dryrun'   { $dryRun = $true }
+        '-validateenv' { $validateEnv = $true }
         '-help'     { Write-Host "deploy.ps1 — Idempotent deployment script for ClearLedger contracts"; exit 0 }
         '-h'        { Write-Host "deploy.ps1 — Idempotent deployment script for ClearLedger contracts"; exit 0 }
         default     { Write-Host "Unknown argument: $arg  (use -Help for usage)"; exit 1 }
@@ -58,18 +61,25 @@ if (-not $stellar) {
 $envFile = if (Test-Path .env) { ".env" } else { ".env.example" }
 Get-Content $envFile | ForEach-Object {
     $line = $_.Trim()
-    if ($line -and -not $line.StartsWith('#') -and $line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+    if ($line -and -not $line.StartsWith('#') -and $line -match '^\s*([^#=\s]+)\s*=\s*(.*?)\s*$') {
         $key = $matches[1]
-        if ($key -in @('DEPLOYER_ACCOUNT', 'DEPLOY_XLM', 'USDC_ISSUER', 'XLM_ASSET', 'AGENT_REGISTRY_CONTRACT', 'STELLAR_BIN')) {
-            $value = $matches[2].Trim()
-            if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
+        if ($key -in @('DEPLOYER_ACCOUNT', 'DEPLOY_XLM', 'USDC_ISSUER', 'XLM_ASSET', 'AGENT_REGISTRY_CONTRACT', 'STELLAR_BIN', 'STELLAR_NETWORK')) {
+            $value = $matches[2].Trim().Trim('"').Trim("'")
             [Environment]::SetEnvironmentVariable($key, $value)
         }
     }
 }
 $deployXlm = $env:DEPLOY_XLM -eq 'true'
+
+$stellarNetwork = [Environment]::GetEnvironmentVariable('STELLAR_NETWORK')
+if (-not $stellarNetwork) { $stellarNetwork = 'testnet' }
+$deployXlmValue = [Environment]::GetEnvironmentVariable('DEPLOY_XLM')
+if (-not $deployXlmValue) { $deployXlmValue = 'false' }
+if ($deployXlmValue -notmatch '^(?i:true|false)$') {
+    Write-Host "ERROR: DEPLOY_XLM must be 'true' or 'false'; set it explicitly in .env."
+    exit 1
+}
+$deployXlm = $deployXlmValue -ieq 'true'
 
 # ---------------------------------------------------------------------------
 # 1. Address persistence helpers
@@ -126,7 +136,7 @@ function Wait-ForContract {
     Write-Host "  Waiting for contract $contractId to be confirmed on-chain..."
     while ($attempt -lt $maxAttempts) {
         $wasmPath = Join-Path ([System.IO.Path]::GetTempPath()) "clearledger-$contractId.wasm"
-        $output = & $stellar contract fetch --id $contractId --network testnet --out-file $wasmPath 2>&1
+        $output = & $stellar contract fetch --id $contractId --network $stellarNetwork --out-file $wasmPath 2>&1
         if (Test-Path $wasmPath) { Remove-Item $wasmPath -Force }
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Confirmed."
@@ -168,7 +178,7 @@ function Deploy-Contract {
     }
 
     Write-Host "  Deploying $key from $wasm ..."
-    $contractId = & $stellar contract deploy --wasm $wasm --source $env:DEPLOYER_ACCOUNT --network testnet 2>&1
+    $contractId = & $stellar contract deploy --wasm $wasm --source $env:DEPLOYER_ACCOUNT --network $stellarNetwork 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Deploy failed for $key:"
         Write-Host "  Stellar CLI output withheld to avoid logging transaction signing material."
@@ -208,7 +218,7 @@ function Invoke-Init {
     }
 
     Write-Host "  Initializing $label ($contractId) ..."
-    $output = & $stellar contract invoke --id $contractId --source $env:DEPLOYER_ACCOUNT --network testnet @initArgs 2>&1
+    $output = & $stellar contract invoke --id $contractId --source $env:DEPLOYER_ACCOUNT --network $stellarNetwork @initArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Initialization failed for $label:"
         Write-Host "  Stellar CLI output withheld to avoid logging transaction signing material."
@@ -229,19 +239,35 @@ Write-Host "`n=== Pre-flight checks ==="
 
 $deployerAccount = [Environment]::GetEnvironmentVariable('DEPLOYER_ACCOUNT')
 if (-not $deployerAccount) {
-    Write-Host "ERROR: DEPLOYER_ACCOUNT is not set.  Check your .env file."
+    Write-Host "ERROR: DEPLOYER_ACCOUNT is required. Set it to an existing Stellar CLI key alias in .env."
+    exit 1
+}
+if ($deployerAccount -notmatch '^[A-Za-z0-9_][A-Za-z0-9_-]*$') {
+    Write-Host "ERROR: DEPLOYER_ACCOUNT '$deployerAccount' is not a valid key alias; use letters, digits, '_' or '-'."
+    exit 1
+}
+if ($stellarNetwork -ne 'testnet') {
+    Write-Host "ERROR: Unsupported STELLAR_NETWORK '$stellarNetwork'. This deployment script only supports testnet."
     exit 1
 }
 
 $usdcIssuer = [Environment]::GetEnvironmentVariable('USDC_ISSUER')
 if (-not $usdcIssuer) {
-    Write-Host "ERROR: USDC_ISSUER is not set.  Check your .env file."
+    Write-Host "ERROR: USDC_ISSUER is required. Set it to the Testnet USDC Stellar address in .env."
+    exit 1
+}
+if ($usdcIssuer -notmatch '^[GC][A-Z2-7]{55}$') {
+    Write-Host "ERROR: USDC_ISSUER must use the 56-character Stellar G... account or C... contract StrKey format."
     exit 1
 }
 
 $xlmAsset = [Environment]::GetEnvironmentVariable('XLM_ASSET')
 if ($deployXlm -and -not $xlmAsset) {
-    Write-Host "ERROR: XLM_ASSET is not set.  Check your .env file."
+    Write-Host "ERROR: XLM_ASSET is required when DEPLOY_XLM=true. Set the experimental Testnet asset contract address in .env."
+    exit 1
+}
+if ($deployXlm -and $xlmAsset -notmatch '^[GC][A-Z2-7]{55}$') {
+    Write-Host "ERROR: XLM_ASSET must use the 56-character Stellar G... account or C... contract StrKey format when DEPLOY_XLM=true."
     exit 1
 }
 
@@ -251,12 +277,21 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "       Run scripts/setup-testnet.ps1 first."
     exit 1
 }
+if ($deployerAddress -notmatch '^[GC][A-Z2-7]{55}$') {
+    Write-Host "ERROR: Stellar CLI returned an invalid address for key '$deployerAccount'."
+    exit 1
+}
 Write-Host "  Deployer address : $deployerAddress"
 Write-Host "  Addresses file   : $addressesFile"
 Write-Host "  Fresh deploy     : $fresh"
 Write-Host "  Dry-run mode     : $dryRun"
 Write-Host "  Deploy XLM       : $deployXlm"
 Write-Host ""
+
+if ($validateEnv) {
+    Write-Host "Environment configuration is valid; deployment skipped."
+    exit 0
+}
 
 # ---------------------------------------------------------------------------
 # 6. Build
@@ -298,8 +333,8 @@ Invoke-Init "escrow_usdc" $escrowUsdcId @("--", "initialize", "--admin", $deploy
 
 Invoke-Init "pool_usdc" $poolUsdcId @("--", "initialize", "--admin", $deployerAddress, "--invoice_contract", $invoiceId, "--escrow_contract", $escrowUsdcId, "--funding_asset", $usdcIssuer, "--registry_contract", $registryId, "--treasury", $deployerAddress, "--min_initial_deposit", "10000000", "--share_name", "`"ClearLedger USDC Pool Shares`"", "--share_symbol", "`"TT-USDC`"", "--share_decimals", "7")
 
- $escrowXlmId = ''
- $poolXlmId = ''
+$escrowXlmId = ''
+$poolXlmId = ''
 if ($deployXlm) {
     Write-Host "`n=== Deploying XLM escrow_contract (EXPERIMENTAL) ==="
     $escrowXlmId = Deploy-Contract "escrow_xlm" "target/wasm32v1-none/release/clearledger_escrow.wasm"
@@ -312,6 +347,8 @@ if ($deployXlm) {
     Invoke-Init "escrow_xlm" $escrowXlmId @("--", "initialize", "--admin", $deployerAddress, "--pool_contract", $poolXlmId, "--usdc_asset", $xlmAsset)
 
     Invoke-Init "pool_xlm" $poolXlmId @("--", "initialize", "--admin", $deployerAddress, "--invoice_contract", $invoiceId, "--escrow_contract", $escrowXlmId, "--funding_asset", $xlmAsset, "--registry_contract", $registryId, "--treasury", $deployerAddress, "--min_initial_deposit", "10000000", "--share_name", "`"ClearLedger XLM Pool Shares`"", "--share_symbol", "`"TT-XLM`"", "--share_decimals", "7")
+} else {
+    Write-Host "`n=== DEPLOY_XLM is false — skipping experimental XLM contracts ==="
 }
 
 Write-Host "`n=== Wiring USDC pool_contract into invoice_contract ==="

@@ -59,6 +59,38 @@ impl PoolFactoryContract {
         events::contract_initialized(&env, &admin);
     }
 
+    /// Transfers factory admin ownership to `new_admin`.
+    ///
+    /// The factory admin is the trust anchor for the pools it manages: it is
+    /// the only address allowed to register assets and is copied into every
+    /// newly deployed pool as that pool's admin and treasury. Moving it is
+    /// therefore deliberately a two-party operation.
+    ///
+    /// # Auth
+    /// Requires authorization from both the current admin (read from storage)
+    /// and `new_admin`. Requiring the incoming admin to sign prevents ownership
+    /// from being forced onto an address that never consented (for example a
+    /// typo), while requiring the current admin prevents anyone else from
+    /// seizing the factory. Neither signature alone is sufficient. After the
+    /// call succeeds every admin-gated entry point (`register_asset`,
+    /// `register_existing_pool`, and a subsequent `transfer_ownership`) checks
+    /// the *new* admin, so the old key has no residual authority.
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the factory has not been initialized.
+    ///
+    /// # Example
+    /// ```ignore
+    /// client.transfer_ownership(&new_admin);
+    /// ```
+    pub fn transfer_ownership(env: Env, new_admin: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::ownership_transferred(&env, &admin, &new_admin);
+    }
+
     /// Deploys a new pool instance for an asset and records it as that asset's
     /// pool.
     ///
@@ -72,6 +104,10 @@ impl PoolFactoryContract {
     /// * `env` - The Soroban environment.
     /// * `asset` - The asset the new pool instance custodies. Passed to the
     ///   pool as its `funding_asset`, the single asset that instance supports.
+    ///   For native XLM this must be the network's Stellar Asset Contract
+    ///   address (Testnet
+    ///   `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`), never
+    ///   the string `native` or an issuer account. See `docs/NATIVE_XLM.md`.
     /// * `pool_wasm_hash` - Hash of the uploaded pool Wasm to deploy. Must
     ///   already be present in the ledger.
     /// * `invoice_contract` - The invoice contract the new pool funds invoices
@@ -111,9 +147,14 @@ impl PoolFactoryContract {
     ///   asset once only; there is no replace semantics.
     /// * `InvoiceNotInitialized` if `invoice_contract` does not report a
     ///   registry contract.
-    /// * `PoolError::InvalidConfiguration` if the pool rejects the resulting
-    ///   address set (for example if the factory admin is also one of the
-    ///   invoice/escrow/asset/registry addresses).
+    /// * `InvalidAsset` if `asset` aliases the factory admin, the factory
+    ///   itself, or another wired address.
+    /// * `InvalidContractAddress` if `invoice_contract` or `escrow_contract`
+    ///   aliases another configured role. Both checks run before deployment,
+    ///   so an invalid registration never orphans a deployed instance.
+    /// * `PoolError::InvalidContractAddress` / `PoolError::InvalidAsset` if the
+    ///   pool rejects the resulting address set (for example if the factory
+    ///   admin is also one of the invoice/escrow/registry addresses).
     /// * `PoolError::EscrowAssetMismatch` if `escrow_contract` was initialized
     ///   with a different asset than `asset`.
     ///
@@ -134,6 +175,13 @@ impl PoolFactoryContract {
         let admin = Self::admin(&env);
         admin.require_auth();
         Self::assert_unregistered(&env, &asset);
+        Self::assert_valid_registration_addresses(
+            &env,
+            &admin,
+            &asset,
+            &invoice_contract,
+            &escrow_contract,
+        );
 
         // Deploy the instance with this factory as the deploying contract. The
         // deployer address plus the salt fix the instance address, so the
@@ -167,7 +215,8 @@ impl PoolFactoryContract {
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
-    /// * `asset` - The asset address to register.
+    /// * `asset` - The asset address to register. For native XLM, pass the
+    ///   network's Stellar Asset Contract address; see `register_asset`.
     /// * `pool_address` - The existing pool contract address.
     ///
     /// # Auth
@@ -176,6 +225,10 @@ impl PoolFactoryContract {
     /// # Panics
     /// * `NotInitialized` if the factory has not been initialized.
     /// * `AssetAlreadyRegistered` if the asset is already registered.
+    /// * `InvalidAsset` if `asset` aliases the factory admin, the factory
+    ///   itself, or `pool_address`.
+    /// * `InvalidContractAddress` if `pool_address` aliases the factory admin
+    ///   or the factory itself.
     /// * `InvalidPool` if `pool_address` does not expose a pool initialized
     ///   for `asset`.
     ///
@@ -190,6 +243,15 @@ impl PoolFactoryContract {
         let admin = Self::admin(&env);
         admin.require_auth();
         Self::assert_unregistered(&env, &asset);
+        if pool_address == admin || pool_address == env.current_contract_address() {
+            panic_with_error!(&env, PoolFactoryError::InvalidContractAddress);
+        }
+        if asset == admin
+            || asset == env.current_contract_address()
+            || asset == pool_address
+        {
+            panic_with_error!(&env, PoolFactoryError::InvalidAsset);
+        }
 
         let pool_funding_asset = env.try_invoke_contract::<Address, soroban_sdk::Error>(
             &pool_address,
@@ -392,7 +454,103 @@ impl PoolFactoryContract {
         AggregateStatsPage { items, next_cursor }
     }
 
+    /// Lists a bounded page of registered assets.
+    ///
+    /// This is the preferred asset-list read. It replaces [`Self::list_assets`]
+    /// for integrations: the asset index is stored in instance storage, so the
+    /// unbounded view's cost grows with every registration and will eventually
+    /// exceed the Soroban per-call budget.
+    ///
+    /// # Iteration semantics
+    /// The asset index is append-only. Both `register_asset` and
+    /// `register_existing_pool` append the newly registered asset at index
+    /// `AssetCount`, then increment `AssetCount`, so registration order is
+    /// stable: an asset's cursor never changes and is never reused.
+    ///
+    /// Start at `cursor = 0` and keep passing the returned `next_cursor` until
+    /// it is `None`. A `next_cursor` of `Some(next)` means at least one more
+    /// asset exists at index `next`; it is also the number of items already
+    /// walked. A registration that lands between two page reads is appended
+    /// after the last cursor already returned, so it appears at the end of the
+    /// walk and cannot shift, duplicate, or skip an item already read. Calling
+    /// with `cursor` equal to the current asset count returns an empty final
+    /// page (`next_cursor == None`). Each invocation reads at most
+    /// [`MAX_ASSET_PAGE_LIMIT`] index entries.
+    ///
+    /// # ABI
+    /// `get_assets_page(cursor: u32, limit: u32) -> AssetPage`, where
+    /// [`AssetPage`] is `{ items: Vec<Address>, next_cursor: Option<u32> }`.
+    /// Both arguments and the result are encoded as Soroban contract types;
+    /// `next_cursor` is a 32-bit index, not an opaque token.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `cursor` - Zero-based index of the first asset to return. Must be
+    ///   `<=` the current asset count; `cursor == count` returns an empty page.
+    /// * `limit` - Maximum number of assets to return. Must be in
+    ///   `1..=MAX_ASSET_PAGE_LIMIT`.
+    ///
+    /// # Auth
+    /// No authorization is required (read-only view).
+    ///
+    /// # Panics
+    /// * `InvalidLimit` if `limit == 0` or
+    ///   `limit > MAX_ASSET_PAGE_LIMIT`.
+    /// * `InvalidCursor` if `cursor` is greater than the current asset count.
+    ///
+    /// # Returns
+    /// * [`AssetPage`] - Up to `limit` assets in registration order plus the
+    ///   cursor for the next page, or `None` when this is the final page.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut cursor = 0;
+    /// loop {
+    ///     let page = client.get_assets_page(&cursor, &50);
+    ///     for asset in page.items.iter() {
+    ///         // use asset
+    ///     }
+    ///     match page.next_cursor {
+    ///         Some(next) => cursor = next,
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    pub fn get_assets_page(env: Env, cursor: u32, limit: u32) -> AssetPage {
+        if limit == 0 || limit > MAX_ASSET_PAGE_LIMIT {
+            panic_with_error!(&env, PoolFactoryError::InvalidLimit);
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetCount)
+            .unwrap_or(0);
+        if cursor > count {
+            panic_with_error!(&env, PoolFactoryError::InvalidCursor);
+        }
+
+        let end = cursor.saturating_add(limit).min(count);
+        let mut items = Vec::new(&env);
+        let mut index = cursor;
+        while index < end {
+            if let Some(asset) = env.storage().instance().get(&DataKey::AssetIndex(index)) {
+                items.push_back(asset);
+            }
+            index += 1;
+        }
+
+        let next_cursor = if end < count { Some(end) } else { None };
+        AssetPage { items, next_cursor }
+    }
+
     /// Lists all registered assets.
+    ///
+    /// **Deprecated for new integrations:** this view is unbounded, so its
+    /// cost grows with the number of registered assets and can exceed the
+    /// Soroban per-call budget. Use [`Self::get_assets_page`] instead and walk
+    /// the list with a cursor. This function is retained for ABI compatibility
+    /// and returns the same registration order the page API exposes.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -432,6 +590,33 @@ impl PoolFactoryContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, PoolFactoryError::NotInitialized))
+    }
+
+    /// Rejects registration address sets that alias a token id with a
+    /// contract/admin role, or one contract role with another. Validated
+    /// before deploy/storage so a rejected call leaves no orphaned instance.
+    fn assert_valid_registration_addresses(
+        env: &Env,
+        admin: &Address,
+        asset: &Address,
+        invoice_contract: &Address,
+        escrow_contract: &Address,
+    ) {
+        if asset == admin
+            || asset == &env.current_contract_address()
+            || asset == invoice_contract
+            || asset == escrow_contract
+        {
+            panic_with_error!(env, PoolFactoryError::InvalidAsset);
+        }
+        if invoice_contract == admin
+            || invoice_contract == &env.current_contract_address()
+            || escrow_contract == admin
+            || escrow_contract == &env.current_contract_address()
+            || invoice_contract == escrow_contract
+        {
+            panic_with_error!(env, PoolFactoryError::InvalidContractAddress);
+        }
     }
 
     /// Panics if `asset` already has a pool registered.

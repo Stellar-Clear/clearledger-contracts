@@ -50,6 +50,34 @@ All contracts follow a consistent TTL extension pattern:
 > immediately followed by `persistent().extend_ttl()`. The `extend_instance_ttl()`
 > helper is called at the end of every public state-changing function.
 
+## Caller-Controlled Persistent Data Audit
+
+Persistent values and contract events are public ledger data. TTL limits how
+long a value remains live; it does not make the value private, and a hash does
+not conceal a low-entropy secret. Do not submit personal data, credentials,
+private reports, or other confidential material in metadata, addresses,
+symbols, event fields, or signed payloads. Attestations store the evidence hash,
+not the off-chain evidence itself.
+
+| Contract / key family | Caller-controlled data and bounds | Retention / growth | Privacy and trust boundary |
+|---|---|---|---|
+| Registry `Profile(Address)` | Address is a fixed Soroban `Address`. Metadata accepts at most 20 entries; each non-empty key is at most 64 bytes and each non-empty value at most 512 bytes. | Persistent profile TTL is extended on registration and update. Profile and role-index cardinality has no protocol-wide cap; batch registration is limited to 50 entries per call. | A profile owner signs self-registration and metadata updates; admin batch registration is trusted. Profile values and addresses are public. |
+| Registry `ProfileIndex` / `ProfileCount` | Fixed-width role, `u32` index/count, and address values. | Append-only; no deregistration or index compaction. Unique profile count can grow without a global limit. | Public enumeration exposes registered addresses and their registration order. |
+| Invoice `Invoice`, indexes, `Attestation`, `AttestationExpiry` | Invoice IDs/evidence hashes are `BytesN<32>`, addresses are fixed Soroban `Address`, and scalar fields are fixed-width. Creation caps face value at `MAX_FACE_VALUE` and due date at 10 years. Attestation `agent_id` is a bounded `Symbol`; `risk_score` is `u32` with no semantic range check; nonce/expiry are `u64`. Raw XDR payload must decode but has no application-specific encoded-length cap and is not stored. | Invoice, index, attestation, and expiry entries receive persistent TTL extensions when written. Index entries are bounded per invoice but aggregate invoice count has no global cap. | Issuer/buyer authorize invoice actions; attestation trust is the signature plus active agent registry record. Stored scores, identifiers, and evidence hashes are public. Signed payload wire format includes `expires_at`; see [invoice lifecycle](../contracts/invoice/STATE_TRANSITIONS.md). |
+| Pool LP positions and `Allowance(Address, Address)` | Address keys and numeric share/deposit/yield values are fixed-width. Allowances reject negative amounts, expire by ledger sequence, and amount zero removes the key. | Position keys are per address; allowance keys are per address pair. No global address-count cap. Non-zero writes extend TTL; expired grants read as zero. | LP authorizes share changes and grants; spender authorizes `transfer_from`. Balances, counterparties, and amounts are public. |
+| Pool `FundedInvoice(BytesN<32>)` | Invoice ID key with a fixed-width `u128` funded amount, populated from verified invoice terms. | Persistent TTL is extended when funding is recorded; the entry is removed when settled/defaulted. Number of funded invoice IDs has no global cap beyond pool liquidity and network resources. | Pool controls writes after reading invoice/registry state. Invoice ID and funded amount are public. |
+| Pool instance configuration | Admin supplies treasury address, minimum deposit, share name/symbol and decimals at initialization; name/symbol must be non-empty but have no application-level length cap, and decimals are any `u32`. Protocol fee is admin-set and capped by `MAX_PROTOCOL_FEE_BPS`. | Stored in instance storage and covered by instance TTL extension. | Admin is the trust boundary; configuration and share metadata are public. |
+| Escrow `Locked(BytesN<32>)` | Fixed-width invoice ID, amount, timestamps, and issuer address. | One active lock per invoice; removed on release/default. Persistent TTL is extended on write. | Only the configured pool can lock/release; authorized release paths determine the recipient. Amounts and parties are public. |
+| Escrow `History(BytesN<32>)` | Append-only `Vec<EscrowEvent>` containing fixed-width invoice ID, action, amount, timestamp, and optional caller address. | Each action appends and extends TTL. There is no application-level vector-length cap or compaction; storage/resource limits are the effective bound. | Only escrow-authorized flows append, but history and caller addresses are public. Never treat it as a private audit channel. |
+
+All caller-provided byte/string inputs are also subject to Soroban transaction and
+resource limits. Those network limits are not a substitute for application
+validation: registry metadata caps are explicit, while escrow history and the
+encoded attestation payload have no application-level length cap, and attestation
+scores have no semantic range check. This audit describes the
+contract behavior in this checkout; deployment TTL settings and archival
+policies remain network configuration.
+
 ---
 
 ## Contract: registry_contract
@@ -126,7 +154,7 @@ before storing references or submitting profile metadata.
   duplicate, or omit entries already covered by the cursor. `limit` must be in
   `1..=50`: `0` panics with `InvalidPageSize` (`#9`) and a larger value with
   `PageSizeExceeded` (`#8`). A cursor greater than `get_profile_count(role)`
-  panics with `InvalidCursor` (`#10`); a cursor equal to the count is a valid
+  panics with `InvalidCursor` (`#11`); a cursor equal to the count is a valid
   empty tail page. Each call examines at most `limit` index slots, so a slot
   that has aged out can make a page shorter than `limit` while the cursor
   still advances past the gap. Ordering is registration order.
@@ -337,49 +365,45 @@ EscrowRecord {
 }
 ```
 
-#### History Entry
+#### History Entries
 
 | DataKey | Type | Description |
 |---------|------|-------------|
-| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Bounded, chronological event log keyed by invoice ID |
+| `HistoryCount(BytesN<32>)` | `u32` | Monotonic next append index and cursor ceiling |
+| `HistoryStart(BytesN<32>)` | `u32` | First retained event index after pruning |
+| `HistoryEvent(BytesN<32>, u32)` | `EscrowEvent` | Event at its stable append index |
+| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Legacy pre-pagination vector; migrated on append or compaction |
 
-```
-EscrowEvent {
-    invoice_id: BytesN<32>,
-    action:     EscrowAction,   // Locked | ReleasedToIssuer | ReleasedToPool | DefaultHandled
-    amount:     u128,
-    timestamp:  u64,
-    caller:     Option<Address>,
-}
-```
+History is stored per event so `get_history_page(invoice_id, cursor, limit)`
+hydrates only the requested slice. The append index remains stable through
+pruning; a cursor older than `HistoryStart` resumes at the first retained event.
+At most `MAX_HISTORY_EVENTS` (32) are retained automatically, and admins may
+lower that number with `compact_history`. Pruned history remains available in
+the ledger event stream for indexers. The compatibility `get_history` view
+returns all currently retained entries in one response.
 
 #### History Retention and Compaction (issue #51)
 
-Escrow history is **bounded** so a long-lived invoice cannot grow its
-persistent entry without limit:
-
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `MAX_HISTORY_EVENTS` | 32 | Hard cap enforced by every `append_history` write. The oldest event is evicted when a 33rd is appended. |
-| `MIN_HISTORY_EVENTS` | 1 | Smallest retention an admin may request from `compact_history`. |
-| `MAX_COMPACT_PER_CALL` | 32 | Maximum events one `compact_history` call removes, bounding per-call CPU/memory. |
+| `MAX_HISTORY_EVENTS` | 32 | Automatic on-chain retention ceiling per invoice |
+| `MIN_HISTORY_EVENTS` | 1 | Smallest admin-selected retention |
+| `MAX_COMPACT_PER_CALL` | 32 | Maximum entries removed by one compaction call |
 
-`compact_history(invoice_id, keep) -> u32` is **admin-authenticated** and prunes
-the oldest entries until `keep` remain, returning the number removed. It is
-admin-gated rather than permissionless because removing on-chain audit data is
-destructive to clients that have not yet synced; the stored admin is the
-accountable party. Repeated calls are safe and idempotent: once the retained
-length is `<= keep` (or no further batch can be removed) the call returns `0`.
+`compact_history(invoice_id, keep) -> u32` requires admin authorization and
+removes oldest indexed entries until `keep` remain or the per-call removal cap
+is reached. Repeated calls are safe. Original ledger events are preserved for
+indexers; see [ESCROW_HISTORY.md](./ESCROW_HISTORY.md).
 
-Retained events keep their original chronological order (oldest first). Pruned
-events are **not** silently invented or rewritten; they remain available in the
-ledger's event stream via `funds_locked`, `released_to_issuer`,
-`released_to_pool`, and `default_resolved`. See
-[ESCROW_HISTORY.md](./ESCROW_HISTORY.md) for the full client/indexer policy.
+**Approximately 2 + N persistent keys per invoice, or 3 + N after pruning** — one `Locked` record, `HistoryCount`, one `HistoryEvent` per retained event (`N`), and `HistoryStart` once pruning begins. Legacy `History` vectors are removed when migrated. History entries receive the same TTL extension policy as the lock.
 
 #### Lifecycle
 
-1. `lock()` creates an `EscrowRecord` and transfers USDC from pool → escrow.
+1. `lock()` validates that `amount` is in `1..=i128::MAX` and that no
+   `Locked` record already exists for the invoice **before** transferring
+   USDC. Invalid amounts fail with `InvalidAmount`; a duplicate invoice fails
+   with `AlreadyLocked` and leaves the original `amount`/`issuer` unchanged.
+   On success it creates an `EscrowRecord` and transfers USDC from pool → escrow.
 2. `release_to_issuer()` or `release_to_pool()` transfers USDC out and
    **removes** the `Locked` key (caller must re-lock for a new funding cycle).
    `release_to_issuer()` treats `EscrowRecord.issuer` as the source of truth:
@@ -388,12 +412,6 @@ ledger's event stream via `funds_locked`, `released_to_issuer`,
 3. `handle_default()` returns locked USDC to the pool and **removes** the key.
 4. On removal, the TTL-granted entries also expire organically.
 
-### Storage Key Count
-
-**Approximately 2 keys per funded invoice** — one `Locked` record and one
-`History` vector (which shares its TTL with the lock). The history vector is
-capped at `MAX_HISTORY_EVENTS` entries, so its size does not grow with invoice
-age or funding cycles.
 
 ---
 
@@ -432,6 +450,10 @@ age or funding cycles.
 | `LPInitialDeposit(Address)` | `u128` | Total principal deposited by LP (tracked for yield calculation) |
 
 #### SEP-41 Share Transfers
+
+See [SEP-41 LP Share Token: Design and Behavior](SEP41_DESIGN.md) for the full
+method table, authorization matrix, allowance expiry semantics, and known
+deviations.
 
 LP shares move between addresses through two public entry points that share
 one balance-movement path (`move_shares`) and emit the same standard
@@ -503,6 +525,24 @@ In practice most pools will have:
 **Approximately 2 + (2 × number_of_assets).**
 
 Each registered asset requires two keys: one for its position in the list (`AssetIndex`) and one mapping its address to a pool (`PoolForAsset`).
+
+### Asset Enumeration and Pagination
+
+`AssetIndex` is append-only and ordered by registration. Both registration
+paths write the asset's pool mapping, append the asset at index `AssetCount`,
+and then increment `AssetCount`, so a position never moves or gets reused.
+
+Read the list with `get_assets_page(cursor, limit)`, which returns
+`AssetPage { items: Vec<Address>, next_cursor: Option<u32> }`. `limit` must be
+in `1..=50` (`MAX_ASSET_PAGE_LIMIT`), otherwise the call panics with
+`InvalidLimit` (error 10); a cursor greater than `AssetCount` panics with
+`InvalidCursor` (error 11). Start at cursor `0` and follow `next_cursor` until
+it is `None`. A cursor equal to `AssetCount` returns an empty final page.
+
+Because the index is append-only, a registration between two page reads is
+returned at the end of the walk and cannot shift or duplicate an already-read
+asset. The legacy unbounded `list_assets()` view is retained for ABI
+compatibility and uses the same order, but new integrations should page.
 
 
 ## Gas / Budget Estimates

@@ -1,6 +1,6 @@
 # Limitations
 
-> **Updated:** 2026-09-30
+> **Updated:** 2026-10-20
 > **Applies to:** ClearLedger protocol on Stellar testnet
 
 This document captures known limitations, testnet-specific constraints,
@@ -72,6 +72,7 @@ relative costs based on code analysis.
 | `registry::list_profiles_page` | 0 | 0 | — | — | Low (O(limit), ≤ 50) |
 | `invoice::create` | 2 (`is_verified` ×2) | 0 | — | — | Low |
 | `invoice::batch_create` | 2 per entry (`is_verified` ×2) | 0 | — | — | Low per entry, **up to 50× `create`** |
+| `invoice::submit_attestation` | 1 (`get_agent`) | 0 | — | — | Medium (domain + payload hashes + secp256k1 recovery) |
 | `invoice::list_for_financing` | 0 | 0 | — | — | Low |
 | `invoice::batch_list_for_financing` | 0 | 0 | — | — | Low per entry, **up to 50× `list_for_financing`** |
 | `invoice::mark_funded` | 0 | 0 | — | — | Low |
@@ -173,16 +174,18 @@ caller mistakes that should be fixed rather than silently skipped. Callers
 reconcile the returned funded IDs against their input to see which entries a
 capacity stop skipped.
 
-### Storing the `History` Vector (resolved by #51)
+### Escrow History Growth
 
-`escrow::append_history` stores a `Vec<EscrowEvent>` under
-`DataKey::History(invoice_id)` capped at `MAX_HISTORY_EVENTS` (32) entries.
-Appends evict the oldest entry once the cap is reached, and the admin-gated
-`compact_history(invoice_id, keep)` entry point can tighten retention further
-(`1..=32`) in bounded batches of at most 32 removals per call. This keeps the
-persistent entry well below the per-entry size limit (~100 KB in practice).
-Complete historical detail remains available from the per-action escrow events
-for indexers; see [ESCROW_HISTORY.md](./ESCROW_HISTORY.md).
+Escrow events are stored as individually indexed `HistoryEvent` entries with
+`HistoryCount` and `HistoryStart` cursors. `get_history_page(invoice_id,
+cursor, limit)` hydrates at most `limit` events (maximum 50), while the
+contract retains at most `MAX_HISTORY_EVENTS` (32) events per invoice. When
+the cap is exceeded, the oldest on-chain entries are evicted without
+renumbering survivors; admin `compact_history` can reduce retention further in
+batches. The legacy `get_history` view remains available but returns all
+retained events at once. Full historical detail remains in the emitted ledger
+events for indexers. Legacy `History` vectors migrate to indexed entries on the
+next append or compaction.
 
 ## Integer Arithmetic and Rounding
 
@@ -226,6 +229,19 @@ withdrawal. The regression test in `contracts/pool/src/test.rs` covers this
 scenario. Per-deposit lots would be required if the protocol needs a specific
 FIFO/HIFO tax or reporting policy.
 
+### Pool `set_max_utilization` Auth Is Caller-Controlled
+
+`pool::set_max_utilization(admin, new_cap_bps)` calls
+`admin.require_auth()` on the caller-supplied `admin` argument but never
+compares it to the stored pool admin
+(`contracts/pool/src/lib.rs:1914-1926`). Any account that signs its own call
+can raise or lower the utilization cap, despite the function's doc comment
+saying it requires the contract admin. The regression test
+`test_set_max_utilization_requires_admin_authorization`
+(`contracts/pool/src/test.rs:1530`) only covers an unsigned non-admin. Treat
+the cap as caller-controlled until the contract compares the argument to
+`DataKey::Admin`.
+
 ### Issuer Release Not Wired (Issue #56)
 
 After `fund_invoice` locks USDC in escrow, the pooled funds should be
@@ -245,13 +261,41 @@ repayment occurs. The buyer pays the full `face_value` regardless of how
 early they repay, so there is no on-chain rebate proportional to the time
 remaining on the invoice.
 
-### No Duplicate Invoice Detection
+### Duplicate Invoice Detection Is Advisory Only
 
 The `create` function generates an invoice ID from a SHA-256 hash of
 (issuer, buyer, face_value, due_date, counter, asset). The counter
-guarantees uniqueness even for otherwise identical invoices, but there is
-no user-visible warning when an issuer re-submits the same commercial
-terms.
+guarantees uniqueness even for otherwise identical invoices, so `create`
+never rejects a re-submitted set of commercial terms.
+
+For off-chain warnings, the invoice contract exposes
+`duplicate_terms_key(issuer, buyer, face_value, due_date, funding_asset)`
+as an unauthenticated, storage-free read. It returns
+`SHA-256(DUPLICATE_TERMS_DOMAIN_SEPARATOR || fields)`, where `fields` are:
+
+1. `u32` big-endian length + canonical Soroban XDR encoding of `issuer`
+2. `u32` big-endian length + canonical Soroban XDR encoding of `buyer`
+3. `face_value` as 16-byte big-endian (USDC stroops, 7 decimals)
+4. `due_date` as 8-byte big-endian (Unix seconds)
+5. `u32` big-endian length + canonical Soroban XDR encoding of
+   `funding_asset`
+
+The domain separator is
+`"ClearLedger.InvoiceDupTerms.v1__"`. Length prefixes and fixed-width scalars
+make the encoding unambiguous. The key is stable across ledger time and the
+invoice lifecycle (it excludes the counter, status, and mutable financing
+terms such as `discount_bps`), and it is distinct from the counter-based
+invoice ID. It panics with `InvalidParticipants` for a self-invoiced
+`issuer == buyer`, `InvalidFaceValue` for a zero amount, and `InvalidAmount`
+above `MAX_FACE_VALUE`.
+
+Clients on Stellar Testnet can query it through Soroban RPC
+read/simulation against the deployed invoice contract, or reproduce it
+off-chain from `get(invoice_id)` using canonical Address XDR and stroop
+amounts. It is a warning signal only: indexers should not treat it as a
+uniqueness constraint or use it to reject otherwise valid invoices. The
+current invoice model has no description or metadata fields; adding them
+would require bumping the `v1` domain separator.
 
 ---
 
@@ -288,7 +332,9 @@ are provided where available.
 
 ### Smart Contracts
 
-- Multi-sig admin (3-of-5 Stellar signers)
+- Multisig-aware deployment automation. Account-level 3-of-5 admin is
+  documented in [MULTISIG_ADMIN.md](MULTISIG_ADMIN.md), but the deployment
+  scripts still initialize contracts with the deployer address.
 - LP-governed invoice funding (stake LP tokens to vote on invoices). Design
   proposal: [NEW_DESIGN.md](NEW_DESIGN.md) (issue #718)
 - Dynamic utilization-based interest rate model
@@ -301,8 +347,12 @@ are provided where available.
 - Formal verification or symbolic execution audit
 - `cargo-soroban` integration for automated WASM budget reporting
 - TypeScript SDK for contract interaction
-- Automated fuzz testing across all four contracts
-- Smart-contract upgrade mechanism (`__constructor` + `__upgrade`)
+- Automated fuzz testing across all deployed contracts
+- Timelocked or multisig contract upgrades. Admin-only `upgrade` entry points
+  already exist on `invoice` and `escrow`; `registry`, `pool`, and
+  `pool_factory` are not upgradeable through a contract entry point. See
+  [MULTISIG_ADMIN.md](MULTISIG_ADMIN.md#contract-authority-map) and
+  [THREAT_MODEL.md](./THREAT_MODEL.md#upgrade-powers).
 
 > **Note:** Partial repayments are now supported on the **escrow** path
 > (`escrow::release_to_pool(invoice_id, repayment_amount)` accepts a
