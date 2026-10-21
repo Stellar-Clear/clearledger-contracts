@@ -1,0 +1,33 @@
+{
+  "registry": {
+    "verify_profile": "profile_verified",
+    "revoke": "address_revoked",
+    "reinstate": "address_reinstated",
+    "transfer_ownership": "ownership_transferred",
+    "transfer_admin": "admin_transferred",
+    "pause": "paused",
+    "unpause": "unpaused"
+  },
+  "invoice": {
+    "set_pool_contract": "pool_contract_updated",
+    "set_agent_registry_contract": "agent_registry_contract_updated",
+    "set_escrow_contract": "escrow_contract_updated",
+    "set_expiry_window": "expiry_window_set",
+    "add_supported_asset": "supported_asset_added",
+    "remove_supported_asset": "supported_asset_removed",
+    "transfer_ownership": "ownership_transferred",
+    "pause": "paused",
+    "unpause": "unpaused"
+  },
+  "pool": {
+    "set_max_utilization": "max_utilization_updated",
+    "set_protocol_fee": "protocol_fee_updated",
+    "transfer_ownership": "ownership_transferred",
+    "pause": "paused",
+    "unpause": "unpaused"
+  },
+  "escrow": {
+    "pause": "paused",
+    "unpause": "unpaused"
+  }
+}

@@ -1,8 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 use clearledger_pause::{require_not_paused, set_paused};
+use soroban_sdk::{contract, contractimpl, map, panic_with_error, Address, Env, Map, String, Vec};
 
+mod bench;
 mod constants;
 mod errors;
 mod events;
@@ -123,12 +124,45 @@ impl RegistryContract {
         true
     }
 
-    // Returns the list of addresses that were skipped (already registered) so
-    // the caller knows exactly which entries were not processed (#66).
-    //
-    // Only freshly created profiles are appended to the issuer enumeration
-    // index; entries skipped as already-registered are never indexed twice
-    // (#841).
+    /// Batch-registers issuer profiles.
+    ///
+    /// Duplicate handling is deterministic and per-entry:
+    /// * An address that already has a profile (from `register_issuer` or an
+    ///   earlier batch) is **skipped**, not reverted, and returned in the
+    ///   skipped list. Its existing profile and metadata are left untouched.
+    /// * If the same address appears more than once in `entries`, the first
+    ///   occurrence is registered and every later occurrence is skipped. Thus
+    ///   `skipped` can contain the same address more than once.
+    /// * A failed validation is **not** skipped: invalid metadata rejects the
+    ///   whole batch. Metadata is validated for every entry up front, so no
+    ///   entry is persisted if any entry is invalid.
+    ///
+    /// There is no separate address syntax check on-chain: each entry is an
+    /// SDK `Address`, which is always structurally valid. Entries do not
+    /// require the registered address's auth; only the admin authorizes the
+    /// batch.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `entries` - A vector of `(Address, Map<String, String>)` pairs. Issuer
+    ///   metadata is validated but not stored by this path; new issuer
+    ///   profiles start with empty metadata.
+    ///
+    /// # Auth
+    /// * Requires `admin.require_auth()`.
+    ///
+    /// # Panics
+    /// * `RegistryError::BatchSizeExceeded` if `entries.len() > 50`.
+    /// * `RegistryError::NotInitialized` if the contract admin is not set.
+    /// * `RegistryError::InvalidMetadata` if any entry's metadata is invalid.
+    ///
+    /// # Returns
+    /// * `Vec<Address>` - Addresses skipped because they were already
+    ///   registered, including later occurrences of a within-batch duplicate.
+    ///
+    /// Only freshly created profiles are appended to the issuer enumeration
+    /// index; entries skipped as already-registered are never indexed twice
+    /// (#841).
     pub fn batch_register_issuers(
         env: Env,
         entries: Vec<(Address, Map<String, String>)>,
@@ -185,6 +219,15 @@ impl RegistryContract {
     /// creates `Role::Buyer` profiles. The admin must be authorized and the
     /// batch size must not exceed 50 entries.
     ///
+    /// Duplicate handling matches the issuer path: an already-registered
+    /// address is skipped and returned, the first occurrence of a within-batch
+    /// duplicate is registered while later occurrences are skipped, and
+    /// invalid metadata rejects the entire call rather than skipping the
+    /// offending entry. Buyer metadata is validated and, for newly registered
+    /// addresses, stored on the profile. As with issuers, an `Address` is
+    /// always structurally valid on-chain and only the admin authorizes the
+    /// batch.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `entries` - A vector of `(Address, Map<String, String>)` pairs, each
@@ -197,6 +240,7 @@ impl RegistryContract {
     /// # Panics
     /// * `RegistryError::BatchSizeExceeded` if `entries.len() > 50`.
     /// * `RegistryError::NotInitialized` if the contract admin is not set.
+    /// * `RegistryError::InvalidMetadata` if any entry's metadata is invalid.
     ///
     /// # Returns
     /// * `Vec<Address>` - The list of addresses that were skipped (already
@@ -634,6 +678,41 @@ impl RegistryContract {
     /// let result = client.revoke(&issuer);
     /// ```
     pub fn revoke(env: Env, address: Address) -> bool {
+        Self::revoke_with_reason(env, address, RevocationReason::Unspecified)
+    }
+
+    /// Revokes a registered profile and records a machine-readable reason.
+    ///
+    /// This is the reason-aware variant of [`revoke`](Self::revoke). The
+    /// reason is emitted in the `address_revoked` event data as its stable
+    /// `u32` discriminant. Behaviour, auth and idempotency are otherwise
+    /// identical: an already-unverified profile returns `true` without
+    /// re-emitting the event.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `address` - The address of the profile to revoke.
+    /// * `reason` - Bounded [`RevocationReason`] supplied by the admin.
+    ///
+    /// # Auth
+    /// * Requires admin authorization (the stored admin from `DataKey::Admin`).
+    ///
+    /// # Returns
+    /// * `true` if the profile is now in revoked state (including if it was
+    ///   already revoked).
+    ///
+    /// # Panics
+    /// * `NotFound` if the address is not registered.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result = client.revoke_with_reason(&issuer, &RevocationReason::Fraud);
+    /// ```
+    pub fn revoke_with_reason(
+        env: Env,
+        address: Address,
+        reason: RevocationReason,
+    ) -> bool {
         require_not_paused(&env);
         let admin = Self::require_admin(&env);
         admin.require_auth();
@@ -652,7 +731,7 @@ impl RegistryContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-        events::address_revoked(&env, &address);
+        events::address_revoked(&env, &address, &reason);
         Self::extend_instance_ttl(&env);
         true
     }

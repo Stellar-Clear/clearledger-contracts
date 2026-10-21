@@ -20,10 +20,15 @@ pub fn invoice_created(
     );
 }
 
-pub fn invoice_listed(env: &Env, invoice_id: &BytesN<32>, discount_bps: u32) {
+pub fn invoice_listed(
+    env: &Env,
+    invoice_id: &BytesN<32>,
+    discount_bps: u32,
+    expires_at: u64,
+) {
     env.events().publish(
         (Symbol::new(env, "invoice_listed"), invoice_id.clone()),
-        discount_bps,
+        (discount_bps, expires_at),
     );
 }
 
@@ -37,6 +42,15 @@ pub fn invoice_cancelled(env: &Env, invoice_id: &BytesN<32>) {
 pub fn upgraded(env: &Env, wasm_hash: &BytesN<32>) {
     env.events()
         .publish((Symbol::new(env, "upgraded"), wasm_hash.clone()), ());
+}
+
+/// Explicit companion used by funding paths; the legacy helper remains byte-compatible.
+#[allow(dead_code)] // Emitter modules are also compiled standalone by golden-fixture tests.
+pub fn invoice_funded_v1(env: &Env, invoice_id: &BytesN<32>, funded_amount: u128) {
+    env.events().publish(
+        (Symbol::new(env, "invoice_funded_v1"), invoice_id.clone()),
+        (1u32, funded_amount),
+    );
 }
 
 pub fn invoice_funded(env: &Env, invoice_id: &BytesN<32>, funded_amount: u128) {
