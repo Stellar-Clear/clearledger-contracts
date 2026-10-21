@@ -44,6 +44,15 @@ pub fn shares_transferred(env: &Env, from: &Address, to: &Address, amount: i128)
     );
 }
 
+/// Explicit companion used by funding paths; the legacy helper remains byte-compatible.
+#[allow(dead_code)] // Emitter modules are also compiled standalone by golden-fixture tests.
+pub fn invoice_funded_v1(env: &Env, invoice_id: &BytesN<32>, funded_amount: u128) {
+    env.events().publish(
+        (Symbol::new(env, "invoice_funded_v1"), invoice_id.clone()),
+        (1u32, funded_amount),
+    );
+}
+
 pub fn invoice_funded(env: &Env, invoice_id: &BytesN<32>, funded_amount: u128) {
     env.events().publish(
         (Symbol::new(env, "invoice_funded"), invoice_id.clone()),

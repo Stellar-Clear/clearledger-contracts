@@ -77,12 +77,32 @@ if [[ -z "$registry" || -z "$invoice" || -z "$escrow_usdc" || -z "$pool_usdc" ]]
   exit 1
 fi
 
-# Prepare the new table content
-NEW_TABLE="| Contract | Address |\n|----------|---------|\n"
-NEW_TABLE+="| registry_contract | \`$registry\` |\n"
-NEW_TABLE+="| invoice_contract | \`$invoice\` |\n"
-NEW_TABLE+="| escrow_contract | \`$escrow_usdc\` |\n"
-NEW_TABLE+="| pool_contract | \`$pool_usdc\` |\n"
+# Prepare the new table content. Derive each Explorer URL from the same ID
+# displayed in the address column so redeployments cannot leave stale links.
+NEW_TABLE="| Contract | Address | Stellar Expert |\n|----------|---------|---------------|\n"
+add_contract_row() {
+  local name="$1"
+  local address="$2"
+  if [[ ! "$address" =~ ^C[A-Z2-7]{55}$ ]]; then
+    echo "Error: invalid contract ID for $name." >&2
+    exit 1
+  fi
+  NEW_TABLE+="| $name | \`$address\` | [View](https://stellar.expert/explorer/testnet/contract/$address) |\n"
+}
+
+add_contract_row "registry_contract" "$registry"
+add_contract_row "invoice_contract" "$invoice"
+add_contract_row "escrow_contract" "$escrow_usdc"
+add_contract_row "pool_contract" "$pool_usdc"
+
+escrow_xlm=$(jq -r '.escrow_xlm // empty' "$DEPLOYMENTS_FILE" 2>/dev/null || true)
+pool_xlm=$(jq -r '.pool_xlm // empty' "$DEPLOYMENTS_FILE" 2>/dev/null || true)
+if [[ -n "$escrow_xlm" ]]; then
+  add_contract_row "escrow_xlm_contract (experimental)" "$escrow_xlm"
+fi
+if [[ -n "$pool_xlm" ]]; then
+  add_contract_row "pool_xlm_contract (experimental)" "$pool_xlm"
+fi
 
 # Use awk to replace the section between markers in README.md
 awk -v new_content="$NEW_TABLE" '

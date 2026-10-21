@@ -16,6 +16,26 @@ pub enum VerificationStatus {
     Revoked,
 }
 
+/// Machine-readable reason attached to an admin revocation.
+///
+/// The numeric discriminants are part of the public ABI: off-chain indexers
+/// decode the `address_revoked` payload as a `u32` and must keep working if a
+/// new variant is appended. Existing values must never be renumbered.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevocationReason {
+    /// No specific reason supplied (used by the legacy `revoke` entry point).
+    Unspecified = 0,
+    /// Regulatory or policy compliance action.
+    Compliance = 1,
+    /// Suspected or confirmed fraud.
+    Fraud = 2,
+    /// Account dormant for the operator's inactivity policy.
+    Inactivity = 3,
+    /// Any other reason not covered by the codes above.
+    Other = 4,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Profile {

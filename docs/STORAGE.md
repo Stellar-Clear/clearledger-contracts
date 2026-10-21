@@ -87,7 +87,6 @@ Entries skipped as already-registered are never indexed twice, so
 
 ```
 Profile {
-    address:      Address,          // Stellar address (also the key)
     packed_flags: u32,              // Bit 0: role (0=Issuer, 1=Buyer)
                                     // Bit 1: verified status
                                     // Bit 2: revoked status
@@ -95,6 +94,19 @@ Profile {
     metadata:     Map<String, String>, // Arbitrary key-value metadata
 }
 ```
+
+The Stellar `Address` is not stored inside the struct: it is the
+`DataKey::Profile(Address)` key and the profile's public identity. All profile
+fields are public, and `get_profile(address)` returns the complete metadata map
+without authentication.
+
+Metadata is limited to 20 entries, with non-empty keys up to 64 bytes and
+non-empty values up to 512 bytes (`RegistryError::InvalidMetadata`, `#6`). The
+contract enforces only those size rules; it does not detect or redact personal
+data. Treat every metadata key and value as public and effectively permanent:
+there is no on-chain erasure, and updates leave earlier values in transaction
+history. See [Registry Metadata Privacy and Data Minimization](METADATA_PRIVACY.md)
+before storing references or submitting profile metadata.
 
 #### Indexing Notes
 
@@ -113,6 +125,25 @@ Profile {
   `NotFound` if absent.
 - `get_verification_status(address)` returns a three-valued enum
   (`Unregistered`, `Verified`, `Revoked`).
+
+### Batch Registration Semantics
+
+`batch_register_issuers` / `batch_register_buyers` process entries in order
+and never revert merely because an address is already registered:
+
+| Case | Behaviour |
+|------|-----------|
+| Address already registered (by a single or earlier batch call) | Skipped; existing profile is untouched and the address is returned in the skipped list |
+| Same address repeated within one batch | First occurrence is registered; later occurrences are skipped and reported |
+| All entries are duplicates | Nothing is written; the result lists every skipped occurrence |
+| Valid entries mixed with duplicates | Valid new entries are registered; only duplicates are skipped |
+| Invalid metadata | Entire call panics with `InvalidMetadata`; no entry from the batch is persisted |
+| More than 50 entries | Entire call panics with `BatchSizeExceeded`; nothing is persisted |
+
+On-chain `Address` values are always structurally valid, so there is no
+invalid-address branch. Single-address registration differs deliberately:
+`register_issuer` / `register_buyer` panic with `AlreadyRegistered` instead of
+skipping.
 
 ### Storage Key Count
 
@@ -191,31 +222,77 @@ Cancelled = 8   // issuer cancelled before listing
 | `IssuerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by issuer + index |
 | `BuyerIndexCount(Address)` | `u32` | Number of invoices for this buyer |
 | `BuyerIndexEntry(Address, u32)` | `BytesN<32>` | Invoice ID by buyer + index |
-| `StatusIndexCount(u32)` | `u32` | Number of invoices in this status |
-| `StatusIndexEntry(u32, u32)` | `BytesN<32>` | Invoice ID by status + index |
+| `StatusIndexCount(u32)` | `u32` | Number of live slots in this status index |
+| `StatusIndexEntry(u32, u32)` | `BytesN<32>` | Invoice ID by status + slot |
+| `StatusPosition(InvoiceStatus, BytesN<32>)` | `u32` | O(1) slot of an invoice in its status index; presence is membership |
 | `StatusCount(u32)` | `u64` | Count of invoices in each status |
+| `StatusMigrationCursor(InvoiceStatus)` | `u32` | Temporary source cursor for `migrate_status_index` |
+| `StatusMigrationKept(InvoiceStatus)` | `u32` | Temporary live-member counter for `migrate_status_index` |
+| `StatusMembership(InvoiceStatus, u64)` | `bool` | **Legacy only.** Pre-upgrade short-id marker; read fallback, never written by new code |
 
-#### Indexing Notes
+#### Status Index Notes
 
-- Three index families (`IssuerIndex`, `BuyerIndex`, `StatusIndex`) each
-  maintain a count key and an ordered list of entries.
-- Index entries are appended — no compaction on status transitions (entries
-  are added to the new status but not removed from the old).
-- `get_by_status()`, `get_by_issuer()`, and `get_by_buyer()` are paginated
-  (`page`, `page_size`, capped at `MAX_PAGE_SIZE`). Each call reads at most
-  `page_size` index entries, so cost is bounded regardless of index size.
-- `get_by_status()` still filters each page to entries whose current
-  `invoice.status` matches (to handle stale index entries), so a page may
-  contain fewer than `page_size` results.
+- The status index is a **bounded membership index**, not an append-only
+  history. `StatusPosition` maps `(status, full invoice id)` to the exact
+  `StatusIndexEntry` slot in O(1).
+- Entering a status appends one slot and writes its position. Leaving a
+  status swap-and-pops: the last slot fills the vacated slot, the moved
+  invoice's position is rewritten, and the departing position is deleted.
+  Both operations are O(1) and never scan the status's invoice history.
+- `StatusIndexCount` (slots) always equals the number of current members for
+  post-upgrade data. Storage is therefore bounded by live members, not by the
+  number of historical transitions.
+- `get_by_status()` reads only the requested page of member slots and
+  hydrates at most `page_size` invoices. The page is still filtered to the
+  invoice's current status so un-migrated legacy rows cannot leak stale
+  results; such a page can be short until migration completes.
+- Ordering follows the compacted slot array: insertion order is preserved
+  until a member leaves, at which point the previous last member moves into
+  the vacated slot (swap-and-pop, as covered by
+  `test_move_status_index_compacts_storage`).
+- `get_by_issuer()` and `get_by_buyer()` remain append-only, paginated index
+  families and are unaffected by this change.
+
+#### Status Index Migration (upgrade note)
+
+The old shape appended `StatusIndexEntry` rows and never reclaimed them, and
+had no position map. Existing deployments should upgrade as follows:
+
+1. Optionally `pause()` the contract while migrating so paginated reads do not
+   observe a half-compacted status.
+2. For each status, call
+   `migrate_status_index(status, page_size)` repeatedly until it returns
+   `done = true`. Each call scans at most `page_size` (≤ `MAX_PAGE_SIZE`)
+   source slots, keeps only invoices whose current status matches, rewrites
+   them into the compact prefix, writes their `StatusPosition`, and on the last
+   page deletes stale trailing slots, sets `StatusIndexCount` /
+   `StatusCount` to the live count, and clears the temporary migration keys.
+3. `unpause()` and resume. The function requires admin authorization and is
+   idempotent if re-run after completion.
+
+No migration is required for correctness before then: a pre-upgrade invoice
+without a position is located once by a compatibility scan on its next
+transition and seeded in the map. Calling `migrate_status_index` removes that
+one-time scan and any stale historical rows.
+
+**ABI change:** `migrate_status_index(status: InvoiceStatus, page_size: u32)
+-> (u32, bool)` is a new admin-authenticated entry point. Existing read
+signatures (`get_by_status(status, page, page_size)`) and their result shape
+are unchanged; only ordering under a departure follows the already-documented
+swap-and-pop compaction.
 
 ### Storage Key Count
 
-**Approximately 5 + (7 × number_of_invoices)** keys per active invoice:
+**Approximately 6 + (7 × number_of_invoices)** keys per active invoice:
 - 5 instance keys
 - 1 invoice entry
 - 1 issuer index entry (+1 for count if first)
 - 1 buyer index entry (+1 for count if first)
-- 1 status index entry (+1 for each status transition)
+- 1 status index entry
+- 1 status position (removed when the invoice leaves that status)
+
+Transitions reuse the single status slot/position rather than adding a row per
+historical status, so key count stays bounded over the invoice lifecycle.
 
 ---
 
@@ -244,6 +321,7 @@ EscrowRecord {
     invoice_id: BytesN<32>,
     amount:     u128,      // USDC stroops
     locked_at:  u64,       // Unix timestamp
+    issuer:     Address,   // Lock-time issuer; sole recipient source of truth
 }
 ```
 
@@ -251,7 +329,7 @@ EscrowRecord {
 
 | DataKey | Type | Description |
 |---------|------|-------------|
-| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Append-only event log keyed by invoice ID |
+| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Bounded, chronological event log keyed by invoice ID |
 
 ```
 EscrowEvent {
@@ -259,21 +337,51 @@ EscrowEvent {
     action:     EscrowAction,   // Locked | ReleasedToIssuer | ReleasedToPool | DefaultHandled
     amount:     u128,
     timestamp:  u64,
+    caller:     Option<Address>,
 }
 ```
+
+#### History Retention and Compaction (issue #51)
+
+Escrow history is **bounded** so a long-lived invoice cannot grow its
+persistent entry without limit:
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `MAX_HISTORY_EVENTS` | 32 | Hard cap enforced by every `append_history` write. The oldest event is evicted when a 33rd is appended. |
+| `MIN_HISTORY_EVENTS` | 1 | Smallest retention an admin may request from `compact_history`. |
+| `MAX_COMPACT_PER_CALL` | 32 | Maximum events one `compact_history` call removes, bounding per-call CPU/memory. |
+
+`compact_history(invoice_id, keep) -> u32` is **admin-authenticated** and prunes
+the oldest entries until `keep` remain, returning the number removed. It is
+admin-gated rather than permissionless because removing on-chain audit data is
+destructive to clients that have not yet synced; the stored admin is the
+accountable party. Repeated calls are safe and idempotent: once the retained
+length is `<= keep` (or no further batch can be removed) the call returns `0`.
+
+Retained events keep their original chronological order (oldest first). Pruned
+events are **not** silently invented or rewritten; they remain available in the
+ledger's event stream via `funds_locked`, `released_to_issuer`,
+`released_to_pool`, and `default_resolved`. See
+[ESCROW_HISTORY.md](./ESCROW_HISTORY.md) for the full client/indexer policy.
 
 #### Lifecycle
 
 1. `lock()` creates an `EscrowRecord` and transfers USDC from pool → escrow.
 2. `release_to_issuer()` or `release_to_pool()` transfers USDC out and
    **removes** the `Locked` key (caller must re-lock for a new funding cycle).
+   `release_to_issuer()` treats `EscrowRecord.issuer` as the source of truth:
+   a caller-supplied address must equal it, and the transfer always goes to the
+   stored value.
 3. `handle_default()` returns locked USDC to the pool and **removes** the key.
 4. On removal, the TTL-granted entries also expire organically.
 
 ### Storage Key Count
 
 **Approximately 2 keys per funded invoice** — one `Locked` record and one
-`History` vector (which shares its TTL with the lock).
+`History` vector (which shares its TTL with the lock). The history vector is
+capped at `MAX_HISTORY_EVENTS` entries, so its size does not grow with invoice
+age or funding cycles.
 
 ---
 
@@ -398,6 +506,7 @@ Each registered asset requires two keys: one for its position in the list (`Asse
 | `pool::deposit` | 5 | 5 (+ TTL + token transfer) | Medium |
 | `pool::fund_invoice` | 6+ | 5 (+ TTL + cross-contract calls) | High |
 | `escrow::lock` | 2 | 2 (+ TTL + token transfer) | Medium |
+| `escrow::compact_history` | 1 | 1 (+ TTL), at most `MAX_COMPACT_PER_CALL` evictions | Low-Medium |
 
 See [LIMITATIONS.md](./LIMITATIONS.md) for current testnet budget constraints.
 
