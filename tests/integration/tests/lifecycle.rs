@@ -360,10 +360,41 @@ fn assert_fee_settlement(lifecycle: &FeeLifecycle, expected: FeeSettlementExpect
     assert_eq!(token.balance(&lifecycle.escrow_id), 9_800_000_000);
 }
 
-fn expected_repayment_split(
-    invoice: &clearledger_invoice::Invoice,
-    repaid_at: u64,
-) -> (u128, u128) {
+const DEFAULT_LIFECYCLE_DEPOSIT: u128 = 12_000_000_000;
+
+/// Builds an identical, fully funded invoice for both terminal paths:
+/// LP deposit -> list -> pool funding -> shipping -> dual delivery
+/// confirmation. The returned invoice is `Confirmed` and therefore eligible
+/// for both `repay` and `trigger_default`.
+fn setup_funded_lifecycle() -> (FeeLifecycle, BytesN<32>, u64) {
+    let lifecycle = setup_fee_lifecycle();
+    lifecycle
+        .pool
+        .deposit(&lifecycle.lp, &DEFAULT_LIFECYCLE_DEPOSIT);
+    let (invoice_id, due_date) = create_fee_lifecycle_invoice(&lifecycle);
+    (lifecycle, invoice_id, due_date)
+}
+
+/// Drives the pool-led default/recovery path.
+///
+/// `invoice.trigger_default` is deliberately not used here because the
+/// invoice -> pool -> invoice callback sequence is pinned as a known
+/// self-re-entrancy failure by
+/// `test_partial_repayment_then_default_lifecycle` and
+/// `pool::test_trigger_default_drives_full_pool_and_escrow_chain`. Calling
+/// `pool.handle_default` directly exercises the same escrow recovery,
+/// pool-loss, and invoice-status writes without that unrelated runtime
+/// limitation.
+fn default_via_pool(lifecycle: &FeeLifecycle, invoice_id: &BytesN<32>) -> bool {
+    let defaulted = lifecycle.pool.handle_default(invoice_id);
+    assert_eq!(
+        lifecycle.invoice.get_status(invoice_id),
+        InvoiceStatus::Defaulted as u32
+    );
+    defaulted
+}
+
+fn expected_repayment_split(invoice: &clearledger_invoice::Invoice, repaid_at: u64) -> (u128, u128) {
     let funded_at = invoice
         .funded_at
         .expect("funded invoice should record its funding timestamp");
@@ -1139,6 +1170,181 @@ fn test_cross_contract_partial_repayment_lifecycle() {
     );
 }
 
+const PARTIAL_REPAYMENT_DEPOSIT: u128 = 12_000_000_000;
+
+fn setup_partial_repayment() -> (FeeLifecycle, BytesN<32>, u64) {
+    let lifecycle = setup_fee_lifecycle();
+    lifecycle
+        .pool
+        .deposit(&lifecycle.lp, &PARTIAL_REPAYMENT_DEPOSIT);
+    let (invoice_id, due_date) = create_fee_lifecycle_invoice(&lifecycle);
+    (lifecycle, invoice_id, due_date)
+}
+
+#[test]
+fn test_cross_contract_partial_repayment_zero_rejected_without_state_change() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let buyer_before = token.balance(&lifecycle.buyer);
+    let escrow_before = token.balance(&lifecycle.escrow_id);
+
+    assert!(lifecycle.invoice.try_repay_partial(&invoice_id, &0).is_err());
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(invoice_after.status, invoice_before.status);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.repaid_amount);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.remaining_balance
+    );
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_yield_distributed, stats_before.total_yield_distributed);
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_before);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_before);
+}
+
+#[test]
+fn test_cross_contract_partial_repayment_minimum_stroop_accepted() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+
+    assert!(lifecycle.invoice.repay_partial(&invoice_id, &1));
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    assert_eq!(invoice_after.status, InvoiceStatus::Confirmed);
+    assert_eq!(invoice_after.repaid_amount, 1);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.face_value - 1
+    );
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        invoice_before.face_value - 1
+    );
+
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_yield_distributed, stats_before.total_yield_distributed);
+    assert_eq!(
+        token.balance(&lifecycle.escrow_id),
+        invoice_before.funded_amount as i128 + 1
+    );
+}
+
+#[test]
+fn test_cross_contract_repeated_partial_repayments_track_invoice_and_pool() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let mut cumulative = 0u128;
+
+    for amount in [3_000_000_000u128, 2_000_000_000u128, 1_000_000_000u128] {
+        assert!(lifecycle.invoice.repay_partial(&invoice_id, &amount));
+        cumulative += amount;
+
+        let invoice_after = lifecycle.invoice.get(&invoice_id);
+        assert_eq!(invoice_after.status, InvoiceStatus::Confirmed);
+        assert_eq!(invoice_after.repaid_amount, cumulative);
+        assert_eq!(
+            invoice_after.remaining_balance,
+            invoice_before.face_value - cumulative
+        );
+        assert_eq!(
+            lifecycle.invoice.get_remaining_balance(&invoice_id),
+            invoice_before.face_value - cumulative
+        );
+
+        let stats_after = lifecycle.pool.get_stats();
+        assert_eq!(stats_after.total_funded, stats_before.total_funded);
+        assert_eq!(
+            stats_after.active_invoice_count,
+            stats_before.active_invoice_count
+        );
+        assert_eq!(
+            stats_after.total_yield_distributed,
+            stats_before.total_yield_distributed
+        );
+        assert_eq!(
+            token.balance(&lifecycle.escrow_id),
+            invoice_before.funded_amount as i128 + cumulative as i128
+        );
+    }
+}
+
+#[test]
+fn test_cross_contract_final_exact_balance_repayment_settles_invoice() {
+    let (lifecycle, invoice_id, due_date) = setup_partial_repayment();
+    lifecycle.env.ledger().set_timestamp(due_date);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let discount = invoice_before.face_value - invoice_before.funded_amount;
+    let first_installment = 4_000_000_000u128;
+
+    assert!(lifecycle
+        .invoice
+        .repay_partial(&invoice_id, &first_installment));
+    let remaining = invoice_before.face_value - first_installment;
+    assert!(lifecycle.invoice.repay_partial(&invoice_id, &remaining));
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    assert_eq!(invoice_after.status, InvoiceStatus::Repaid);
+    assert_eq!(invoice_after.remaining_balance, 0);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.face_value);
+    assert!(invoice_after.repaid_at.is_some());
+
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(stats_after.total_funded, 0);
+    assert_eq!(stats_after.active_invoice_count, 0);
+    assert_eq!(stats_after.total_yield_distributed, discount);
+    assert_eq!(
+        stats_after.total_deposits,
+        PARTIAL_REPAYMENT_DEPOSIT + discount
+    );
+
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    assert_eq!(
+        token.balance(&lifecycle.escrow_id),
+        invoice_before.funded_amount as i128
+    );
+}
+
+#[test]
+fn test_cross_contract_partial_repayment_over_balance_rejected_without_state_change() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let buyer_before = token.balance(&lifecycle.buyer);
+    let escrow_before = token.balance(&lifecycle.escrow_id);
+
+    let over_balance = invoice_before.remaining_balance + 1;
+    assert!(lifecycle
+        .invoice
+        .try_repay_partial(&invoice_id, &over_balance)
+        .is_err());
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(invoice_after.status, invoice_before.status);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.repaid_amount);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.remaining_balance
+    );
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_yield_distributed, stats_before.total_yield_distributed);
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_before);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_before);
+}
+
 /// Opt-in native-host measurements, not network fee estimates or a safe-size promise.
 #[test]
 #[ignore = "manual budget baseline; run with --ignored --nocapture"]
@@ -1799,6 +2005,318 @@ fn test_fund_invoice_rolls_back_atomically_when_issuer_payout_fails() {
     assert_eq!(token.balance(&lifecycle.escrow_id), escrow_before);
     assert_eq!(token.balance(&lifecycle.pool_id), pool_before);
     assert_eq!(token.balance(&lifecycle.lp), lp_before);
+}
+// --------------- Repayment / Default Terminal Exclusivity (Issue #99) ---------------
+
+#[test]
+fn test_full_repayment_blocks_default_and_second_settlement() {
+    let (lifecycle, invoice_id, due_date) = setup_funded_lifecycle();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+    let invoice = lifecycle.invoice.get(&invoice_id);
+    let funded_amount = invoice.funded_amount;
+    let face_value = invoice.face_value;
+    let discount = face_value - funded_amount;
+
+    lifecycle.env.ledger().set_timestamp(due_date);
+    assert!(lifecycle.invoice.repay(&invoice_id));
+
+    // Repayment is terminal: the invoice has no remaining balance, the pool has
+    // no outstanding funded principal, and the escrow lock has been consumed.
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Repaid as u32
+    );
+    assert_eq!(lifecycle.invoice.get_remaining_balance(&invoice_id), 0);
+    assert_eq!(
+        lifecycle.invoice.get_repaid_amount(&invoice_id),
+        face_value
+    );
+    assert_eq!(lifecycle.pool.get_funded_amount(&invoice_id), None);
+    assert_eq!(escrow.get_locked(&invoice_id), 0);
+
+    let stats_after_repay = lifecycle.pool.get_stats();
+    assert_eq!(stats_after_repay.total_funded, 0);
+    assert_eq!(stats_after_repay.active_invoice_count, 0);
+    assert_eq!(stats_after_repay.total_loss_realised, 0);
+    assert_eq!(
+        stats_after_repay.total_deposits,
+        DEFAULT_LIFECYCLE_DEPOSIT + discount
+    );
+    // Pool receives face value from escrow and (at maturity) refunds nothing.
+    assert_eq!(
+        token.balance(&lifecycle.pool_id),
+        (DEFAULT_LIFECYCLE_DEPOSIT + discount) as i128
+    );
+    // Escrow retains only the original funded principal, no repayment balance.
+    assert_eq!(token.balance(&lifecycle.escrow_id), funded_amount as i128);
+
+    let buyer_after_repay = token.balance(&lifecycle.buyer);
+    let escrow_after_repay = token.balance(&lifecycle.escrow_id);
+
+    // Every default/recovery entry point must reject the already-repaid
+    // invoice without moving funds or writing accounting.
+    lifecycle.env.ledger().set_timestamp(due_date + 60);
+    assert!(lifecycle.invoice.try_trigger_default(&invoice_id).is_err());
+    assert!(lifecycle.pool.try_handle_default(&invoice_id).is_err());
+    assert!(!escrow.handle_default(&invoice_id, &lifecycle.pool_id));
+    assert!(lifecycle.invoice.try_repay(&invoice_id).is_err());
+    assert!(lifecycle
+        .invoice
+        .try_repay_partial(&invoice_id, &1u128)
+        .is_err());
+
+    let stats_after_rejections = lifecycle.pool.get_stats();
+    assert_eq!(
+        stats_after_rejections.total_deposits,
+        stats_after_repay.total_deposits
+    );
+    assert_eq!(
+        stats_after_rejections.total_funded,
+        stats_after_repay.total_funded
+    );
+    assert_eq!(
+        stats_after_rejections.total_loss_realised,
+        stats_after_repay.total_loss_realised
+    );
+    assert_eq!(
+        stats_after_rejections.active_invoice_count,
+        stats_after_repay.active_invoice_count
+    );
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_after_repay);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_after_repay);
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Repaid as u32
+    );
+    assert_eq!(lifecycle.invoice.get_remaining_balance(&invoice_id), 0);
+}
+
+#[test]
+fn test_default_blocks_repayment_and_second_settlement() {
+    let (lifecycle, invoice_id, due_date) = setup_funded_lifecycle();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+    let invoice = lifecycle.invoice.get(&invoice_id);
+    let funded_amount = invoice.funded_amount;
+    let face_value = invoice.face_value;
+
+    // Funded + confirmed invoice defaults after maturity and the escrow grace
+    // period, exercising the pool-led recovery path.
+    lifecycle.env.ledger().set_timestamp(due_date + 60);
+    assert!(default_via_pool(&lifecycle, &invoice_id));
+
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Defaulted as u32
+    );
+    // No repayment occurred, so the invoice balance is preserved (not reset).
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        face_value
+    );
+    assert_eq!(lifecycle.invoice.get_repaid_amount(&invoice_id), 0);
+    assert_eq!(lifecycle.pool.get_funded_amount(&invoice_id), None);
+    assert_eq!(escrow.get_locked(&invoice_id), 0);
+
+    let stats_after_default = lifecycle.pool.get_stats();
+    assert_eq!(stats_after_default.total_funded, 0);
+    assert_eq!(stats_after_default.active_invoice_count, 0);
+    assert_eq!(stats_after_default.total_loss_realised, funded_amount);
+    assert_eq!(
+        stats_after_default.total_deposits,
+        DEFAULT_LIFECYCLE_DEPOSIT,
+        "default recovery must not double-count the write-off against LP deposits"
+    );
+    // The escrow advance is returned exactly once, restoring the deposited
+    // principal available to the pool.
+    assert_eq!(
+        token.balance(&lifecycle.pool_id),
+        DEFAULT_LIFECYCLE_DEPOSIT as i128
+    );
+    assert_eq!(token.balance(&lifecycle.escrow_id), 0);
+
+    let buyer_after_default = token.balance(&lifecycle.buyer);
+    let escrow_after_default = token.balance(&lifecycle.escrow_id);
+
+    // The terminal default must reject every repayment variant (no buyer
+    // transfer) and replaying default must not realize a second loss.
+    assert!(lifecycle.invoice.try_repay(&invoice_id).is_err());
+    assert!(lifecycle
+        .invoice
+        .try_repay_partial(&invoice_id, &1u128)
+        .is_err());
+    assert!(lifecycle.invoice.try_repay_early(&invoice_id).is_err());
+    assert!(lifecycle.invoice.try_trigger_default(&invoice_id).is_err());
+    assert!(lifecycle.pool.try_handle_default(&invoice_id).is_err());
+    assert!(!escrow.handle_default(&invoice_id, &lifecycle.pool_id));
+
+    let stats_after_rejections = lifecycle.pool.get_stats();
+    assert_eq!(
+        stats_after_rejections.total_deposits,
+        stats_after_default.total_deposits
+    );
+    assert_eq!(
+        stats_after_rejections.total_funded,
+        stats_after_default.total_funded
+    );
+    assert_eq!(
+        stats_after_rejections.total_loss_realised,
+        stats_after_default.total_loss_realised
+    );
+    assert_eq!(
+        stats_after_rejections.active_invoice_count,
+        stats_after_default.active_invoice_count
+    );
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_after_default);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_after_default);
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Defaulted as u32
+    );
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        face_value
+    );
+}
+
+#[test]
+fn test_partial_repayment_then_default_preserves_balance_without_double_settlement() {
+    let (lifecycle, invoice_id, due_date) = setup_funded_lifecycle();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+    let invoice = lifecycle.invoice.get(&invoice_id);
+    let funded_amount = invoice.funded_amount;
+    let face_value = invoice.face_value;
+    let partial_repayment = face_value / 2;
+
+    lifecycle.env.ledger().set_timestamp(due_date);
+    assert!(lifecycle
+        .invoice
+        .repay_partial(&invoice_id, &partial_repayment));
+
+    // Partial repayment records the installment but does not settle the
+    // invoice: status stays non-terminal, the remaining balance shrinks, and
+    // the escrow lock still covers the original funded principal.
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Confirmed as u32
+    );
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        face_value - partial_repayment
+    );
+    assert_eq!(
+        lifecycle.invoice.get_repaid_amount(&invoice_id),
+        partial_repayment
+    );
+    assert_eq!(escrow.get_locked(&invoice_id), funded_amount);
+    assert_eq!(
+        token.balance(&lifecycle.escrow_id),
+        (funded_amount + partial_repayment) as i128
+    );
+    assert_eq!(
+        token.balance(&lifecycle.pool_id),
+        (DEFAULT_LIFECYCLE_DEPOSIT - funded_amount) as i128
+    );
+
+    let stats_before_default = lifecycle.pool.get_stats();
+    assert_eq!(stats_before_default.total_funded, funded_amount);
+    assert_eq!(stats_before_default.active_invoice_count, 1);
+    assert_eq!(stats_before_default.total_loss_realised, 0);
+    assert_eq!(
+        stats_before_default.total_deposits,
+        DEFAULT_LIFECYCLE_DEPOSIT
+    );
+
+    // Default after the partial installment: the unpaid balance is recovered
+    // as a single write-off, and the invoice's repayment counters are not
+    // reset to zero (which is what a double settlement would look like).
+    lifecycle.env.ledger().set_timestamp(due_date + 60);
+    assert!(default_via_pool(&lifecycle, &invoice_id));
+
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Defaulted as u32
+    );
+    assert_eq!(
+        lifecycle.invoice.get_repaid_amount(&invoice_id),
+        partial_repayment
+    );
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        face_value - partial_repayment
+    );
+    assert_eq!(lifecycle.pool.get_funded_amount(&invoice_id), None);
+    assert_eq!(escrow.get_locked(&invoice_id), 0);
+
+    let stats_after_default = lifecycle.pool.get_stats();
+    assert_eq!(stats_after_default.total_funded, 0);
+    assert_eq!(stats_after_default.active_invoice_count, 0);
+    assert_eq!(
+        stats_after_default.total_deposits,
+        stats_before_default.total_deposits,
+        "default must not reduce LP deposits a second time"
+    );
+    // Current single-settlement accounting: the originating funded principal
+    // is written off exactly once by the pool, and escrow releases that same
+    // principal exactly once (the partial installment remains in escrow).
+    assert_eq!(stats_after_default.total_loss_realised, funded_amount);
+    assert_eq!(
+        token.balance(&lifecycle.pool_id),
+        DEFAULT_LIFECYCLE_DEPOSIT as i128
+    );
+    assert_eq!(
+        token.balance(&lifecycle.escrow_id),
+        partial_repayment as i128
+    );
+
+    let buyer_after_default = token.balance(&lifecycle.buyer);
+    let escrow_after_default = token.balance(&lifecycle.escrow_id);
+
+    // No repayment variable may resurrect a defaulted invoice, and replaying
+    // the default path must not move more funds or realize more loss.
+    assert!(lifecycle.invoice.try_repay(&invoice_id).is_err());
+    assert!(lifecycle
+        .invoice
+        .try_repay_partial(&invoice_id, &1u128)
+        .is_err());
+    assert!(lifecycle.invoice.try_repay_early(&invoice_id).is_err());
+    assert!(lifecycle.invoice.try_trigger_default(&invoice_id).is_err());
+    assert!(lifecycle.pool.try_handle_default(&invoice_id).is_err());
+    assert!(!escrow.handle_default(&invoice_id, &lifecycle.pool_id));
+
+    let stats_after_rejections = lifecycle.pool.get_stats();
+    assert_eq!(
+        stats_after_rejections.total_deposits,
+        stats_after_default.total_deposits
+    );
+    assert_eq!(
+        stats_after_rejections.total_funded,
+        stats_after_default.total_funded
+    );
+    assert_eq!(
+        stats_after_rejections.total_loss_realised,
+        stats_after_default.total_loss_realised
+    );
+    assert_eq!(
+        stats_after_rejections.active_invoice_count,
+        stats_after_default.active_invoice_count
+    );
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_after_default);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_after_default);
+    assert_eq!(
+        lifecycle.invoice.get_status(&invoice_id),
+        InvoiceStatus::Defaulted as u32
+    );
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        face_value - partial_repayment
+    );
+    assert_eq!(
+        lifecycle.invoice.get_repaid_amount(&invoice_id),
+        partial_repayment
+    );
 }
 
 /// Opt-in measurement only: normal correctness tests do not rewrite baselines.

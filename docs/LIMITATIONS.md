@@ -1,6 +1,6 @@
 # Limitations
 
-> **Updated:** 2026-09-30
+> **Updated:** 2026-10-20
 > **Applies to:** ClearLedger protocol on Stellar testnet
 
 This document captures known limitations, testnet-specific constraints,
@@ -221,6 +221,19 @@ withdrawal. The regression test in `contracts/pool/src/test.rs` covers this
 scenario. Per-deposit lots would be required if the protocol needs a specific
 FIFO/HIFO tax or reporting policy.
 
+### Pool `set_max_utilization` Auth Is Caller-Controlled
+
+`pool::set_max_utilization(admin, new_cap_bps)` calls
+`admin.require_auth()` on the caller-supplied `admin` argument but never
+compares it to the stored pool admin
+(`contracts/pool/src/lib.rs:1914-1926`). Any account that signs its own call
+can raise or lower the utilization cap, despite the function's doc comment
+saying it requires the contract admin. The regression test
+`test_set_max_utilization_requires_admin_authorization`
+(`contracts/pool/src/test.rs:1530`) only covers an unsigned non-admin. Treat
+the cap as caller-controlled until the contract compares the argument to
+`DataKey::Admin`.
+
 ### Issuer Release Not Wired (Issue #56)
 
 After `fund_invoice` locks USDC in escrow, the pooled funds should be
@@ -240,13 +253,41 @@ repayment occurs. The buyer pays the full `face_value` regardless of how
 early they repay, so there is no on-chain rebate proportional to the time
 remaining on the invoice.
 
-### No Duplicate Invoice Detection
+### Duplicate Invoice Detection Is Advisory Only
 
 The `create` function generates an invoice ID from a SHA-256 hash of
 (issuer, buyer, face_value, due_date, counter, asset). The counter
-guarantees uniqueness even for otherwise identical invoices, but there is
-no user-visible warning when an issuer re-submits the same commercial
-terms.
+guarantees uniqueness even for otherwise identical invoices, so `create`
+never rejects a re-submitted set of commercial terms.
+
+For off-chain warnings, the invoice contract exposes
+`duplicate_terms_key(issuer, buyer, face_value, due_date, funding_asset)`
+as an unauthenticated, storage-free read. It returns
+`SHA-256(DUPLICATE_TERMS_DOMAIN_SEPARATOR || fields)`, where `fields` are:
+
+1. `u32` big-endian length + canonical Soroban XDR encoding of `issuer`
+2. `u32` big-endian length + canonical Soroban XDR encoding of `buyer`
+3. `face_value` as 16-byte big-endian (USDC stroops, 7 decimals)
+4. `due_date` as 8-byte big-endian (Unix seconds)
+5. `u32` big-endian length + canonical Soroban XDR encoding of
+   `funding_asset`
+
+The domain separator is
+`"ClearLedger.InvoiceDupTerms.v1__"`. Length prefixes and fixed-width scalars
+make the encoding unambiguous. The key is stable across ledger time and the
+invoice lifecycle (it excludes the counter, status, and mutable financing
+terms such as `discount_bps`), and it is distinct from the counter-based
+invoice ID. It panics with `InvalidParticipants` for a self-invoiced
+`issuer == buyer`, `InvalidFaceValue` for a zero amount, and `InvalidAmount`
+above `MAX_FACE_VALUE`.
+
+Clients on Stellar Testnet can query it through Soroban RPC
+read/simulation against the deployed invoice contract, or reproduce it
+off-chain from `get(invoice_id)` using canonical Address XDR and stroop
+amounts. It is a warning signal only: indexers should not treat it as a
+uniqueness constraint or use it to reject otherwise valid invoices. The
+current invoice model has no description or metadata fields; adding them
+would require bumping the `v1` domain separator.
 
 ---
 
@@ -296,8 +337,11 @@ are provided where available.
 - Formal verification or symbolic execution audit
 - `cargo-soroban` integration for automated WASM budget reporting
 - TypeScript SDK for contract interaction
-- Automated fuzz testing across all four contracts
-- Smart-contract upgrade mechanism (`__constructor` + `__upgrade`)
+- Automated fuzz testing across all deployed contracts
+- Timelocked or multisig contract upgrades. Admin-only `upgrade` entry points
+  already exist on `invoice` and `escrow`; `registry`, `pool`, and
+  `pool_factory` are not upgradeable through a contract entry point. See
+  [THREAT_MODEL.md](./THREAT_MODEL.md#upgrade-powers).
 
 > **Note:** Partial repayments are now supported on the **escrow** path
 > (`escrow::release_to_pool(invoice_id, repayment_amount)` accepts a

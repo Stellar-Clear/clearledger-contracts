@@ -24,4 +24,9 @@ pub enum PoolFactoryError {
     /// `get_aggregate_stats_page` was given a cursor past the end of the asset
     /// index.
     InvalidAggregateStatsCursor = 13,
+    /// `get_assets_page` was given a zero limit or a limit above
+    /// [`MAX_ASSET_PAGE_LIMIT`](crate::MAX_ASSET_PAGE_LIMIT).
+    InvalidLimit = 14,
+    /// `get_assets_page` was given a cursor past the end of the asset index.
+    InvalidCursor = 15,
 }

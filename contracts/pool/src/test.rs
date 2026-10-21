@@ -20,8 +20,8 @@ use crate::{
         MAX_BATCH_SIZE, MAX_PROTOCOL_FEE_BPS, SUGGESTED_DISCOUNT_CEILING_BPS,
         SUGGESTED_DISCOUNT_FLOOR_BPS,
     },
-    DataKey, PoolContract, PoolContractClient, DEFAULT_MIN_INITIAL_DEPOSIT, DEFAULT_SHARE_DECIMALS,
-    TTL_EXTEND_TO, TTL_THRESHOLD,
+    DataKey, FundingStatus, PoolContract, PoolContractClient, DEFAULT_MIN_INITIAL_DEPOSIT,
+    DEFAULT_SHARE_DECIMALS, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
 use clearledger_escrow::{EscrowContract as RealEscrow, EscrowContractClient as RealEscrowClient};
@@ -1783,6 +1783,316 @@ fn test_fund_invoice_is_permissionless() {
     let stats = te.pool.get_stats();
     assert_eq!(stats.total_funded, DEFAULT_FUNDED_AMOUNT);
     assert_eq!(stats.active_invoice_count, 1);
+}
+
+//  PREVIEW FUND TESTS (issue #44)
+#[test]
+fn test_preview_fund_matches_fund_quote_for_normal_odd_and_boundary_amounts() {
+    // Normal, odd-discount floor rounding, and the smallest fundable amount.
+    let cases = [
+        (10_000_000_000u128, 200u32),
+        (10_000_000_003, 333),
+        (999_999_999, 497),
+        (2, 5000),
+    ];
+
+    for (face_value, discount_bps) in cases {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list_with_params(&te, &te.usdc_id, face_value, discount_bps);
+        let expected = face_value * (10000 - discount_bps as u128) / 10000;
+
+        let preview = te.pool.preview_fund(&invoice_id);
+        assert_eq!(preview.status, FundingStatus::Eligible);
+        assert!(preview.eligible);
+        assert_eq!(preview.funded_amount, expected);
+        assert_eq!(preview.required_capacity, expected);
+        assert_eq!(preview.available_liquidity, 100_000_000_000);
+        assert_eq!(preview.max_utilization_bps, 10000);
+        assert_eq!(
+            preview.utilization_bps_after,
+            (expected * 10_000 / 100_000_000_000) as u32
+        );
+
+        assert!(te.pool.fund_invoice(&invoice_id));
+        assert_eq!(te.pool.get_funded_amount(&invoice_id), Some(expected));
+        assert_eq!(te.pool.get_stats().total_funded, expected);
+    }
+}
+
+#[test]
+fn test_preview_fund_reports_zero_funded_amount_as_invalid() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    // face_value=1, discount_bps=5000 -> funded_amount = 1 * 5000 / 10000 = 0
+    let invoice_id = create_and_list_with_params(&te, &te.usdc_id, 1, 5000);
+
+    let stats_before = te.pool.get_stats();
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::InvalidAmount);
+    assert!(!preview.eligible);
+    assert_eq!(preview.funded_amount, 0);
+    assert_eq!(preview.required_capacity, 0);
+
+    // The write path still rejects the same quote with InvalidAmount (#4).
+    assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    assert_eq!(te.pool.get_stats().total_funded, stats_before.total_funded);
+    let funded_key = DataKey::FundedInvoice(invoice_id);
+    assert!(!te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().has(&funded_key)
+    }));
+}
+
+#[test]
+fn test_preview_fund_reports_hard_eligibility_failures() {
+    // Not listed: the invoice exists but has never been listed for financing.
+    {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let due_date = te.env.ledger().timestamp() + 86400;
+        let invoice_id = te.invoice.create(
+            &te.issuer,
+            &te.buyer,
+            &1_000_000_000,
+            &due_date,
+            &te.usdc_id,
+        );
+
+        let preview = te.pool.preview_fund(&invoice_id);
+        assert_eq!(preview.status, FundingStatus::InvoiceNotListed);
+        assert!(!preview.eligible);
+        assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    }
+
+    // Already funded by this pool: the idempotency guard wins over status.
+    {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list(&te, &te.usdc_id);
+        assert!(te.pool.fund_invoice(&invoice_id));
+
+        let preview = te.pool.preview_fund(&invoice_id);
+        assert_eq!(preview.status, FundingStatus::AlreadyFunded);
+        assert!(!preview.eligible);
+        assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    }
+
+    // Asset mismatch: a listed invoice denominated in another asset.
+    {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list(&te, &te.xlm_id);
+
+        let preview = te.pool.preview_fund(&invoice_id);
+        assert_eq!(preview.status, FundingStatus::AssetMismatch);
+        assert!(!preview.eligible);
+        assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    }
+
+    // Issuer revoked after listing.
+    {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list(&te, &te.usdc_id);
+        te.registry.revoke(&te.issuer);
+
+        let preview = te.pool.preview_fund(&invoice_id);
+        assert_eq!(preview.status, FundingStatus::IssuerNotVerified);
+        assert!(!preview.eligible);
+        assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    }
+
+    // Buyer revoked after listing.
+    {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list(&te, &te.usdc_id);
+        te.registry.revoke(&te.buyer);
+
+        let preview = te.pool.preview_fund(&invoice_id);
+        assert_eq!(preview.status, FundingStatus::BuyerNotVerified);
+        assert!(!preview.eligible);
+        assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+    }
+}
+
+#[test]
+fn test_preview_fund_reports_insufficient_liquidity_without_panicking() {
+    let te = setup();
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    let stats_before = te.pool.get_stats();
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::InsufficientLiquidity);
+    assert!(!preview.eligible);
+    assert_eq!(preview.funded_amount, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(preview.required_capacity, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(preview.available_liquidity, 0);
+
+    // The write path rejects the same quote with InsufficientLiquidity (#5).
+    assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    let funded_key = DataKey::FundedInvoice(invoice_id);
+    assert!(!te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().has(&funded_key)
+    }));
+}
+
+#[test]
+fn test_preview_fund_reports_utilization_cap_without_panicking() {
+    let te = setup();
+    te.pool.set_max_utilization(&te.admin, &8500);
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    let stats_before = te.pool.get_stats();
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::UtilizationCapExceeded);
+    assert!(!preview.eligible);
+    assert_eq!(preview.funded_amount, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(preview.available_liquidity, 10_000_000_000);
+    assert_eq!(preview.utilization_bps_after, 9800);
+    assert_eq!(preview.max_utilization_bps, 8500);
+
+    // The write path rejects the same quote with UtilizationCapExceeded (#12).
+    assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+}
+
+#[test]
+fn test_preview_fund_allows_funding_equal_to_available_liquidity() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &DEFAULT_FUNDED_AMOUNT);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::Eligible);
+    assert!(preview.eligible);
+    assert_eq!(preview.funded_amount, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(preview.available_liquidity, DEFAULT_FUNDED_AMOUNT);
+
+    assert!(te.pool.fund_invoice(&invoice_id));
+    assert_eq!(te.pool.get_stats().total_funded, DEFAULT_FUNDED_AMOUNT);
+}
+
+#[test]
+fn test_preview_fund_allows_exactly_at_utilization_cap() {
+    let te = setup();
+    te.pool.set_max_utilization(&te.admin, &9800);
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::Eligible);
+    assert!(preview.eligible);
+    assert_eq!(preview.utilization_bps_after, 9800);
+    assert_eq!(preview.max_utilization_bps, 9800);
+
+    assert!(te.pool.fund_invoice(&invoice_id));
+    assert_eq!(te.pool.get_stats().total_funded, DEFAULT_FUNDED_AMOUNT);
+}
+
+#[test]
+fn test_preview_fund_reports_overflow_without_panicking() {
+    let te = setup();
+
+    let mock_id = te.env.register_contract(None, MockHugeFaceInvoice);
+    MockHugeFaceInvoiceClient::new(&te.env, &mock_id).configure(
+        &te.issuer,
+        &te.buyer,
+        &te.usdc_id,
+        &u128::MAX,
+        &0,
+    );
+
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::InvoiceContract, &mock_id);
+    });
+
+    let invoice_id = BytesN::from_array(&te.env, &[7u8; 32]);
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::Overflow);
+    assert!(!preview.eligible);
+    assert_eq!(preview.funded_amount, 0);
+
+    // The write path still rejects the same quote with Overflow (#13).
+    assert!(te.pool.try_fund_invoice(&invoice_id).is_err());
+}
+
+#[test]
+fn test_preview_fund_is_read_only_and_requires_no_authorization() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+
+    let stats_before = te.pool.get_stats();
+    let position_before = te.pool.get_lp_position(&te.lp);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let lp_usdc_before = usdc.balance(&te.lp);
+    let pool_usdc_before = usdc.balance(&te.pool_id);
+    let events_before = te.env.events().all().len();
+
+    // Drain the pool's instance TTL below TTL_THRESHOLD so any extension
+    // performed by the preview would be visible.
+    let instance_ttl_before_drain: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().instance().get_ttl()
+    });
+    te.env.ledger().set_sequence_number(
+        te.env.ledger().sequence() + instance_ttl_before_drain - 50,
+    );
+    let instance_ttl_before: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().instance().get_ttl()
+    });
+    assert!(instance_ttl_before < TTL_THRESHOLD);
+
+    te.env.set_auths(&[]);
+    let preview = te.pool.preview_fund(&invoice_id);
+    assert_eq!(preview.status, FundingStatus::Eligible);
+    assert_eq!(preview.funded_amount, DEFAULT_FUNDED_AMOUNT);
+
+    let instance_ttl_after: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().instance().get_ttl()
+    });
+    assert_eq!(instance_ttl_after, instance_ttl_before);
+
+    let funded_key = DataKey::FundedInvoice(invoice_id.clone());
+    assert!(!te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().has(&funded_key)
+    }));
+
+    let stats_after = te.pool.get_stats();
+    let position_after = te.pool.get_lp_position(&te.lp);
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(
+        stats_after.available_liquidity,
+        stats_before.available_liquidity
+    );
+    assert_eq!(position_after.shares, position_before.shares);
+    assert_eq!(position_after.usdc_value, position_before.usdc_value);
+    assert_eq!(position_after.yield_earned, position_before.yield_earned);
+    assert_eq!(usdc.balance(&te.lp), lp_usdc_before);
+    assert_eq!(usdc.balance(&te.pool_id), pool_usdc_before);
+    assert_eq!(te.env.events().all().len(), events_before);
+    assert_eq!(te.invoice.get_status(&invoice_id), 1);
 }
 
 #[test]
@@ -7320,4 +7630,3 @@ fn prop_lp_operation_sequences_conserve_shares_and_deposits() {
         )
         .unwrap();
 }
-

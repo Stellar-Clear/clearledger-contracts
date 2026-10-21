@@ -29,8 +29,32 @@ Copy `.env.example` to `.env` and fill in:
 |----------|-------------|
 | `DEPLOYER_ACCOUNT` | Key alias for the deployer (default: `deployer`) |
 | `USDC_ISSUER` | Stellar address of the USDC issuer on testnet |
-| `XLM_ASSET` | XLM asset contract address (or native) - EXPERIMENTAL/INCOMPLETE |
+| `XLM_ASSET` | Native XLM SAC contract address. Testnet: `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`. See [Native XLM](docs/NATIVE_XLM.md). |
 | `DEPLOY_XLM` | Set to `true` to opt in to experimental XLM contracts; defaults to the supported USDC workflow |
+
+## Native XLM via the Stellar Asset Contract
+
+Native XLM is supported through its Stellar Asset Contract (SAC), not through an
+issuer account. `XLM_ASSET` must be the network-specific SAC `C...` address, and
+the pool's `funding_asset`, the XLM escrow's asset, and the invoice allow-list
+entry must all use that same address. XLM uses 7 decimals (stroops), and the
+native SAC has no issuer or administrator.
+
+The canonical Testnet address is:
+
+```
+CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
+
+Do not use the `native` keyword or a `XLM:G...` asset identifier in a Soroban
+`Address` field. For address derivation, verification commands, factory
+initialization requirements, and current limitations, see
+[docs/NATIVE_XLM.md](docs/NATIVE_XLM.md).
+
+XLM deployment remains opt-in (`DEPLOY_XLM=true`) and the frontend does not yet
+expose an XLM pool. The bundled scripts deploy a dedicated XLM pool directly;
+routing an XLM pool through `pool_factory::register_asset` is supported but
+currently manual.
 
 ### Signing-Key and Log Handling
 
@@ -122,10 +146,10 @@ because each contract references others:
    └─ needs: invoice_contract, escrow_contract, USDC asset
 
 5. escrow_contract (XLM) [EXPERIMENTAL]
-   └─ needs: pool_contract, XLM asset
+   └─ needs: pool_contract, native XLM SAC address
 
 6. pool_contract (XLM) [EXPERIMENTAL]
-   └─ needs: invoice_contract, escrow_contract, XLM asset
+   └─ needs: invoice_contract, escrow_contract, native XLM SAC address
 
 7. Wire pool into invoice
    └─ invoice.set_pool_contract(pool_usdc)
@@ -395,4 +419,5 @@ To manually invalidate old deployments:
 | `DEPLOYER_ACCOUNT not set` | Copy `.env.example` to `.env` and fill in values |
 | Deploy hangs waiting for contract | Check network connection; testnet may be slow |
 | `400` from Friendbot | Account likely already funded — this is normal |
+| `contract not found` for `XLM_ASSET` | Re-derive the SAC address with `stellar contract id asset --network testnet --asset native`; use the `C...` address, never a `G...` issuer. See [docs/NATIVE_XLM.md](docs/NATIVE_XLM.md). |
 | Contract not found on verify | Wait longer after deploy; re-run `verify.sh` |

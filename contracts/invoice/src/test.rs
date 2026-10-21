@@ -13,7 +13,7 @@ use soroban_sdk::{
 
 use crate::{
     InvoiceContract, InvoiceContractClient, InvoiceError, InvoiceStatus, DEFAULT_EXPIRY_WINDOW,
-    MAX_BATCH_SIZE, MAX_FACE_VALUE, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
+    MAX_BATCH_SIZE, MAX_FACE_VALUE, MAX_INVOICE_LIFETIME_SECONDS, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
 // Default invoice parameters used across tests.
@@ -1084,6 +1084,72 @@ fn test_create_succeeds_when_due_date_one_second_in_future() {
     let events = env.events().all();
     let (event_contract, _topics, _data) = events.last().expect("expected at least one event");
     assert_eq!(event_contract, client.address.clone());
+}
+
+// ============== ISSUE #30: MAX INVOICE LIFETIME BOUNDS ==============
+
+// A due date exactly `MAX_INVOICE_LIFETIME_SECONDS` ahead is accepted: the
+// upper-bound comparator is `due_date > max_due_date`, so equality is valid.
+#[test]
+fn test_create_succeeds_at_max_invoice_lifetime() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let now = env.ledger().timestamp();
+    let due_date = now + MAX_INVOICE_LIFETIME_SECONDS;
+
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Created);
+    assert_eq!(invoice.due_date, due_date);
+    assert_eq!(invoice.created_at, now);
+}
+
+// One second past the maximum lifetime is rejected with InvalidDueDate (#7).
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_fails_one_second_past_max_invoice_lifetime() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let due_date = env.ledger().timestamp() + MAX_INVOICE_LIFETIME_SECONDS + 1;
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+}
+
+// A far-future due date (u64::MAX) from a normal ledger time is rejected by
+// the lifetime cap, not silently accepted or truncated.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_fails_far_future_due_date() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &u64::MAX, &usdc);
+}
+
+// When `now + MAX_INVOICE_LIFETIME_SECONDS` would overflow u64, the contract
+// panics with MathOverflow (#15) instead of wrapping.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_create_fails_when_lifetime_addition_overflows() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(u64::MAX - 1);
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &u64::MAX, &usdc);
+}
+
+// Normal success case: a due date comfortably inside the lifetime succeeds.
+#[test]
+fn test_create_succeeds_with_normal_due_date() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Created);
+    assert_eq!(invoice.due_date, due_date);
 }
 
 #[test]
@@ -2533,6 +2599,114 @@ fn test_expire_listing_one_second_before_boundary_panics() {
     client.expire_listing(&invoice_id, &issuer);
 }
 
+/// Same-ledger race at the exact expiry deadline: expiry is inclusive, so
+/// `expire_listing` wins even though it was submitted first, and funding then
+/// observes `Expired` and fails without writing funding state.
+#[test]
+fn test_same_ledger_expire_then_fund_at_deadline_expire_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline);
+
+    assert!(client.expire_listing(&invoice_id, &issuer));
+    assert!(client
+        .try_mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT)
+        .is_err());
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Expired);
+    assert_eq!(invoice.funded_amount, 0);
+    assert_eq!(invoice.funded_at, None);
+    assert_eq!(invoice.funding_pool, None);
+}
+
+/// Same-ledger race at the exact expiry deadline with funding submitted first:
+/// funding still fails because the deadline is inclusive, then expiry succeeds.
+#[test]
+fn test_same_ledger_fund_then_expire_at_deadline_expire_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline);
+
+    assert!(client
+        .try_mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT)
+        .is_err());
+    assert!(client.expire_listing(&invoice_id, &issuer));
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Expired);
+    assert_eq!(invoice.funded_amount, 0);
+    assert_eq!(invoice.funded_at, None);
+    assert_eq!(invoice.funding_pool, None);
+}
+
+/// One tick before expiry, the listing is still fundable: expire-then-fund
+/// leaves the invoice `Funded` because expiry failed with `ListingNotExpired`.
+#[test]
+fn test_same_ledger_expire_then_fund_before_deadline_fund_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline - 1);
+
+    assert!(client.try_expire_listing(&invoice_id, &issuer).is_err());
+    assert!(client.mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT));
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Funded);
+    assert_eq!(invoice.funded_at, Some(deadline - 1));
+    assert_eq!(invoice.funding_pool, Some(pool));
+}
+
+/// One tick before expiry with funding submitted first: funding wins and the
+/// later expiry observes `Funded`, fails, and does not overwrite funding state.
+#[test]
+fn test_same_ledger_fund_then_expire_before_deadline_fund_wins() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&100);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+    let deadline = client.get(&invoice_id).listed_at.unwrap() + 100;
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    env.ledger().set_timestamp(deadline - 1);
+
+    assert!(client.mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT));
+    assert!(client.try_expire_listing(&invoice_id, &issuer).is_err());
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Funded);
+    assert_eq!(invoice.funded_amount, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(invoice.funded_at, Some(deadline - 1));
+    assert_eq!(invoice.funding_pool, Some(pool));
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #18)")]
 fn test_set_expiry_window_rejects_out_of_bounds() {
@@ -2915,6 +3089,154 @@ fn test_invoice_ids_unique_for_different_face_values() {
     let id2 = client.create(&issuer, &buyer, &2_000_000_000, &due_date, &usdc);
 
     assert_ne!(id1, id2);
+}
+
+// ============== Duplicate-terms warning key ==============
+//
+// `duplicate_terms_key` is an advisory digest for off-chain indexers. It must
+// be stable for identical issuer/buyer/terms, change when any field changes,
+// and never act as an on-chain uniqueness constraint.
+
+#[test]
+fn test_duplicate_terms_key_is_deterministic() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let key1 = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let key2 = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    assert_eq!(key1, key2);
+
+    // The key purposely does not depend on ledger time.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + DEFAULT_DUE_OFFSET);
+    let key_later =
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_eq!(key1, key_later);
+}
+
+#[test]
+fn test_duplicate_terms_key_changes_with_each_field() {
+    let (env, client, issuer, buyer, registry, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let base = client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let other_issuer = Address::generate(&env);
+    registry.register(&other_issuer);
+    let other_buyer = Address::generate(&env);
+    registry.register(&other_buyer);
+    let other_asset = env.register_contract(None, MockToken);
+
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&other_issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &other_buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &buyer, &2_000_000_000, &due_date, &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &(due_date + 1), &usdc)
+    );
+    assert_ne!(
+        base,
+        client.duplicate_terms_key(
+            &issuer,
+            &buyer,
+            &DEFAULT_FACE_VALUE,
+            &due_date,
+            &other_asset
+        )
+    );
+}
+
+#[test]
+fn test_duplicate_terms_key_matches_real_invoice_and_does_not_block_create() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    // Querying before creation is allowed and needs no initialization state.
+    let key_before =
+        client.duplicate_terms_key(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    // Two invoices with identical commercial terms are still both created;
+    // the key is advisory and is not asserted as a uniqueness constraint.
+    let id1 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    let id2 = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    assert_ne!(id1, id2);
+    assert_eq!(client.get_status(&id1), InvoiceStatus::Created as u32);
+    assert_eq!(client.get_status(&id2), InvoiceStatus::Created as u32);
+
+    // Recomputing from the persisted invoice terms yields the same key, and
+    // it differs from the counter-based invoice ID.
+    let inv = client.get(&id1);
+    let key_after = client.duplicate_terms_key(
+        &inv.issuer,
+        &inv.buyer,
+        &inv.face_value,
+        &inv.due_date,
+        &inv.funding_asset,
+    );
+    assert_eq!(key_before, key_after);
+    assert_ne!(key_after, inv.id);
+
+    let inv2 = client.get(&id2);
+    assert_eq!(
+        key_after,
+        client.duplicate_terms_key(
+            &inv2.issuer,
+            &inv2.buyer,
+            &inv2.face_value,
+            &inv2.due_date,
+            &inv2.funding_asset,
+        )
+    );
+}
+
+#[test]
+fn test_duplicate_terms_key_boundary_values() {
+    let (_env, client, issuer, buyer, _, usdc) = setup();
+
+    // Smallest accepted face value and the maximum create accepts.
+    let min_key = client.duplicate_terms_key(&issuer, &buyer, &1, &0, &usdc);
+    let max_key = client.duplicate_terms_key(&issuer, &buyer, &MAX_FACE_VALUE, &u64::MAX, &usdc);
+    assert_ne!(min_key, max_key);
+
+    // Same boundary inputs remain stable.
+    assert_eq!(
+        max_key,
+        client.duplicate_terms_key(&issuer, &buyer, &MAX_FACE_VALUE, &u64::MAX, &usdc)
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_duplicate_terms_key_rejects_self_invoicing() {
+    let (env, client, issuer, _, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    client.duplicate_terms_key(&issuer, &issuer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_duplicate_terms_key_rejects_zero_face_value() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    client.duplicate_terms_key(&issuer, &buyer, &0, &due_date, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_duplicate_terms_key_rejects_face_value_above_max() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let above_max = MAX_FACE_VALUE.checked_add(1).unwrap();
+    client.duplicate_terms_key(&issuer, &buyer, &above_max, &due_date, &usdc);
 }
 
 // ── Issue #196: repay from Funded, Active, or Confirmed ─────────────────────────
@@ -4645,6 +4967,99 @@ fn test_repay_early_reads_stored_funded_amount() {
     assert_eq!(inv.status, InvoiceStatus::Repaid);
     assert_eq!(inv.repaid_amount, face_value);
     assert_eq!(inv.remaining_balance, 0);
+}
+
+// ============== EARLY-REPAYMENT DISCOUNT ROUNDING (issue #26) ==============
+//
+// Protocol decision: the pool's time-proportional discount is
+// `floor(discount * elapsed / term)` (rounded down to the stroop). The buyer
+// keeps the unearned remainder, so its net repayment is
+// `face_value - refund_to_buyer = funded_amount + earned_by_pool`.
+
+#[test]
+fn test_repay_early_zero_discount_refunds_nothing() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let face_value: u128 = DEFAULT_FACE_VALUE;
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &face_value, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &0);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &face_value);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+
+    env.ledger().set_timestamp(due_date / 2);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(MockPoolClient::new(&env, &pool).get_last_refund(), 0);
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), 0);
+}
+
+#[test]
+fn test_repay_early_non_divisible_rounds_pool_discount_down() {
+    let (env, client, buyer, invoice_id, pool, _) = setup_confirmed_invoice();
+    // face = 1_000_000_000, 200 bps -> discount = 20_000_000, term = 86_400s.
+    // elapsed = 1s: 20_000_000 / 86_400 = 231.48 -> floor = 231.
+    let face_value: u128 = DEFAULT_FACE_VALUE;
+    let expected_earned: u128 = 231;
+    let expected_refund: u128 = 20_000_000 - expected_earned;
+
+    let usdc = client.get(&invoice_id).funding_asset;
+    env.ledger().set_timestamp(1);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(
+        MockPoolClient::new(&env, &pool).get_last_refund(),
+        expected_refund
+    );
+
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), expected_refund as i128);
+    assert_eq!(face_value - expected_refund, 980_000_000 + expected_earned);
+}
+
+#[test]
+fn test_repay_early_max_valid_discount_rounds_down() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let face_value: u128 = 1_000_000_000;
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &face_value, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    // 5000 bps is the maximum accepted listing discount.
+    client.list_for_financing(&invoice_id, &5000);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &500_000_000);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+
+    // discount = 500_000_000; at elapsed = 1s over an 86_400s term:
+    // 500_000_000 / 86_400 = 5787.03 -> floor = 5787.
+    let expected_earned: u128 = 5787;
+    let expected_refund: u128 = 500_000_000 - expected_earned;
+    env.ledger().set_timestamp(1);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(
+        MockPoolClient::new(&env, &pool).get_last_refund(),
+        expected_refund
+    );
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), expected_refund as i128);
 }
 
 // ── Issue #872: expire_listing issuer path with explicit auth ────────────────

@@ -666,6 +666,8 @@ Emitted when the escrow's admin-gated emergency circuit breaker is disengaged.
 **Contract:** `registry_contract`  
 **Source:** `contracts/registry/src/events.rs`
 
+Verification events (`profile_verified`, `address_revoked`, `address_reinstated`) index the profile's `Role` (`Issuer` or `Buyer`, from `contracts/registry/src/types.rs`) as `topic[2]`.
+
 Registry events publish addresses and status changes, but they do not carry
 profile metadata. That is not a confidentiality guarantee: metadata is public
 through `get_profile`, storage reads, and the transaction arguments of the
@@ -741,7 +743,12 @@ Emitted when an address is revoked (issuer or buyer).
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"address_revoked"` |
 | `topic[1]` | `Address` | Revoked address |
+| `topic[2]` | `Role` | Profile role (`Issuer` or `Buyer`) |
 | **Data** | `RevocationReason` (`u32`) | Machine-readable reason code (see below) |
+
+**ABI note:** The profile `Role` is indexed as `topic[2]`, while the stable
+revocation reason is encoded in event data. Consumers using the first two
+topics remain compatible.
 
 **Emitted by:** `revoke()` (defaults to `Unspecified`) and
 `revoke_with_reason()` in `contracts/registry/src/lib.rs`.
@@ -782,9 +789,12 @@ Emitted when a previously revoked address is reinstated.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"address_reinstated"` |
 | `topic[1]` | `Address` | Reinstated address |
+| `topic[2]` | `Role` | Profile role (`Issuer` or `Buyer`) |
 | **Data** | `()` | None |
 
-**Emitted by:** `reinstate()` in `contracts/registry/src/lib.rs:546`
+**ABI note:** `Role` was added as an indexed `topic[2]`; `topic[0]`, `topic[1]` and the empty data payload are unchanged.
+
+**Emitted by:** `reinstate()` in `contracts/registry/src/lib.rs:689`
 
 ---
 
@@ -811,9 +821,12 @@ Emitted when a profile's verification status is checked/updated.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"profile_verified"` |
 | `topic[1]` | `Address` | Profile address |
+| `topic[2]` | `Role` | Profile role (`Issuer` or `Buyer`) |
 | **Data** | `bool` | Verification status (true = verified) |
 
-**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs:570`
+**ABI note:** `Role` was added as an indexed `topic[2]`; `topic[0]`, `topic[1]` and the `bool` data payload are unchanged. The authorizing admin planned in PR #165 should be appended after the role (for example, as `topic[3]`) rather than reordering the existing topics or changing the data payload, so both changes remain additive and merge cleanly.
+
+**Emitted by:** `verify_profile()` in `contracts/registry/src/lib.rs:711`
 
 ---
 

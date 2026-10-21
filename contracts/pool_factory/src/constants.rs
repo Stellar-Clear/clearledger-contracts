@@ -1,6 +1,21 @@
 pub const TTL_THRESHOLD: u32 = clearledger_ttl::THRESHOLD;
 pub const TTL_EXTEND_TO: u32 = clearledger_ttl::EXTEND_TO;
 
+/// Maximum number of assets a single [`get_assets_page`] call may return.
+///
+/// The asset index lives in instance storage, so an unbounded read hydrates
+/// every registered asset in one invocation and its cost grows with the
+/// registry. `50` mirrors the workspace's other batch ceilings (invoice
+/// `MAX_PAGE_SIZE`, escrow `MAX_HISTORY_LIMIT`), keeping each page within a
+/// predictable Soroban resource budget.
+///
+/// Requests with `limit == 0` or `limit > MAX_ASSET_PAGE_LIMIT` panic with
+/// [`PoolFactoryError::InvalidLimit`](crate::PoolFactoryError::InvalidLimit).
+///
+/// [`get_assets_page`]: crate::PoolFactoryContract::get_assets_page
+pub const MAX_ASSET_PAGE_LIMIT: u32 = 50;
+
+
 /// Maximum number of registered assets one [`get_aggregate_stats_page`] call
 /// may walk (and therefore at most that many pool `get_stats` cross-contract
 /// calls).

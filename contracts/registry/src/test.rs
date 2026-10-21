@@ -3,7 +3,7 @@
 extern crate std;
 
 use crate::{
-    DataKey, Profile, RegistryContract, RegistryContractClient, RevocationReason, Role,
+    DataKey, Profile, RegistryContract, RegistryContractClient, RegistryError, RevocationReason, Role,
     VerificationStatus, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 use proptest::prelude::*;
@@ -14,7 +14,7 @@ use soroban_sdk::{
         storage::{Instance as _, Persistent as _},
         Address as _, Events as _, Ledger,
     },
-    vec, Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
+    vec, Address, Env, Error, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
 };
 
 fn setup() -> (Env, RegistryContractClient<'static>) {
@@ -23,6 +23,33 @@ fn setup() -> (Env, RegistryContractClient<'static>) {
     let contract_id = env.register_contract(None, RegistryContract);
     let client = RegistryContractClient::new(&env, &contract_id);
     (env, client)
+}
+
+/// Asserts the last emitted event has the `(name, address, role)` topic shape
+/// used by the registry verification events.
+fn assert_last_event_role(
+    env: &Env,
+    client: &RegistryContractClient<'_>,
+    name: &str,
+    address: &Address,
+    role: Role,
+) {
+    let events = env.events().all();
+    let (contract, topics, _data) = events.get(events.len() - 1).unwrap();
+    assert_eq!(contract, client.address);
+    assert_eq!(topics.len(), 3);
+    assert_eq!(
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(env, name)
+    );
+    assert_eq!(
+        Address::try_from_val(env, &topics.get(1).unwrap()).unwrap(),
+        address.clone()
+    );
+    assert_eq!(
+        Role::try_from_val(env, &topics.get(2).unwrap()).unwrap(),
+        role
+    );
 }
 
 #[test]
@@ -304,17 +331,20 @@ fn test_reinstate_restores_verified_and_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "profile_verified"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 true.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 RevocationReason::Unspecified.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_reinstated"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "address_reinstated"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 ().into_val(&env),
             ),
         ]
@@ -1137,6 +1167,61 @@ fn test_verify_profile_updates_status() {
 }
 
 #[test]
+fn test_verify_profile_event_includes_issuer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+
+    assert_last_event_role(&env, &client, "profile_verified", &issuer, Role::Issuer);
+
+    // The data payload remains the bool verification status.
+    let events = env.events().all();
+    let (_, _, data) = events.get(events.len() - 1).unwrap();
+    assert!(bool::try_from_val(&env, &data).unwrap());
+}
+
+#[test]
+fn test_verify_profile_event_includes_buyer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let buyer = Address::generate(&env);
+    client.register_buyer(&buyer, &map![&env]);
+    client.verify_profile(&buyer, &true);
+
+    assert_last_event_role(&env, &client, "profile_verified", &buyer, Role::Buyer);
+
+    let events = env.events().all();
+    let (_, _, data) = events.get(events.len() - 1).unwrap();
+    assert!(bool::try_from_val(&env, &data).unwrap());
+}
+
+#[test]
+fn test_revoke_and_reinstate_events_include_buyer_role() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let buyer = Address::generate(&env);
+    client.register_buyer(&buyer, &map![&env]);
+    client.verify_profile(&buyer, &true);
+
+    client.revoke(&buyer);
+    assert_last_event_role(&env, &client, "address_revoked", &buyer, Role::Buyer);
+
+    client.reinstate(&buyer);
+    assert_last_event_role(
+        &env,
+        &client,
+        "address_reinstated",
+        &buyer,
+        Role::Buyer,
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #3)")]
 fn test_verify_profile_unknown_panics() {
     let (env, client) = setup();
@@ -1874,12 +1959,14 @@ fn test_revoke_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "profile_verified"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 true.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env),
+                (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer)
+                    .into_val(&env),
                 RevocationReason::Unspecified.into_val(&env),
             ),
         ]
@@ -1902,7 +1989,7 @@ fn test_revoke_with_reason_emits_explicit_reason_code() {
     let event = events.last().unwrap();
     assert_eq!(
         event.1,
-        (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env)
+        (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer).into_val(&env)
     );
     assert_eq!(event.2, RevocationReason::Fraud.into_val(&env));
     assert_eq!(event.2, 2u32.into_val(&env));
@@ -2653,6 +2740,240 @@ fn test_pause_is_scoped_to_one_instance() {
     assert!(b.register_issuer(&issuer, &map![&env]));
 }
 
+const ENUMERATION_POOL_SIZE: usize = 10;
+const ENUMERATION_MAX_OPS: usize = 24;
+
+const OP_REGISTER: u8 = 0;
+const OP_DUPLICATE: u8 = 1;
+const OP_BATCH: u8 = 2;
+const OP_REVOKE: u8 = 3;
+const OP_REINSTATE: u8 = 4;
+
+type EnumerationOpPlan = std::vec::Vec<(u8, usize, usize, usize)>;
+
+fn enumeration_op_plan() -> impl Strategy<Value = EnumerationOpPlan> {
+    prop::collection::vec(
+        (
+            0u8..5,
+            0usize..ENUMERATION_POOL_SIZE,
+            0usize..ENUMERATION_POOL_SIZE,
+            0usize..ENUMERATION_POOL_SIZE,
+        ),
+        1..=ENUMERATION_MAX_OPS,
+    )
+}
+
+fn register_for_role(
+    env: &Env,
+    client: &RegistryContractClient<'static>,
+    is_buyer: bool,
+    address: &Address,
+) {
+    if is_buyer {
+        client.register_buyer(address, &map![env]);
+    } else {
+        client.register_issuer(address, &map![env]);
+    }
+}
+
+fn batch_register_for_role(
+    client: &RegistryContractClient<'static>,
+    is_buyer: bool,
+    entries: &Vec<(Address, soroban_sdk::Map<String, String>)>,
+) -> Vec<Address> {
+    if is_buyer {
+        client.batch_register_buyers(entries)
+    } else {
+        client.batch_register_issuers(entries)
+    }
+}
+
+fn contract_error(code: u32) -> Result<Error, soroban_sdk::InvokeError> {
+    Ok(Error::from_contract_error(code))
+}
+
+fn assert_duplicate_register_rejected(
+    env: &Env,
+    client: &RegistryContractClient<'static>,
+    is_buyer: bool,
+    address: &Address,
+) {
+    let result = if is_buyer {
+        client.try_register_buyer(address, &map![env])
+    } else {
+        client.try_register_issuer(address, &map![env])
+    };
+    assert_eq!(result.unwrap_err(), contract_error(RegistryError::AlreadyRegistered as u32));
+}
+
+fn assert_enumeration_matches(
+    client: &RegistryContractClient<'static>,
+    role: &Role,
+    expected: &[Address],
+    page_size: u32,
+) {
+    assert!((1u32..=50).contains(&page_size));
+    let count = expected.len() as u32;
+    let mut start: u32 = 0;
+    let mut seen: usize = 0;
+    loop {
+        let page = client.list_profiles(role, &start, &page_size);
+        assert!(page.len() <= page_size);
+        assert_eq!(page, client.list_profiles(role, &start, &page_size));
+        let expected_len = (count.saturating_sub(start) as usize).min(page_size as usize);
+        assert_eq!(page.len() as usize, expected_len);
+        for i in 0..page.len() {
+            assert_eq!(page.get(i).unwrap(), expected[seen]);
+            seen += 1;
+        }
+
+        start = start.saturating_add(page_size);
+        if page.len() < page_size {
+            break;
+        }
+    }
+    assert_eq!(seen, expected.len());
+}
+
+fn run_enumeration_prop_test(is_buyer: bool) {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(
+            &(enumeration_op_plan(), 1u32..=50, 1u32..=50),
+            |(ops, page_size_a, page_size_b)| {
+                let (env, client) = setup();
+                let admin = Address::generate(&env);
+                client.initialize(&admin);
+                let role = if is_buyer { Role::Buyer } else { Role::Issuer };
+
+                let addresses: std::vec::Vec<Address> = (0..ENUMERATION_POOL_SIZE)
+                    .map(|_| Address::generate(&env))
+                    .collect();
+
+                let mut registered = std::vec![false; ENUMERATION_POOL_SIZE];
+                let mut expected: std::vec::Vec<Address> = std::vec::Vec::new();
+
+                for &(action, a, b, c) in ops.iter() {
+                    match action {
+                        OP_REGISTER => {
+                            let address = addresses[a].clone();
+                            if registered[a] {
+                                assert_duplicate_register_rejected(
+                                    &env,
+                                    &client,
+                                    is_buyer,
+                                    &address,
+                                );
+                            } else {
+                                register_for_role(&env, &client, is_buyer, &address);
+                                registered[a] = true;
+                                expected.push(address);
+                            }
+                        }
+                        OP_DUPLICATE => {
+                            let address = addresses[a].clone();
+                            if !registered[a] {
+                                register_for_role(&env, &client, is_buyer, &address);
+                                registered[a] = true;
+                                expected.push(address.clone());
+                            }
+                            assert_duplicate_register_rejected(&env, &client, is_buyer, &address);
+                        }
+                        OP_BATCH => {
+                            let indices = [a, b, c];
+                            let mut entries = Vec::new(&env);
+                            for index in indices.iter() {
+                                entries.push_back((addresses[*index].clone(), map![&env]));
+                            }
+                            let skipped = batch_register_for_role(&client, is_buyer, &entries);
+
+                            let mut seen_in_batch = std::collections::BTreeSet::new();
+                            let mut expected_skipped = Vec::new(&env);
+                            for index in indices.iter() {
+                                if registered[*index] || seen_in_batch.contains(index) {
+                                    expected_skipped.push_back(addresses[*index].clone());
+                                } else {
+                                    seen_in_batch.insert(*index);
+                                    registered[*index] = true;
+                                    expected.push(addresses[*index].clone());
+                                }
+                            }
+                            assert_eq!(skipped, expected_skipped);
+                        }
+                        OP_REVOKE => {
+                            let address = addresses[a].clone();
+                            if registered[a] {
+                                client.verify_profile(&address, &true);
+                                client.revoke(&address);
+                                assert!(!client.is_verified(&address));
+                                assert_eq!(
+                                    client.get_verification_status(&address),
+                                    VerificationStatus::Revoked
+                                );
+                                assert_eq!(client.get_profile_count(&role), expected.len() as u32);
+                            } else {
+                                assert_eq!(
+                                    client.try_revoke(&address).unwrap_err(),
+                                    contract_error(RegistryError::NotFound as u32)
+                                );
+                            }
+                        }
+                        OP_REINSTATE => {
+                            let address = addresses[a].clone();
+                            if registered[a] {
+                                client.reinstate(&address);
+                                assert_eq!(
+                                    client.get_verification_status(&address),
+                                    VerificationStatus::Verified
+                                );
+                            } else {
+                                assert_eq!(
+                                    client.try_reinstate(&address).unwrap_err(),
+                                    contract_error(RegistryError::NotFound as u32)
+                                );
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                assert_eq!(client.get_profile_count(&role), expected.len() as u32);
+
+                assert_enumeration_matches(&client, &role, &expected, 1);
+                assert_enumeration_matches(&client, &role, &expected, 50);
+                assert_enumeration_matches(&client, &role, &expected, page_size_a);
+                assert_enumeration_matches(&client, &role, &expected, page_size_b);
+
+                assert_eq!(client.list_profiles(&role, &0, &0).len(), 0);
+                assert_eq!(
+                    client.list_profiles(&role, &(expected.len() as u32 + 1), &25).len(),
+                    0
+                );
+                assert_eq!(client.list_profiles(&role, &u32::MAX, &50).len(), 0);
+
+                for invalid_limit in [51u32, 100, u32::MAX] {
+                    assert_eq!(
+                        client.try_list_profiles(&role, &0, &invalid_limit).unwrap_err(),
+                        contract_error(RegistryError::PageSizeExceeded as u32)
+                    );
+                }
+
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn prop_issuer_enumeration_unique_stable_and_registration_ordered() {
+    run_enumeration_prop_test(false);
+}
+
+#[test]
+fn prop_buyer_enumeration_unique_stable_and_registration_ordered() {
+    run_enumeration_prop_test(true);
+}
+
 fn persistent_ttl(env: &Env, contract_id: &Address, key: &DataKey) -> u32 {
     env.as_contract(contract_id, || env.storage().persistent().get_ttl(key))
 }
@@ -2777,4 +3098,358 @@ fn test_list_profiles_ttl_extension_at_threshold_boundaries() {
     assert!(index_extended > index_just_after);
     assert!(index_extended >= 1_999_000);
     assert!(count_extended >= 1_999_000);
+}
+
+// ============== ISSUE #14: NEGATIVE AUTHORIZATION COVERAGE ==============
+//
+// Every admin entry point must reject a caller that is not the stored admin,
+// and must reject calls with no authorization at all. These tests pin both
+// cases with explicit auth mocks and assert that a rejected call leaves the
+// stored state untouched.
+
+/// Installs exactly one mocked authorization for `signer` invoking
+/// `contract.fn_name` with `args`. Any other auth is unavailable, so calls
+/// that check `require_auth` on a different address fail.
+fn mock_single_auth(
+    env: &Env,
+    signer: &Address,
+    contract: &Address,
+    fn_name: &str,
+    args: Vec<Val>,
+) {
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: signer,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract,
+            fn_name,
+            args,
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+#[test]
+fn test_verify_profile_true_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "verify_profile",
+        (issuer.clone(), true).into_val(&env),
+    );
+
+    assert!(client.try_verify_profile(&issuer, &true).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Pending
+    );
+}
+
+#[test]
+fn test_verify_profile_false_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "verify_profile",
+        (issuer.clone(), false).into_val(&env),
+    );
+
+    // A non-admin cannot un-verify a profile either.
+    assert!(client.try_verify_profile(&issuer, &false).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Verified
+    );
+}
+
+#[test]
+fn test_verify_profile_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    env.set_auths(&[]);
+    assert!(client.try_verify_profile(&issuer, &true).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Pending
+    );
+}
+
+#[test]
+fn test_revoke_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "revoke",
+        (issuer.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_revoke(&issuer).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Verified
+    );
+}
+
+#[test]
+fn test_revoke_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    env.set_auths(&[]);
+    assert!(client.try_revoke(&issuer).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(client.is_verified(&issuer));
+}
+
+#[test]
+fn test_reinstate_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+    client.revoke(&issuer);
+    let flags_before = client.get_profile(&issuer).packed_flags;
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "reinstate",
+        (issuer.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_reinstate(&issuer).is_err());
+    assert_eq!(client.get_profile(&issuer).packed_flags, flags_before);
+    assert!(!client.is_verified(&issuer));
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Revoked
+    );
+}
+
+#[test]
+fn test_batch_register_issuers_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let entries = vec![&env, (first.clone(), map![&env]), (second.clone(), map![&env])];
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "batch_register_issuers",
+        (entries.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_batch_register_issuers(&entries).is_err());
+    assert_eq!(client.get_profile_count(&Role::Issuer), 0);
+    assert_eq!(
+        client.get_verification_status(&first),
+        VerificationStatus::Unregistered
+    );
+    assert_eq!(
+        client.get_verification_status(&second),
+        VerificationStatus::Unregistered
+    );
+}
+
+#[test]
+fn test_batch_register_buyers_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let entries = vec![&env, (first.clone(), map![&env]), (second.clone(), map![&env])];
+
+    let non_admin = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "batch_register_buyers",
+        (entries.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_batch_register_buyers(&entries).is_err());
+    assert_eq!(client.get_profile_count(&Role::Buyer), 0);
+    assert_eq!(
+        client.get_verification_status(&first),
+        VerificationStatus::Unregistered
+    );
+    assert_eq!(
+        client.get_verification_status(&second),
+        VerificationStatus::Unregistered
+    );
+}
+
+#[test]
+fn test_batch_registration_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    let issuer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let issuer_entries = vec![&env, (issuer.clone(), map![&env])];
+    let buyer_entries = vec![&env, (buyer.clone(), map![&env])];
+
+    env.set_auths(&[]);
+    assert!(client.try_batch_register_issuers(&issuer_entries).is_err());
+    assert!(client.try_batch_register_buyers(&buyer_entries).is_err());
+
+    assert_eq!(client.get_profile_count(&Role::Issuer), 0);
+    assert_eq!(client.get_profile_count(&Role::Buyer), 0);
+    assert_eq!(
+        client.get_verification_status(&issuer),
+        VerificationStatus::Unregistered
+    );
+    assert_eq!(
+        client.get_verification_status(&buyer),
+        VerificationStatus::Unregistered
+    );
+}
+
+#[test]
+fn test_pause_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+
+    env.set_auths(&[]);
+    assert!(client.try_pause().is_err());
+
+    // Still live after the rejected pause.
+    env.mock_all_auths();
+    assert!(client.register_issuer(&Address::generate(&env), &map![&env]));
+}
+
+#[test]
+fn test_unpause_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    client.initialize(&Address::generate(&env));
+    client.pause();
+
+    env.set_auths(&[]);
+    assert!(client.try_unpause().is_err());
+
+    // Still paused after the rejected unpause.
+    env.mock_all_auths();
+    assert!(client
+        .try_register_issuer(&Address::generate(&env), &map![&env])
+        .is_err());
+
+    // The real admin can still resume it.
+    client.unpause();
+    assert!(client.register_issuer(&Address::generate(&env), &map![&env]));
+}
+
+#[test]
+fn test_transfer_ownership_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "transfer_ownership",
+        (new_admin.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_transfer_ownership_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+
+    env.set_auths(&[]);
+    assert!(client.try_transfer_ownership(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_transfer_admin_non_admin_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+
+    mock_single_auth(
+        &env,
+        &non_admin,
+        &client.address,
+        "transfer_admin",
+        (new_admin.clone(),).into_val(&env),
+    );
+
+    assert!(client.try_transfer_admin(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_transfer_admin_missing_auth_rejected_and_state_unchanged() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let new_admin = Address::generate(&env);
+
+    env.set_auths(&[]);
+    assert!(client.try_transfer_admin(&new_admin).is_err());
+    assert_eq!(client.get_admin(), admin);
 }

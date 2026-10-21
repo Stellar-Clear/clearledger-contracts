@@ -37,11 +37,14 @@ pub enum InvoiceError {
     /// [`MAX_BATCH_SIZE`](crate::MAX_BATCH_SIZE), which would defeat the
     /// per-call cost bound batching exists to provide.
     BatchSizeExceeded = 28,
-    // Discriminants 29 and 30 are reserved for issue #83. New variants must
-    // be allocated at 31 or above so they do not collide with that work.
+    // Discriminants 29 and 30 are reserved for issue #83.
     /// `get_funded_amount` was called for an invoice that exists but has not
     /// been funded yet. The committed amount is only meaningful once
     /// `mark_funded` has recorded it, so callers get a distinct error instead
     /// of a `0` that is indistinguishable from a real commitment.
     NotFunded = 31,
+    /// Funding was attempted at or after the listing's expiry deadline.
+    /// Expiry is time-based, so it takes effect even if `expire_listing` has
+    /// not been called yet in this ledger.
+    ListingExpired = 32,
 }

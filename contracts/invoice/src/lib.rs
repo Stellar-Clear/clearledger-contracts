@@ -39,6 +39,14 @@ pub const MAX_INVOICE_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 /// against an unrelated contract or message format.
 pub const ATTESTATION_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceAttest.v1____";
 
+/// Fixed 32-byte domain separator prefixed to the [`InvoiceContract::duplicate_terms_key`]
+/// digest input.
+///
+/// Binding the digest to this scheme prevents it from colliding with any other
+/// hash computed over an invoice's terms (for example the counter-based
+/// [`Invoice::id`]) and makes the `v1` composition explicit and upgradeable.
+pub const DUPLICATE_TERMS_DOMAIN_SEPARATOR: [u8; 32] = *b"ClearLedger.InvoiceDupTerms.v1__";
+
 /// Maximum number of invoices a single paginated `get_by_*` query may return.
 ///
 /// Pagination exists to keep each read within the Soroban per-transaction
@@ -642,6 +650,100 @@ impl InvoiceContract {
             .instance()
             .get(&DataKey::SupportedAssetCount)
             .unwrap_or(0)
+    }
+
+    /// Returns a deterministic digest of an invoice's issuer, buyer, and
+    /// commercial terms, for off-chain duplicate warnings.
+    ///
+    /// This is an advisory, read-only key. It performs no storage reads, needs
+    /// no authorization, and does **not** reject or alter [`Self::create`]:
+    /// two invoices with identical terms still get distinct invoice IDs (the
+    /// generated ID includes the monotonically increasing counter) and are
+    /// both persisted. Indexers can compare this key across invoices and warn
+    /// about re-submitted commercial terms without treating the result as a
+    /// uniqueness constraint.
+    ///
+    /// # Digest composition (`v1`)
+    ///
+    /// The returned value is
+    /// `SHA-256(DUPLICATE_TERMS_DOMAIN_SEPARATOR || fields)`, where `fields`
+    /// is, in order:
+    ///
+    /// 1. `u32` big-endian length + canonical Soroban XDR encoding of `issuer`
+    /// 2. `u32` big-endian length + canonical Soroban XDR encoding of `buyer`
+    /// 3. `face_value` as 16-byte big-endian (USDC stroops, 7 decimals; never a
+    ///    float)
+    /// 4. `due_date` as 8-byte big-endian (Unix seconds from the Stellar
+    ///    ledger clock)
+    /// 5. `u32` big-endian length + canonical Soroban XDR encoding of
+    ///    `funding_asset`
+    ///
+    /// Length-prefixing the variable-width address encodings and fixing the
+    /// scalar widths makes the concatenation unambiguous. The domain
+    /// separator ([`DUPLICATE_TERMS_DOMAIN_SEPARATOR`]) keeps the digest
+    /// distinct from the invoice ID and any other hash scheme. The current
+    /// invoice model has no description or metadata fields, so none are
+    /// included; if those fields are added, this composition must be revised
+    /// and the domain separator version bumped.
+    ///
+    /// The digest deliberately does **not** validate `due_date` against the
+    /// current ledger time, so the same inputs always produce the same key
+    /// regardless of when it is queried. It is also independent of the
+    /// counter and of later mutable financing terms such as `discount_bps`, so
+    /// the key remains stable across the invoice lifecycle.
+    ///
+    /// # Off-chain usage
+    ///
+    /// Clients can query this method through a Soroban RPC read/simulation
+    /// against the deployed (Testnet) invoice contract, or reproduce the
+    /// composition locally from the fields returned by [`Self::get`]. Soroban
+    /// `Address` values are canonical XDR encodings of the Stellar StrKey
+    /// address bytes, and amounts must be passed in stroops at 7-decimal asset
+    /// precision.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `issuer` - The invoice issuer address.
+    /// * `buyer` - The invoice buyer address.
+    /// * `face_value` - The face value in USDC stroops.
+    /// * `due_date` - The due date as Unix seconds.
+    /// * `funding_asset` - The funding asset (token contract) address.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `InvoiceError::InvalidParticipants` if `issuer == buyer`, matching
+    ///   [`Self::create`]'s participant check.
+    /// * `InvoiceError::InvalidFaceValue` if `face_value` is zero.
+    /// * `InvoiceError::InvalidAmount` if `face_value` exceeds
+    ///   [`MAX_FACE_VALUE`].
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The deterministic duplicate-terms key.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let key = client.duplicate_terms_key(&issuer, &buyer, &1_000, &due, &usdc);
+    /// ```
+    pub fn duplicate_terms_key(
+        env: Env,
+        issuer: Address,
+        buyer: Address,
+        face_value: u128,
+        due_date: u64,
+        funding_asset: Address,
+    ) -> BytesN<32> {
+        if issuer == buyer {
+            panic_with_error!(&env, InvoiceError::InvalidParticipants);
+        }
+        if face_value == 0 {
+            panic_with_error!(&env, InvoiceError::InvalidFaceValue);
+        }
+        if face_value > MAX_FACE_VALUE {
+            panic_with_error!(&env, InvoiceError::InvalidAmount);
+        }
+        duplicate_terms_digest(&env, &issuer, &buyer, face_value, due_date, &funding_asset)
     }
 
     /// Creates a new invoice with the given issuer, buyer, and terms.
@@ -1335,9 +1437,21 @@ impl InvoiceContract {
     ///   address that can self-authorize could hijack an invoice's
     ///   `funding_pool` (issue #553).
     /// * `InvoiceError::InvalidStatusTransition` if invoice status is not `Listed`.
+    /// * `InvoiceError::ListingExpired` if `now >= listed_at + expiry_window`.
+    ///   A listing is no longer fundable from its expiry deadline onward, even
+    ///   when `expire_listing` has not been called yet.
     /// * `InvoiceError::UnsupportedAsset` if the asset does not match the invoice funding asset.
     /// * `InvoiceError::InvalidAmount` if `funded_amount` is zero or exceeds
     ///   the invoice's `face_value` (issue #554).
+    ///
+    /// # Same-ledger ordering
+    /// Funding and expiry are ordered by ledger time, not by submission order.
+    /// Before the deadline, funding wins: a same-ledger `expire_listing` sees
+    /// `Funded` and fails with `InvalidStatusTransition`. At or after the
+    /// deadline, expiry wins: funding fails with `ListingExpired` regardless
+    /// of whether `expire_listing` ran first. The first call that changes the
+    /// status wins; the second observes the new status and fails, leaving no
+    /// partial state.
     ///
     /// # Returns
     /// * `bool` - `true` when funding is recorded.
@@ -1384,6 +1498,19 @@ impl InvoiceContract {
             .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
         if invoice.status != InvoiceStatus::Listed {
             panic_with_error!(&env, InvoiceError::InvalidStatusTransition);
+        }
+        let expiry_window = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExpiryWindow)
+            .unwrap_or(7 * 24 * 60 * 60);
+        let deadline = invoice
+            .listed_at
+            .unwrap_or(0)
+            .checked_add(expiry_window)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
+        if env.ledger().timestamp() >= deadline {
+            panic_with_error!(&env, InvoiceError::ListingExpired);
         }
         if funded_amount > invoice.face_value {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
@@ -1576,6 +1703,16 @@ impl InvoiceContract {
     /// Once cumulative repayment equals `face_value`, the escrow releases the funds
     /// to the pool, the pool's repayment accounting is updated, the invoice transitions
     /// to `Repaid`, and `invoice_repaid` is emitted.
+    ///
+    /// # Early-repayment discount rounding (issue #26)
+    ///
+    /// The pool's time-proportional share of the discount is
+    /// `floor(discount * elapsed / term)`: it is rounded **down** to the whole
+    /// stroop. The buyer receives the remainder as a refund, so the buyer's net
+    /// repayment is `face_value - refund_to_buyer`, i.e.
+    /// `funded_amount + floor(discount * elapsed / term)`. Rounding in the
+    /// buyer's favour means the pool is never credited more discount than the
+    /// elapsed term justifies, and no stroop is manufactured by division.
     pub fn repay_partial(env: Env, invoice_id: BytesN<32>, amount: u128) -> bool {
         require_not_paused(&env);
         let inv_key = DataKey::Invoice(invoice_id.clone());
@@ -1646,19 +1783,16 @@ impl InvoiceContract {
                 .funded_at
                 .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
             let discount = face_value.saturating_sub(funded_amount);
-            let term = invoice.due_date.saturating_sub(funded_at);
-            let elapsed = now.saturating_sub(funded_at);
-            // Floor proportional discount accrual; the buyer receives the
-            // remainder so earned amount plus refund equals the full discount.
-            let earned_by_pool = if term == 0 {
-                discount
-            } else {
-                discount
-                    .checked_mul(elapsed as u128)
-                    .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow))
-                    / (term as u128)
-            };
-            let refund_to_buyer = discount.saturating_sub(earned_by_pool);
+            let earned_by_pool = Self::early_repayment_earned_discount(
+                &env,
+                discount,
+                funded_at,
+                invoice.due_date,
+                now,
+            );
+            let refund_to_buyer = discount
+                .checked_sub(earned_by_pool)
+                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
 
             // Step 2: escrow releases full face_value back to pool
             let mut escrow_args = Vec::new(&env);
@@ -1711,6 +1845,38 @@ impl InvoiceContract {
         Self::repay_partial(env, invoice_id, invoice.remaining_balance)
     }
 
+    /// Returns the discount the pool has earned by `now`, rounded down.
+    ///
+    /// Rule (issue #26): `earned = floor(discount * elapsed / term)`, where
+    /// `elapsed = now - funded_at` and `term = due_date - funded_at`, clamped
+    /// via saturating subtraction to non-negative values. `elapsed` is clamped
+    /// to `term`, so settlement after the due date still earns at most the
+    /// full discount and the buyer refund never underflows. Integer division
+    /// truncates toward zero, so the pool never earns a fractional stroop and
+    /// the unearned remainder is refunded to the buyer. When `term == 0` the
+    /// whole discount is earned (no time remains to pro-rate over).
+    ///
+    /// All multiplications are checked; overflow panics with
+    /// [`InvoiceError::MathOverflow`].
+    fn early_repayment_earned_discount(
+        env: &Env,
+        discount: u128,
+        funded_at: u64,
+        due_date: u64,
+        now: u64,
+    ) -> u128 {
+        let term = due_date.saturating_sub(funded_at);
+        if term == 0 {
+            return discount;
+        }
+        let elapsed = now.saturating_sub(funded_at).min(term);
+        discount
+            .checked_mul(elapsed as u128)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+            .checked_div(term as u128)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+    }
+
     /// Repays a confirmed invoice before its due date, returning the
     /// pro-rated discount to the buyer.
     ///
@@ -1721,6 +1887,14 @@ impl InvoiceContract {
     /// remaining discount is refunded back to the buyer. This function must
     /// be called before `due_date` — once the invoice is due, use
     /// [`Self::repay`] instead.
+    ///
+    /// # Rounding
+    ///
+    /// The pool's earned discount is `floor(discount * elapsed / term)`,
+    /// rounded **down** to the stroop (integer division truncates). The buyer
+    /// gets the remainder, so its net repayment is
+    /// `face_value - refund_to_buyer = funded_amount + earned_by_pool`.
+    /// See [`Self::early_repayment_earned_discount`].
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -1777,20 +1951,16 @@ impl InvoiceContract {
         }
 
         let _prev_status = invoice.status;
-        let term = invoice.due_date.saturating_sub(funded_at);
-        let elapsed = now.saturating_sub(funded_at);
-
-        // Floor proportional discount accrual; the buyer receives the
-        // remainder so earned amount plus refund equals the full discount.
-        let earned_by_pool = if term == 0 {
-            discount
-        } else {
-            discount
-                .checked_mul(elapsed as u128)
-                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow))
-                / (term as u128)
-        };
-        let refund_to_buyer = discount.saturating_sub(earned_by_pool);
+        let earned_by_pool = Self::early_repayment_earned_discount(
+            &env,
+            discount,
+            funded_at,
+            invoice.due_date,
+            now,
+        );
+        let refund_to_buyer = discount
+            .checked_sub(earned_by_pool)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
 
         let buyer = invoice.buyer.clone();
         let funding_asset = invoice.funding_asset.clone();
@@ -2085,6 +2255,15 @@ impl InvoiceContract {
     /// * `InvoiceError::NotAuthorized` if `caller` is neither the issuer nor the admin.
     /// * `InvoiceError::ListingNotExpired` if `now < listed_at + expiry_window`.
     /// * `InvoiceError::MathOverflow` if `listed_at + expiry_window` overflows.
+    ///
+    /// # Same-ledger ordering
+    /// The deadline is inclusive: at exactly `listed_at + expiry_window` the
+    /// listing is already expired. If `mark_funded` ran first in the same
+    /// ledger, this call sees `Funded` and fails with
+    /// `InvalidStatusTransition`; if it runs first, funding then fails with
+    /// `ListingExpired`. Before the deadline the reverse holds: funding wins
+    /// and this call fails with `ListingNotExpired`. In every ordering at most
+    /// one of the two calls mutates the listing.
     ///
     /// # Returns
     /// * `bool` - `true` when the listing is expired.
@@ -2968,6 +3147,54 @@ impl InvoiceContract {
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
     }
+}
+
+/// Appends a big-endian `u32` byte length followed by the bytes themselves.
+///
+/// Used by [`duplicate_terms_digest`] so variable-width XDR-encoded addresses
+/// cannot be confused with one another or with adjacent fixed-width fields.
+fn append_length_prefixed(input: &mut Bytes, value: &Bytes) {
+    for b in value.len().to_be_bytes() {
+        input.push_back(b);
+    }
+    for b in value.iter() {
+        input.push_back(b);
+    }
+}
+
+/// Builds the deterministic `v1` duplicate-terms digest documented on
+/// [`InvoiceContract::duplicate_terms_key`].
+///
+/// Kept separate from the public entry point so the composition can be
+/// exercised directly and reused if another view needs the same warning key.
+fn duplicate_terms_digest(
+    env: &Env,
+    issuer: &Address,
+    buyer: &Address,
+    face_value: u128,
+    due_date: u64,
+    funding_asset: &Address,
+) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    for b in DUPLICATE_TERMS_DOMAIN_SEPARATOR.iter() {
+        input.push_back(*b);
+    }
+
+    let issuer_xdr = issuer.clone().to_xdr(env);
+    let buyer_xdr = buyer.clone().to_xdr(env);
+    let asset_xdr = funding_asset.clone().to_xdr(env);
+
+    append_length_prefixed(&mut input, &issuer_xdr);
+    append_length_prefixed(&mut input, &buyer_xdr);
+    for b in face_value.to_be_bytes() {
+        input.push_back(b);
+    }
+    for b in due_date.to_be_bytes() {
+        input.push_back(b);
+    }
+    append_length_prefixed(&mut input, &asset_xdr);
+
+    env.crypto().sha256(&input).into()
 }
 
 /// Checks that an address is verified in the registry, panicking with the

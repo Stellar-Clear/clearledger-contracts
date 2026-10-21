@@ -39,6 +39,10 @@ pub struct Invoice {
     pub face_value: u128,
     /// Discount applied when the invoice is funded, in basis points
     /// (1 bp = 0.01%). Determines the yield to funders.
+    ///
+    /// On early repayment the pool earns only the time-proportional share,
+    /// `floor(discount * elapsed / term)`, rounded down to the stroop; the
+    /// unearned remainder is refunded to the buyer (issue #26).
     pub discount_bps: u32,
     /// Amount that has been funded against this invoice, in USDC stroops.
     ///
