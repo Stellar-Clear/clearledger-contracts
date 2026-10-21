@@ -292,6 +292,22 @@ fn test_late_invalid_batch_create_rolls_back_counter_indexes_and_events() {
     );
 }
 
+#[test]
+fn test_pool_rejects_invoice_funded_by_a_different_asset() {
+    let lifecycle = setup_fee_lifecycle();
+    let wrong_asset = lifecycle.env.register_contract(None, MockToken);
+    lifecycle.invoice.add_supported_asset(&wrong_asset);
+    let due = lifecycle.env.ledger().timestamp() + 30 * 86400;
+    let invoice_id = lifecycle.invoice.create(
+        &lifecycle.issuer, &lifecycle.buyer, &10_000_000_000u128, &due, &wrong_asset,
+    );
+    attest_invoice(&lifecycle.env, &lifecycle.invoice, &invoice_id);
+    lifecycle.invoice.list_for_financing(&invoice_id, &200);
+    assert!(lifecycle.pool.try_fund_invoice(&invoice_id).is_err());
+    assert_eq!(lifecycle.invoice.get_status(&invoice_id), InvoiceStatus::Listed as u32);
+    assert_eq!(lifecycle.invoice.get_funded_amount(&invoice_id), 0);
+}
+
 struct FeeSettlementExpectation {
     shares: u128,
     deposit: u128,
