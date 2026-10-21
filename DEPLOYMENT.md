@@ -16,6 +16,10 @@ smart contracts on Stellar.
 The repo ships `rust-toolchain.toml` pinning channel `1.85.0` and
 target `wasm32v1-none`. `rustup` picks it up automatically.
 
+For exact commands to build release WASM, compare local and deployed
+hashes, inspect contract specs, and run the tests, see the
+[WASM artifact contributor guide](docs/developer-guide/wasm-artifacts.md).
+
 ### Environment Variables
 
 Copy `.env.example` to `.env` and fill in:
@@ -26,6 +30,18 @@ Copy `.env.example` to `.env` and fill in:
 | `USDC_ISSUER` | Stellar address of the USDC issuer on testnet |
 | `XLM_ASSET` | XLM asset contract address (or native) - EXPERIMENTAL/INCOMPLETE |
 | `DEPLOY_XLM` | Set to `true` to opt in to experimental XLM contracts; defaults to the supported USDC workflow |
+
+### Signing-Key and Log Handling
+
+The scripts accept a Stellar CLI key alias in `DEPLOYER_ACCOUNT`; they do not
+accept or write secret seeds. Keep signing keys in the Stellar CLI key store,
+never in `.env`, deployment metadata, or command-line arguments. The Bash
+scripts use a restrictive `umask` for generated local state and neither script
+variant enables command tracing. On CLI deployment or initialization failures,
+raw CLI output is withheld because it can contain signed transaction material;
+the scripts print a safe failure summary instead. Do not enable PowerShell
+transcription or shell tracing in environments that capture private command
+input.
 
 ## Testnet Deployment
 
@@ -172,6 +188,77 @@ submit the initialization transaction with the configured threshold. Subsequent
 admin-only invocations, including contract upgrades, must likewise carry
 authorization satisfying the 3-of-5 threshold.
 
+## Testnet Pause and Recovery Runbook
+
+This procedure applies to the current Testnet deployment only. It is an
+operator response guide, not evidence of Mainnet readiness. The `pause` and
+`unpause` entry points are available on the registry, invoice, escrow, and pool
+contracts. Each contract has an independent pause flag; pausing one contract
+does not pause the others. Read-only methods remain available while paused,
+but guarded state changes fail with `ContractPaused`.
+
+The manual commands below use the contract IDs from `.env` (see
+`.env.example`) and the admin methods implemented in
+`contracts/{registry,invoice,escrow,pool}/src/lib.rs`. `scripts/deploy.sh`
+deploys contracts but does not provide an incident pause workflow.
+`.github/workflows/ci.yml` runs build and test jobs only; it does not deploy,
+pause, or resume contracts. An authorized Testnet operator must run this
+procedure.
+
+### Contain an Incident
+
+1. Confirm the affected contract IDs in `.env` and check their admins with the
+   existing read-only `get_admin` calls. Stop deploy/redeploy jobs while
+   investigating; do not use `--fresh` as an incident response.
+2. Use the configured admin signer (or the configured multi-sig threshold) to
+   pause the affected contracts. For a broad protocol incident, pause each
+   deployed pool first to stop new funding and LP activity, then pause the
+   invoice, escrow, and registry contracts as needed. The experimental XLM
+   contracts are optional and should only be included when deployed.
+
+   ```bash
+   stellar contract invoke --id "$POOL_USDC_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$POOL_XLM_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$INVOICE_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$ESCROW_USDC_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$ESCROW_XLM_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   stellar contract invoke --id "$REGISTRY_CONTRACT_ID" --source "$DEPLOYER_ACCOUNT" --network testnet -- pause
+   ```
+
+   Omit an optional ID when its contract is not deployed. The signer used by
+   `--source` must satisfy the contract admin's authorization policy; for a
+   multi-sig admin, submit with the required threshold rather than replacing
+   the admin with a single signer.
+
+3. Confirm each transaction succeeds and inspect that contract's events on
+   [Stellar Expert Testnet](https://stellar.expert/explorer/testnet) for the
+   `paused` event and its admin. The current contracts do not expose a
+   read-only pause-status method, so `get_admin`, `get_stats`, or `get_counts`
+   alone cannot confirm pause state. Use those existing views to capture
+   contract configuration and balances while investigating. Do not submit a
+   real state-changing transaction just to test whether a contract is paused.
+4. Record the incident time, affected contract IDs, transaction hashes,
+   observed event(s), relevant ledger/state observations, and the operator who
+   authorized the pause. Tell integrators that affected state-changing calls
+   will fail until the contracts are resumed.
+
+### Recover
+
+1. Resolve the underlying incident and verify the affected contract wiring and
+   state using the existing read-only queries in [Contract Verification](#contract-verification).
+   Check the relevant pool `get_stats`, invoice `get_counts`, escrow lock
+   records, and registry state before resuming. Re-running `scripts/verify.sh`
+   is an additional deployment/wiring check; it does not report pause state.
+2. Obtain the operator/multi-sig approval to resume, then call `unpause` on
+   each contract that was paused. Use the same contract IDs, network, admin
+   signer, and authorization threshold as for `pause`, replacing the final
+   `pause` argument with `unpause`.
+3. Confirm successful transaction inclusion and inspect each contract's
+   `unpaused` event on Stellar Expert Testnet. Start with a small, controlled
+   operation and monitor contract events and balances before restoring normal
+   traffic. Do not describe Testnet assets as having Mainnet or real-value
+   status.
+
 ## Agent Registry Wiring
 
 `AGENT_REGISTRY_CONTRACT` in `.env.example` refers to the agent-registry
@@ -223,13 +310,17 @@ Or on Windows (PowerShell):
 powershell ./scripts/verify.ps1
 ```
 
-This checks each contract responds to a read-only query
-(`get_admin`, `get_counts`, `get_stats`, `get_locked`) and that the
-invoice contract's post-deploy wiring is in place
-(`get_escrow_contract`, `get_agent_registry_contract`,
-`is_supported_asset`).
+This checks that each deployed contract responds, its WASM hash matches the
+local release artifact, admin addresses match `DEPLOYER_ACCOUNT`, cross-contract
+references and configured assets match `.env`, and the invoice asset allow-list
+is correct. Experimental XLM contracts are checked only when
+`DEPLOY_XLM=true`. Build the same release artifacts that were deployed before
+running verification; a different local build is expected to fail the hash
+check.
 
 You can also verify on [Stellar Expert Testnet](https://stellar.expert/explorer/testnet).
+To confirm the deployed bytecode matches your local build, compare hashes as
+described in the [WASM artifact contributor guide](docs/developer-guide/wasm-artifacts.md#compare-wasm-hashes).
 
 ## Contract Address Lifecycle & Rotation Policy
 
@@ -253,7 +344,7 @@ pool_xlm=<CONTRACT_ID> (EXPERIMENTAL)
 
 ### Integrator Expectations
 
-The automated update of `README.md` with live testnet addresses only occurs when the full `deploy.sh` pipeline is run to completion by an operator with valid deployer credentials and an active Stellar CLI session. It relies on the local, gitignored `deployments.json` and does not run automatically on every address change or in CI.
+The deployment scripts write local, gitignored `deployments.json` metadata. The Bash deployment pipeline passes that metadata to `scripts/maintainer/update-readme-addresses.sh`, which refreshes both each contract ID and its individual Stellar Expert Testnet link in `README.md`. The PowerShell deployment also refreshes the README from its deployment metadata. These links target Testnet and do not imply Mainnet support.
 
 > [!NOTE]
 > **Single-Contract Hotfix Redeploys:** Use `bash scripts/deploy.sh --only <contract>` (e.g. `--only invoice`) to redeploy a single contract without re-running the full pipeline. The script will automatically update `deployments.json` and `README.md` with the new address. See the [Single-Contract Hotfix](#single-contract-hotfix-redeploys) section under **Flags** above for full details.
