@@ -6,6 +6,7 @@
 # existing account via Friendbot instead of failing.
 
 set -euo pipefail
+umask 077
 
 # Prefer a globally available `stellar` on PATH, fall back to a common WSL installation
 if command -v stellar &> /dev/null; then
@@ -39,7 +40,11 @@ if "$STELLAR" keys ls 2>/dev/null | grep -q "^${KEY_NAME}$"; then
   fi
 else
   echo "Creating and funding testnet deployer account..."
-  "$STELLAR" keys generate "$KEY_NAME" --network testnet --fund
+  if ! "$STELLAR" keys generate "$KEY_NAME" --network testnet --fund >/dev/null 2>&1; then
+    echo "Error: Stellar CLI could not generate and fund the deployer key."
+    echo "       CLI output was withheld to avoid exposing key material."
+    exit 1
+  fi
   DEPLOYER_ADDRESS=$("$STELLAR" keys address "$KEY_NAME")
   echo "Deployer address: $DEPLOYER_ADDRESS"
   echo "Account created and funded."

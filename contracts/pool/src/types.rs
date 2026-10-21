@@ -64,6 +64,22 @@ pub struct LPPosition {
     pub deposit_count: u32,
 }
 
+/// Read-only quote returned by `preview_withdraw`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawPreview {
+    /// USDC (in stroops) `withdraw` would return for the requested shares,
+    /// using the same floor-rounded conversion as the write path.
+    pub usdc_out: u128,
+    /// USDC (in stroops) currently available for withdrawals, equal to
+    /// `total_deposits - total_funded`.
+    pub available_liquidity: u128,
+    /// Whether `available_liquidity` covers `usdc_out`. When false, a real
+    /// `withdraw` of the same shares would revert with `InsufficientLiquidity`
+    /// (assuming the caller owns the shares and the pool is unpaused).
+    pub liquidity_ok: bool,
+}
+
 /// SEP-41 share allowance granted by an LP to a spender.
 #[contracttype]
 #[derive(Clone, Debug)]

@@ -67,6 +67,10 @@ cargo build --workspace --release --target wasm32v1-none
 cargo test --workspace
 ```
 
+See [Building and inspecting WASM artifacts](./docs/developer-guide/wasm-artifacts.md)
+for WASM artifact paths, hash comparison against a deployed contract, contract
+spec inspection, and target/version troubleshooting.
+
 Add positive and negative tests where applicable. New public functions must include
 rustdoc for arguments, authorization, panics, and return values.
 
