@@ -1,3 +1,4 @@
+use crate::types::RevocationReason;
 use soroban_sdk::{Address, Env, Symbol};
 
 pub fn contract_initialized(env: &Env, admin: &Address) {
@@ -17,9 +18,14 @@ pub fn buyer_registered(env: &Env, address: &Address) {
         .publish((Symbol::new(env, "buyer_registered"), address.clone()), ());
 }
 
-pub fn address_revoked(env: &Env, address: &Address) {
-    env.events()
-        .publish((Symbol::new(env, "address_revoked"), address.clone()), ());
+/// Emitted when an admin revokes a profile. The data payload is the
+/// [`RevocationReason`] encoded as its stable `u32` discriminant, so indexers
+/// can decode the reason without an additional lookup.
+pub fn address_revoked(env: &Env, address: &Address, reason: &RevocationReason) {
+    env.events().publish(
+        (Symbol::new(env, "address_revoked"), address.clone()),
+        reason.clone(),
+    );
 }
 
 pub fn batch_registered(env: &Env, registered: u32, skipped: u32) {

@@ -1,10 +1,10 @@
 #![no_std]
 
+use clearledger_pause::{require_not_paused, set_paused};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, BytesN, Env, IntoVal, String, Symbol,
     Vec,
 };
-use clearledger_pause::{require_not_paused, set_paused};
 
 mod constants;
 mod errors;
@@ -635,6 +635,61 @@ impl PoolContract {
         Self::shares_for_deposit(&env, usdc_amount)
     }
 
+    /// Previews the USDC a withdrawal of `shares` would return.
+    ///
+    /// Uses the same floor-rounded conversion as `withdraw`
+    /// (`shares * total_deposits / total_shares`) and only reads pool state.
+    /// The returned `WithdrawPreview` also reports the pool's currently
+    /// available liquidity and whether it covers the quoted output, so a
+    /// caller can surface an insufficient-liquidity condition without a
+    /// reverted transaction.
+    ///
+    /// Unlike `withdraw`, this method neither requires nor checks an LP
+    /// address: it quotes the pool's share price and liquidity, while the LP's
+    /// own share balance remains available from `balance`/`get_lp_position`.
+    /// It also does not check pause state, so callers should combine the quote
+    /// with those checks before submitting `withdraw`. It is read-only — no
+    /// authorization, storage writes, events, or TTL extensions occur.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `shares` - The number of shares to quote a redemption for.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the pool is not initialized.
+    /// * `InvalidAmount` if `shares` is zero.
+    /// * `NoShares` if no shares are outstanding.
+    /// * `MinimumDeposit` if the computed USDC redemption rounds down to zero.
+    /// * `Overflow` if `shares * total_deposits` would overflow `u128`.
+    ///
+    /// # Returns
+    /// * `WithdrawPreview` - The quoted USDC output, available liquidity, and
+    ///   whether that liquidity is sufficient.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let preview = client.preview_withdraw(500);
+    /// if preview.liquidity_ok {
+    ///     // preview.usdc_out is what withdraw(&lp, 500) would return.
+    /// }
+    /// ```
+    pub fn preview_withdraw(env: Env, shares: u128) -> WithdrawPreview {
+        Self::require_initialized(&env);
+
+        let totals = Self::totals(&env);
+        let available_liquidity = totals.deposits - totals.funded;
+        let usdc_out = Self::usdc_for_withdraw(&env, shares, totals.shares, totals.deposits);
+
+        WithdrawPreview {
+            usdc_out,
+            available_liquidity,
+            liquidity_ok: usdc_out <= available_liquidity,
+        }
+    }
+
     /// Withdraws shares from the pool and transfers USDC to the LP.
     ///
     /// # Arguments
@@ -695,13 +750,7 @@ impl PoolContract {
         let total_funded = totals.funded;
         let available = total_deposits - total_funded;
 
-        let scaled = shares
-            .checked_mul(total_deposits)
-            .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow));
-        let usdc_to_return = scaled / total_shares;
-        if usdc_to_return == 0 {
-            panic_with_error!(&env, PoolError::MinimumDeposit);
-        }
+        let usdc_to_return = Self::usdc_for_withdraw(&env, shares, total_shares, total_deposits);
         if usdc_to_return > available {
             panic_with_error!(&env, PoolError::InsufficientLiquidity);
         }
@@ -1229,6 +1278,8 @@ impl PoolContract {
         let funded_amount = face_value
             .checked_mul(10000 - discount_bps as u128)
             .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow))
+            // Integer division floors; any fractional stroop is excluded from
+            // the funded principal and remains part of the invoice discount.
             / 10000;
         if funded_amount == 0 {
             panic_with_error!(&env, PoolError::InvalidAmount);
@@ -1292,6 +1343,7 @@ impl PoolContract {
         let _: bool =
             env.invoke_contract(&invoice_contract, &Symbol::new(&env, "mark_funded"), args);
 
+        events::invoice_funded_v1(&env, &invoice_id, funded_amount);
         events::invoice_funded(&env, &invoice_id, funded_amount);
         Self::extend_instance_ttl(&env);
         true
@@ -1902,6 +1954,9 @@ impl PoolContract {
     /// Requires authorization from `admin` (via `admin.require_auth()`).
     ///
     /// # Panics
+    /// * `InvalidConfiguration` if `new_cap_bps` is zero. A zero cap would
+    ///   make every positive funding attempt fail and is therefore not a
+    ///   valid operating configuration.
     /// * `InvalidAmount` if `new_cap_bps` exceeds `10_000`.
     ///
     /// # Returns
@@ -1914,6 +1969,9 @@ impl PoolContract {
     pub fn set_max_utilization(env: Env, admin: Address, new_cap_bps: u32) -> bool {
         require_not_paused(&env);
         admin.require_auth();
+        if new_cap_bps == 0 {
+            panic_with_error!(&env, PoolError::InvalidConfiguration);
+        }
         if new_cap_bps > 10000 {
             panic_with_error!(&env, PoolError::InvalidAmount);
         }
@@ -2069,7 +2127,7 @@ impl PoolContract {
     }
 
     fn shares_for_deposit(env: &Env, usdc_amount: u128) -> u128 {
-        if usdc_amount == 0 {
+        if usdc_amount == 0 || usdc_amount > i128::MAX as u128 {
             panic_with_error!(env, PoolError::InvalidAmount);
         }
 
@@ -2094,6 +2152,36 @@ impl PoolContract {
         }
 
         shares_to_issue
+    }
+
+    /// Converts LP shares to the USDC `withdraw` would return.
+    ///
+    /// This is the single source of truth for withdrawal rounding: integer
+    /// division floors the result, and the zero-output dust guard matches the
+    /// deposit-side one. Both `withdraw` and `preview_withdraw` call this, so a
+    /// quote can never drift from the amount the write path pays out.
+    fn usdc_for_withdraw(
+        env: &Env,
+        shares: u128,
+        total_shares: u128,
+        total_deposits: u128,
+    ) -> u128 {
+        if shares == 0 {
+            panic_with_error!(env, PoolError::InvalidAmount);
+        }
+        if total_shares == 0 {
+            panic_with_error!(env, PoolError::NoShares);
+        }
+
+        let scaled = shares
+            .checked_mul(total_deposits)
+            .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow));
+        let usdc_to_return = scaled / total_shares;
+        if usdc_to_return == 0 {
+            panic_with_error!(env, PoolError::MinimumDeposit);
+        }
+
+        usdc_to_return
     }
 
     fn registry_contract(env: &Env) -> Address {
@@ -2202,6 +2290,8 @@ impl PoolContract {
             yield_amount
                 .checked_mul(fee_bps as u128)
                 .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow))
+                // Floor the treasury share; the fractional remainder stays
+                // with LPs so the split conserves every whole stroop.
                 / 10_000
         } else {
             0

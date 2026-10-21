@@ -427,6 +427,38 @@ fn create_lp_with_balance(te: &TestEnv, balance: i128) -> Address {
 }
 
 //  DEPOSIT TESTS
+#[cfg(test)]
+mod versioned_event_tests {
+    use crate::events::{invoice_funded, invoice_funded_v1};
+    use soroban_sdk::{BytesN, Env, Symbol};
+    use soroban_sdk::{testutils::Events, IntoVal, Val, Vec};
+
+    #[test]
+    fn funding_keeps_legacy_payload_and_adds_explicit_version() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::PoolContract);
+        let invoice_id = BytesN::from_array(&env, &[17; 32]);
+        env.as_contract(&contract, || {
+            invoice_funded_v1(&env, &invoice_id, 123u128);
+            invoice_funded(&env, &invoice_id, 123u128);
+        });
+        let published = env.events().all();
+        assert_eq!(published.len(), 2);
+        let (legacy_contract, legacy_topics, legacy_data) = published.get(1).unwrap();
+        let expected_legacy_topics: Vec<Val> =
+            (Symbol::new(&env, "invoice_funded"), invoice_id.clone()).into_val(&env);
+        assert_eq!(legacy_contract, contract);
+        assert_eq!(legacy_topics, expected_legacy_topics);
+        assert_eq!(legacy_data, 123u128.into_val(&env));
+        let (versioned_contract, versioned_topics, versioned_data) = published.get(0).unwrap();
+        let expected_versioned_topics: Vec<Val> =
+            (Symbol::new(&env, "invoice_funded_v1"), invoice_id).into_val(&env);
+        assert_eq!(versioned_contract, contract);
+        assert_eq!(versioned_topics, expected_versioned_topics);
+        assert_eq!(versioned_data, (1u32, 123u128).into_val(&env));
+    }
+}
+
 #[test]
 fn test_first_deposit_issues_one_to_one_shares() {
     let te = setup();
@@ -543,6 +575,229 @@ fn test_preview_deposit_rejects_dust_after_yield() {
     te.pool.preview_deposit(&1);
 }
 
+#[test]
+fn test_preview_withdraw_matches_withdraw_across_share_prices() {
+    // 1:1 share price, including the full balance.
+    for shares in [1u128, 5_000_000_000, 10_000_000_000] {
+        let te = setup();
+        te.pool.deposit(&te.lp, &10_000_000_000);
+
+        let stats_before = te.pool.get_stats();
+        let preview = te.pool.preview_withdraw(&shares);
+        assert_eq!(preview.available_liquidity, stats_before.available_liquidity);
+        assert!(preview.liquidity_ok);
+
+        let withdrawn = te.pool.withdraw(&te.lp, &shares);
+        assert_eq!(preview.usdc_out, withdrawn);
+    }
+
+    // Repayment yield moves the price to 1.02; odd share counts must floor the
+    // same way on both paths.
+    for shares in [1u128, 3, 7, 123_456_789] {
+        let te = setup();
+        te.pool.deposit(&te.lp, &10_000_000_000);
+        fund_and_repay_invoice(&te);
+
+        let preview = te.pool.preview_withdraw(&shares);
+        assert!(preview.liquidity_ok);
+
+        let withdrawn = te.pool.withdraw(&te.lp, &shares);
+        assert_eq!(preview.usdc_out, withdrawn);
+        assert_eq!(
+            preview.usdc_out,
+            shares * 10_200_000_000 / 10_000_000_000
+        );
+    }
+}
+
+#[test]
+fn test_preview_withdraw_floors_odd_share_prices_like_withdraw() {
+    // 10 USDC backing 7 shares: 1 -> 1, 2 -> 2, 3 -> 4, 6 -> 8.
+    for (shares, expected) in [(1u128, 1u128), (2, 2), (3, 4), (6, 8)] {
+        let te = setup();
+        // Fund the pool's token balance, then replace the aggregate accounting
+        // with a state that produces a non-integer share price.
+        te.pool.deposit(&te.lp, &10_000_000_000);
+        te.env.as_contract(&te.pool_id, || {
+            te.env
+                .storage()
+                .instance()
+                .set(&DataKey::TotalShares, &7u128);
+            te.env
+                .storage()
+                .instance()
+                .set(&DataKey::TotalDeposits, &10u128);
+            te.env
+                .storage()
+                .instance()
+                .set(&DataKey::TotalFunded, &0u128);
+            te.env
+                .storage()
+                .persistent()
+                .set(&DataKey::LPShares(te.lp.clone()), &7u128);
+        });
+
+        let preview = te.pool.preview_withdraw(&shares);
+        assert_eq!(preview.usdc_out, expected);
+        assert_eq!(preview.available_liquidity, 10);
+        assert!(preview.liquidity_ok);
+
+        assert_eq!(te.pool.withdraw(&te.lp, &shares), expected);
+    }
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_preview_withdraw_zero_shares_panics() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.preview_withdraw(&0);
+}
+
+#[test]
+fn test_preview_withdraw_requires_no_authorization() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.env.set_auths(&[]);
+
+    assert_eq!(te.pool.preview_withdraw(&1).usdc_out, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_preview_withdraw_preserves_dust_guard() {
+    let te = setup();
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalShares, &1_000_000_000_000u128);
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &1u128);
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalFunded, &0u128);
+    });
+
+    te.pool.preview_withdraw(&1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_preview_withdraw_rejects_share_price_overflow() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &u128::MAX);
+    });
+
+    te.pool.preview_withdraw(&10_000_000_000);
+}
+
+#[test]
+fn test_preview_withdraw_reports_insufficient_liquidity_without_panicking() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &DEFAULT_FUNDED_AMOUNT);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    let _ = te.pool.fund_invoice(&invoice_id);
+
+    let stats_before = te.pool.get_stats();
+    assert_eq!(stats_before.available_liquidity, 0);
+
+    let preview = te.pool.preview_withdraw(&1);
+    assert_eq!(preview.usdc_out, 1);
+    assert_eq!(preview.available_liquidity, 0);
+    assert!(!preview.liquidity_ok);
+
+    // The write path still rejects the same quote.
+    assert!(te.pool.try_withdraw(&te.lp, &1).is_err());
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+}
+
+#[test]
+fn test_preview_withdraw_above_lp_balance_reports_liquidity_constraint() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+
+    let requested = 20_000_000_000u128;
+    let position = te.pool.get_lp_position(&te.lp);
+    assert!(requested > position.shares);
+
+    let preview = te.pool.preview_withdraw(&requested);
+    assert_eq!(preview.usdc_out, requested);
+    assert_eq!(preview.available_liquidity, 10_000_000_000);
+    assert!(!preview.liquidity_ok);
+
+    // `withdraw` rejects the same request via its LP-balance guard.
+    assert!(te.pool.try_withdraw(&te.lp, &requested).is_err());
+}
+
+#[test]
+fn test_preview_withdraw_does_not_write_state_emit_events_or_extend_ttl() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+
+    let stats_before = te.pool.get_stats();
+    let position_before = te.pool.get_lp_position(&te.lp);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let lp_usdc_before = usdc.balance(&te.lp);
+    let pool_usdc_before = usdc.balance(&te.pool_id);
+    let events_before = te.env.events().all().len();
+
+    // Drain the LP-share entry below TTL_THRESHOLD so any extension performed
+    // by the preview would be visible.
+    let shares_key = DataKey::LPShares(te.lp.clone());
+    let ttl_before_drain: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get_ttl(&shares_key)
+    });
+    te.env
+        .ledger()
+        .set_sequence_number(te.env.ledger().sequence() + ttl_before_drain - 50);
+    let shares_ttl_before: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get_ttl(&shares_key)
+    });
+    let instance_ttl_before: u32 = te
+        .env
+        .as_contract(&te.pool_id, || te.env.storage().instance().get_ttl());
+    assert!(shares_ttl_before < TTL_THRESHOLD);
+    assert!(instance_ttl_before < TTL_THRESHOLD);
+
+    let preview = te.pool.preview_withdraw(&1_000_000_000);
+    assert_eq!(preview.usdc_out, 1_020_000_000);
+    assert!(preview.liquidity_ok);
+
+    let shares_ttl_after: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get_ttl(&shares_key)
+    });
+    let instance_ttl_after: u32 = te
+        .env
+        .as_contract(&te.pool_id, || te.env.storage().instance().get_ttl());
+    assert_eq!(shares_ttl_after, shares_ttl_before);
+    assert_eq!(instance_ttl_after, instance_ttl_before);
+
+    let stats_after = te.pool.get_stats();
+    let position_after = te.pool.get_lp_position(&te.lp);
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(stats_after.available_liquidity, stats_before.available_liquidity);
+    assert_eq!(position_after.shares, position_before.shares);
+    assert_eq!(position_after.usdc_value, position_before.usdc_value);
+    assert_eq!(position_after.yield_earned, position_before.yield_earned);
+    assert_eq!(usdc.balance(&te.lp), lp_usdc_before);
+    assert_eq!(usdc.balance(&te.pool_id), pool_usdc_before);
+    assert_eq!(te.env.events().all().len(), events_before);
+}
+
 //  DUST ATTACK / 0-SHARE TESTS (issue #129)
 // After the pool accrues yield the share price rises above 1.0. A deposit
 // small enough that `usdc_amount * total_shares < total_deposits` would round
@@ -578,6 +833,9 @@ fn test_dust_deposit_rejection_preserves_state_and_funds() {
 
     let before = te.pool.get_stats();
     let lp2 = create_lp_with_balance(&te, 10_000_000_000);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let lp_balance_before = usdc.balance(&lp2);
+    let pool_balance_before = usdc.balance(&te.pool_id);
 
     // try_* returns Err on contract panic instead of unwinding the test.
     let res = te.pool.try_deposit(&lp2, &1);
@@ -587,6 +845,8 @@ fn test_dust_deposit_rejection_preserves_state_and_funds() {
     let after = te.pool.get_stats();
     assert_eq!(after.total_deposits, before.total_deposits);
     assert_eq!(after.total_shares, before.total_shares);
+    assert_eq!(usdc.balance(&lp2), lp_balance_before);
+    assert_eq!(usdc.balance(&te.pool_id), pool_balance_before);
 
     // The rejected depositor holds no shares.
     let pos = te.pool.get_lp_position(&lp2);
@@ -892,6 +1152,18 @@ fn test_fund_invoice_allows_boundary_amount_of_one() {
     let stats = te.pool.get_stats();
     assert_eq!(stats.total_funded, 1);
     assert_eq!(stats.active_invoice_count, 1);
+}
+
+#[test]
+fn test_fund_invoice_discount_rounds_funded_amount_down() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    // 3 * (10_000 - 1) / 10_000 = 2.9997, floored to 2 stroops.
+    let invoice_id = create_and_list_with_params(&te, &te.usdc_id, 3, 1);
+
+    assert!(te.pool.fund_invoice(&invoice_id));
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), Some(2));
+    assert_eq!(te.pool.get_stats().total_funded, 2);
 }
 
 #[test]
@@ -1472,8 +1744,7 @@ fn test_fund_invoice_rejects_above_cap() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
-fn test_fund_invoice_rejects_when_utilization_cap_is_zero() {
+fn test_set_max_utilization_rejects_zero_without_changing_cap() {
     let te = setup();
     te.pool.set_max_utilization(&te.admin, &0);
     te.pool.deposit(&te.lp, &10_000_000_000);
@@ -1674,6 +1945,33 @@ fn test_repay_early_against_real_pool_and_escrow() {
     assert_eq!(escrow_client.get_locked(&invoice_id), 0);
 
     assert_eq!(te.invoice.get_status(&invoice_id), 5); // Repaid
+}
+
+#[test]
+fn test_early_repayment_rounds_one_unit_discount_accrual_down() {
+    let te = setup();
+    let deposit = 100_000_000_000u128;
+    te.pool.deposit(&te.lp, &deposit);
+    let invoice_id =
+        create_and_list_with_params_and_term(&te, &te.usdc_id, 5, 2000, 86_400);
+    te.pool.fund_invoice(&invoice_id);
+    te.invoice.mark_shipped(&invoice_id);
+    te.invoice.confirm_delivery(&invoice_id, &te.issuer);
+    te.invoice.confirm_delivery(&invoice_id, &te.buyer);
+
+    // The one-stroop discount accrued halfway through the term floors to 0.
+    te.env
+        .ledger()
+        .set_timestamp(te.env.ledger().timestamp() + 43_200);
+    let buyer_before = MockTokenClient::new(&te.env, &te.usdc_id).balance(&te.buyer);
+
+    assert!(te.invoice.repay_early(&invoice_id));
+
+    let buyer_after = MockTokenClient::new(&te.env, &te.usdc_id).balance(&te.buyer);
+    assert_eq!(buyer_after, buyer_before - 4);
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_deposits, deposit);
+    assert_eq!(stats.total_yield_distributed, 0);
 }
 
 // Issue #876: nonzero protocol fees must also flow through the real early
@@ -3654,11 +3952,11 @@ fn test_fund_invoice_before_initialize_panics() {
 // production code rather than the mock. Refs: issue #631.
 mod real_registry_integration {
     use super::*;
-    use soroban_sdk::{map, Map, String};
     use clearledger_registry::{
         RegistryContract as RealRegistry, RegistryContractClient as RealRegistryClient,
         VerificationStatus,
     };
+    use soroban_sdk::{map, Map, String};
 
     #[test]
     fn test_real_registry_revoke_reinstate_gates_create_and_funding() {
@@ -4396,6 +4694,30 @@ fn prop_initial_deposit_below_minimum_always_rejected() {
         .unwrap();
 }
 
+#[test]
+fn prop_deposits_above_token_amount_range_rejected_without_mutation() {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(&((i128::MAX as u128 + 1)..=u128::MAX), |deposit_amount| {
+            let te = setup();
+            let pool_before = te.pool.get_stats();
+            let token = MockTokenClient::new(&te.env, &te.usdc_id);
+            let lp_balance_before = token.balance(&te.lp);
+            let pool_balance_before = token.balance(&te.pool_id);
+
+            prop_assert!(
+                te.pool.try_deposit(&te.lp, &deposit_amount).is_err(),
+                "deposit {deposit_amount} exceeds the SEP-41 signed amount range"
+            );
+            prop_assert_eq!(te.pool.get_stats().total_deposits, pool_before.total_deposits);
+            prop_assert_eq!(te.pool.get_stats().total_shares, pool_before.total_shares);
+            prop_assert_eq!(token.balance(&te.lp), lp_balance_before);
+            prop_assert_eq!(token.balance(&te.pool_id), pool_balance_before);
+            Ok(())
+        })
+        .unwrap();
+}
+
 // For any withdrawal of all shares after a deposit, the USDC returned must
 // equal the deposited amount (no yield, no loss).
 #[test]
@@ -4561,6 +4883,49 @@ fn test_freshly_initialized_pool_has_zero_protocol_fee() {
 }
 
 #[test]
+fn test_protocol_fee_rounding_at_zero_max_and_truncation_boundaries() {
+    let cases = [
+        (0u32, 1u128, 0u128),
+        (1, 9_999, 0),
+        (1, 10_000, 1),
+        (MAX_PROTOCOL_FEE_BPS, 4, 0),
+        (MAX_PROTOCOL_FEE_BPS, 5, 1),
+        (MAX_PROTOCOL_FEE_BPS, 10_001, 2_000),
+    ];
+
+    for (fee_bps, yield_amount, expected_fee) in cases {
+        let te = setup();
+        te.pool.deposit(&te.lp, &100_000_000_000);
+        let invoice_id = create_and_list(&te, &te.usdc_id);
+        te.pool.fund_invoice(&invoice_id);
+
+        let treasury = Address::generate(&te.env);
+        te.pool.set_protocol_fee(&fee_bps, &treasury);
+
+        let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+        let treasury_before = usdc.balance(&treasury);
+        let stats_before = te.pool.get_stats();
+        assert!(te
+            .pool
+            .receive_repayment(&invoice_id, &(DEFAULT_FUNDED_AMOUNT + yield_amount)));
+
+        let stats_after = te.pool.get_stats();
+        assert_eq!(
+            usdc.balance(&treasury) - treasury_before,
+            expected_fee as i128
+        );
+        assert_eq!(
+            stats_after.total_yield_distributed - stats_before.total_yield_distributed,
+            yield_amount - expected_fee
+        );
+        assert_eq!(
+            stats_after.total_deposits - stats_before.total_deposits,
+            yield_amount - expected_fee
+        );
+    }
+}
+
+#[test]
 fn test_nonzero_protocol_fee_splits_receive_repayment() {
     let te = setup();
     te.pool.deposit(&te.lp, &100_000_000_000);
@@ -4653,6 +5018,25 @@ fn test_nonzero_protocol_fee_splits_receive_repayment_with_refund() {
         after_stats.total_deposits - before_stats.total_deposits,
         expected_lp_yield
     );
+}
+
+#[test]
+fn test_protocol_fee_rounding_assigns_fractional_remainder_to_lps() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list_with_params(&te, &te.usdc_id, 5, 2000);
+    te.pool.fund_invoice(&invoice_id);
+
+    let treasury = Address::generate(&te.env);
+    te.pool.set_protocol_fee(&2000, &treasury);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let treasury_before = usdc.balance(&treasury);
+
+    // A one-unit surplus at 20% floors the protocol cut to zero.
+    assert!(te.pool.receive_repayment(&invoice_id, &5));
+
+    assert_eq!(usdc.balance(&treasury), treasury_before);
+    assert_eq!(te.pool.get_stats().total_yield_distributed, 1);
 }
 
 //  ISSUE #846: PROPT — FEE SPLIT CONSERVES YIELD
@@ -6156,6 +6540,8 @@ enum FundStep {
     Repay(u128),
     Default,
     Withdraw(u128),
+    Transfer(u128),
+    SetFee(u32),
     SetCap(u32),
 }
 
@@ -6170,7 +6556,12 @@ fn fund_step_strategy() -> impl Strategy<Value = FundStep> {
     ]
 }
 
-fn run_fund_step(te: &TestEnv, invoices: &[BytesN<32>; 3], step: &FundStep) -> StepOutcome {
+fn run_fund_step(
+    te: &TestEnv,
+    other_lp: &Address,
+    invoices: &[BytesN<32>; 3],
+    step: &FundStep,
+) -> StepOutcome {
     match step {
         FundStep::Deposit(amount) => classify(te.pool.try_deposit(&te.lp, amount)),
         FundStep::Fund(index) => {
@@ -6185,6 +6576,13 @@ fn run_fund_step(te: &TestEnv, invoices: &[BytesN<32>; 3], step: &FundStep) -> S
         FundStep::Withdraw(shares) => classify(te.pool.try_withdraw(&te.lp, shares)),
         FundStep::SetCap(bps) => classify(te.pool.try_set_max_utilization(&te.admin, bps)),
     }
+        FundStep::Transfer(shares) => {
+            classify(te.pool.try_transfer(&te.lp, other_lp, &(*shares as i128)))
+        }
+        FundStep::SetFee(bps) => {
+            let treasury = te.pool.get_treasury();
+            classify(te.pool.try_set_protocol_fee(bps, &treasury))
+        }
 }
 
 /// `(total_deposits, total_funded, available_liquidity, max_utilization_bps)`.
@@ -6229,13 +6627,20 @@ fn prop_utilization_cap_and_funding_accounting_hold_across_op_sequences() {
             &(
                 // Sometimes a very tight cap (mostly rejections), sometimes a
                 // full cap (so funding can succeed and the cap assertion bites).
-                prop_oneof![1 => 0u32..=500u32, 1 => 1u32..=10_000u32],
+                prop_oneof![1 => 1u32..=500u32, 1 => 1u32..=10_000u32],
                 prop::collection::vec(fund_step_strategy(), 1..=PROP_MAX_STEPS),
             ),
             |(cap_bps, steps)| {
                 let te = setup();
                 te.pool.set_max_utilization(&te.admin, &cap_bps);
 
+                let other_lp = Address::generate(&te.env);
+                te.env.as_contract(&te.usdc_id, || {
+                    te.env
+                        .storage()
+                        .persistent()
+                        .set(&TKey(other_lp.clone()), &100_000_000_000_000i128);
+                });
                 // A small set of fundable invoices plus enough LP liquidity.
                 let invoices = [
                     create_and_list(&te, &te.usdc_id),
@@ -6249,11 +6654,16 @@ fn prop_utilization_cap_and_funding_accounting_hold_across_op_sequences() {
 
                 for (index, step) in steps.iter().enumerate() {
                     let before = fund_snapshot(&te);
-                    let outcome = run_fund_step(&te, &invoices, step);
+                    let outcome = run_fund_step(&te, &other_lp, &invoices, step);
 
                     // The core invariants hold after every step.
                     check_fund_invariants(&te)?;
 
+                    prop_assert_eq!(
+                        (te.pool.balance(&te.lp) + te.pool.balance(&other_lp)) as u128,
+                        te.pool.get_stats().total_shares,
+                        "LP balances must conserve total share supply after every operation"
+                    );
                     match outcome {
                         StepOutcome::Succeeded => {
                             accepted_steps.set(accepted_steps.get() + 1);
@@ -6649,13 +7059,19 @@ fn test_batch_fund_invoice_stops_on_insufficient_liquidity() {
         &te.env,
         create_and_list(&te, &te.usdc_id),
         create_and_list(&te, &te.usdc_id),
+        create_and_list(&te, &te.usdc_id),
+        create_and_list(&te, &te.usdc_id),
     ];
 
     let funded = te.pool.batch_fund_invoice(&ids);
     assert_eq!(funded.len(), 1);
     assert_eq!(funded.get(0).unwrap(), ids.get(0).unwrap());
-    assert_eq!(te.invoice.get_status(&ids.get(1).unwrap()), 1); // Listed
-    assert_eq!(te.pool.get_stats().active_invoice_count, 1);
+    for index in 1..ids.len() {
+        assert_eq!(te.invoice.get_status(&ids.get(index).unwrap()), 1); // Listed
+    }
+    let stats = te.pool.get_stats();
+    assert_eq!(stats.total_funded, DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(stats.active_invoice_count, 1);
 }
 
 /// Eligibility failures are NOT treated as a capacity stop: an ineligible entry
@@ -6826,4 +7242,80 @@ fn test_get_funded_amount_returns_none_after_default() {
     assert!(te.pool.handle_default(&invoice_id));
 
     assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+}
+// Issue #37 initial state-machine scope: LP operations plus fee configuration.
+// Cross-contract settlement/default sequences remain a separate follow-up.
+#[test]
+fn prop_lp_operation_sequences_conserve_shares_and_deposits() {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(
+            &proptest::collection::vec((0u8..5, 1u32..1000), 1..20),
+            |operations| {
+                let te = setup();
+                let other = Address::generate(&te.env);
+                te.env.as_contract(&te.usdc_id, || {
+                    te.env
+                        .storage()
+                        .persistent()
+                        .set(&TKey(other.clone()), &100_000_000_000_000i128);
+                });
+                let token = MockTokenClient::new(&te.env, &te.usdc_id);
+                let initial_tokens = token.balance(&te.lp) + token.balance(&other);
+                let mut deposits = DEFAULT_MIN_INITIAL_DEPOSIT * 10;
+                te.pool.deposit(&te.lp, &deposits);
+                for (operation, amount) in operations {
+                    let amount = amount as u128;
+                    match operation {
+                        0 | 1 => {
+                            let actor = if operation == 0 { &te.lp } else { &other };
+                            te.pool.deposit(actor, &amount);
+                            deposits += amount;
+                        }
+                        2 => {
+                            let balance = te.pool.balance(&te.lp) as u128;
+                            let moved = amount.min(balance);
+                            if moved > 0 {
+                                te.pool.transfer(&te.lp, &other, &(moved as i128));
+                            }
+                        }
+                        3 => {
+                            let balance = te.pool.balance(&other) as u128;
+                            let burned = amount.min(balance);
+                            if burned > 0 {
+                                let paid = te.pool.withdraw(&other, &burned);
+                                deposits -= paid;
+                            }
+                        }
+                        _ => {
+                            let fee = (amount as u32) % (MAX_PROTOCOL_FEE_BPS + 1);
+                            te.pool.set_protocol_fee(&fee, &te.admin);
+                        }
+                    }
+                    let stats = te.pool.get_stats();
+                    let shares = te.pool.balance(&te.lp) + te.pool.balance(&other);
+                    prop_assert_eq!(stats.total_shares, shares as u128);
+                    prop_assert_eq!(stats.total_deposits, deposits);
+                    prop_assert_eq!(stats.total_funded, 0);
+                    prop_assert_eq!(stats.total_shares, stats.total_deposits);
+                    prop_assert_eq!(stats.available_liquidity, deposits);
+                    prop_assert_eq!(token.balance(&te.pool_id), deposits as i128);
+                    prop_assert_eq!(
+                        token.balance(&te.lp) + token.balance(&other) + token.balance(&te.pool_id),
+                        initial_tokens
+                    );
+
+                    // A malformed movement must fail without changing supply
+                    // or either participant's balance at every sequence prefix.
+                    let lp_before = te.pool.balance(&te.lp);
+                    let other_before = te.pool.balance(&other);
+                    prop_assert!(te.pool.try_transfer(&te.lp, &other, &-1).is_err());
+                    prop_assert_eq!(te.pool.balance(&te.lp), lp_before);
+                    prop_assert_eq!(te.pool.balance(&other), other_before);
+                    prop_assert_eq!(te.pool.get_stats().total_shares, stats.total_shares);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
 }

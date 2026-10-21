@@ -3,8 +3,8 @@
 extern crate std;
 
 use crate::{
-    DataKey, Profile, RegistryContract, RegistryContractClient, Role, VerificationStatus,
-    TTL_EXTEND_TO, TTL_THRESHOLD,
+    DataKey, Profile, RegistryContract, RegistryContractClient, RevocationReason, Role,
+    VerificationStatus, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
@@ -310,7 +310,7 @@ fn test_reinstate_restores_verified_and_emits_event() {
             (
                 client.address.clone(),
                 (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env),
-                ().into_val(&env),
+                RevocationReason::Unspecified.into_val(&env),
             ),
             (
                 client.address.clone(),
@@ -793,6 +793,27 @@ fn test_batch_register_issuers_all_duplicate() {
 }
 
 #[test]
+fn test_batch_register_issuers_duplicate_within_batch() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let issuer = Address::generate(&env);
+    let entries = vec![
+        &env,
+        (issuer.clone(), map![&env]),
+        (issuer.clone(), map![&env]),
+    ];
+
+    let skipped = client.batch_register_issuers(&entries);
+    // First occurrence registers, the second is reported as skipped.
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped.get(0).unwrap(), issuer);
+    assert_eq!(client.get_profile(&issuer).role(), Role::Issuer);
+    assert_eq!(client.get_profile_count(&Role::Issuer), 1);
+}
+
+#[test]
 fn test_batch_register_issuers_mixed() {
     let (env, client) = setup();
     let admin = Address::generate(&env);
@@ -995,6 +1016,27 @@ fn test_batch_register_buyers_all_duplicate() {
 }
 
 #[test]
+fn test_batch_register_buyers_duplicate_within_batch() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let buyer = Address::generate(&env);
+    let entries = vec![
+        &env,
+        (buyer.clone(), map![&env]),
+        (buyer.clone(), map![&env]),
+    ];
+
+    let skipped = client.batch_register_buyers(&entries);
+    // First occurrence registers, the second is reported as skipped.
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped.get(0).unwrap(), buyer);
+    assert_eq!(client.get_profile(&buyer).role(), Role::Buyer);
+    assert_eq!(client.get_profile_count(&Role::Buyer), 1);
+}
+
+#[test]
 fn test_batch_register_buyers_mixed() {
     let (env, client) = setup();
     let admin = Address::generate(&env);
@@ -1024,6 +1066,30 @@ fn test_batch_register_buyers_mixed() {
 
     assert_eq!(client.get_profile(&buyer2).role(), crate::Role::Buyer);
     assert_eq!(client.get_profile(&buyer3).role(), crate::Role::Buyer);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_batch_register_buyers_invalid_metadata_rejects_all() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let buyer1 = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
+    let bad_metadata = map![
+        &env,
+        (String::from_str(&env, ""), String::from_str(&env, "value"))
+    ];
+
+    let entries = vec![
+        &env,
+        (buyer1.clone(), map![&env]),
+        (buyer2.clone(), bad_metadata),
+    ];
+
+    // Invalid metadata is never skipped: it rejects the whole batch.
+    client.batch_register_buyers(&entries);
 }
 
 #[test]
@@ -1814,10 +1880,47 @@ fn test_revoke_emits_event() {
             (
                 client.address.clone(),
                 (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env),
-                ().into_val(&env),
+                RevocationReason::Unspecified.into_val(&env),
             ),
         ]
     );
+}
+
+#[test]
+fn test_revoke_with_reason_emits_explicit_reason_code() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+    client.verify_profile(&issuer, &true);
+
+    client.revoke_with_reason(&issuer, &RevocationReason::Fraud);
+
+    assert!(!client.is_verified(&issuer));
+    let events = env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(
+        event.1,
+        (Symbol::new(&env, "address_revoked"), issuer.clone()).into_val(&env)
+    );
+    assert_eq!(event.2, RevocationReason::Fraud.into_val(&env));
+    assert_eq!(event.2, 2u32.into_val(&env));
+}
+
+#[test]
+fn test_revocation_reason_discriminants_are_stable() {
+    let env = Env::default();
+    let cases = [
+        (RevocationReason::Unspecified, 0u32),
+        (RevocationReason::Compliance, 1u32),
+        (RevocationReason::Fraud, 2u32),
+        (RevocationReason::Inactivity, 3u32),
+        (RevocationReason::Other, 4u32),
+    ];
+    for (reason, code) in cases {
+        assert_eq!(reason.into_val(&env), code.into_val(&env));
+    }
 }
 
 // ============== ISSUE #179: TTL EXTENSION ON READ ==============
@@ -1865,6 +1968,18 @@ fn test_get_profile_extends_ttl() {
     assert!(
         ttl_after_read >= 1_999_000,
         "TTL should be extended close to EXTEND_TO (2_000_000), got {ttl_after_read}"
+    );
+
+    // A profile remains readable after a long supported-activity interval,
+    // and the read renews it before the persistent entry can expire.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + ttl_after_read - 50);
+    assert!(client.get_profile(&issuer).verified());
+    let ttl_after_activity: u32 =
+        env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key));
+    assert!(
+        ttl_after_activity >= 1_999_000,
+        "active profile TTL should be renewed before expiry, got {ttl_after_activity}"
     );
 }
 
@@ -2536,4 +2651,130 @@ fn test_pause_is_scoped_to_one_instance() {
     let issuer = Address::generate(&env);
     assert!(a.try_register_issuer(&issuer, &map![&env]).is_err());
     assert!(b.register_issuer(&issuer, &map![&env]));
+}
+
+fn persistent_ttl(env: &Env, contract_id: &Address, key: &DataKey) -> u32 {
+    env.as_contract(contract_id, || env.storage().persistent().get_ttl(key))
+}
+
+fn advance_to_remaining_ttl(env: &Env, contract_id: &Address, key: &DataKey, remaining: u32) {
+    let current = persistent_ttl(env, contract_id, key);
+    assert!(
+        current >= remaining,
+        "cannot rewind ledger: current TTL {current} < target {remaining}"
+    );
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + (current - remaining));
+}
+
+#[test]
+fn test_pagination_across_ledger_advancement_keeps_profiles_available() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let mut registered = Vec::new(&env);
+    for _ in 0..7 {
+        let issuer = Address::generate(&env);
+        client.register_issuer(&issuer, &map![&env]);
+        registered.push_back(issuer);
+    }
+
+    let contract_id = client.address.clone();
+    let count_key = DataKey::ProfileCount(Role::Issuer);
+    assert_eq!(client.get_profile_count(&Role::Issuer), 7);
+
+    advance_to_remaining_ttl(&env, &contract_id, &count_key, TTL_THRESHOLD - 1);
+
+    let mut paged = Vec::new(&env);
+    let pages = [(0u32, 3u32), (3, 3), (6, 3)];
+    for (start, limit) in pages {
+        let page = client.list_profiles(&Role::Issuer, &start, &limit);
+        let expected_len = (7 - start).min(limit);
+        assert_eq!(page.len(), expected_len);
+
+        for offset in 0..expected_len {
+            let expected = registered.get(start + offset).unwrap();
+            assert_eq!(page.get(offset).unwrap(), expected);
+            paged.push_back(expected);
+
+            let index_key = DataKey::ProfileIndex(Role::Issuer, start + offset);
+            let ttl = persistent_ttl(&env, &contract_id, &index_key);
+            assert!(
+                ttl >= 1_999_000,
+                "index slot {} should be extended on page read, got TTL {ttl}",
+                start + offset
+            );
+        }
+
+        let count_ttl = persistent_ttl(&env, &contract_id, &count_key);
+        assert!(
+            count_ttl > TTL_THRESHOLD,
+            "profile count should remain within the TTL policy, got {count_ttl}"
+        );
+
+        if start + expected_len < 7 {
+            env.ledger()
+                .set_sequence_number(env.ledger().sequence() + TTL_THRESHOLD / 4);
+        }
+    }
+
+    assert_eq!(paged, registered);
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_THRESHOLD / 10);
+    let first_page = vec![
+        &env,
+        registered.get(0).unwrap(),
+        registered.get(1).unwrap(),
+        registered.get(2).unwrap(),
+    ];
+    assert_eq!(client.list_profiles(&Role::Issuer, &0, &3), first_page);
+
+    assert_eq!(client.get_profile_count(&Role::Issuer), 7);
+    for address in registered.iter() {
+        let profile_key = DataKey::Profile(address.clone());
+        assert!(persistent_ttl(&env, &contract_id, &profile_key) > 0);
+        let profile = client.get_profile(&address);
+        assert_eq!(profile.role(), Role::Issuer);
+        let ttl = persistent_ttl(&env, &contract_id, &profile_key);
+        assert!(
+            ttl >= 1_999_000,
+            "profile TTL should be extended on read, got {ttl}"
+        );
+    }
+}
+
+#[test]
+fn test_list_profiles_ttl_extension_at_threshold_boundaries() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let issuer = Address::generate(&env);
+    client.register_issuer(&issuer, &map![&env]);
+
+    let contract_id = client.address.clone();
+    let index_key = DataKey::ProfileIndex(Role::Issuer, 0);
+    let count_key = DataKey::ProfileCount(Role::Issuer);
+    let expected = vec![&env, issuer.clone()];
+
+    advance_to_remaining_ttl(&env, &contract_id, &index_key, TTL_THRESHOLD + 1);
+    let index_before = persistent_ttl(&env, &contract_id, &index_key);
+    let count_before = persistent_ttl(&env, &contract_id, &count_key);
+    assert!(index_before > TTL_THRESHOLD);
+
+    assert_eq!(client.list_profiles(&Role::Issuer, &0, &1), expected);
+    assert_eq!(persistent_ttl(&env, &contract_id, &index_key), index_before);
+    assert_eq!(persistent_ttl(&env, &contract_id, &count_key), count_before);
+
+    advance_to_remaining_ttl(&env, &contract_id, &index_key, TTL_THRESHOLD - 1);
+    let index_just_after = persistent_ttl(&env, &contract_id, &index_key);
+    assert!(index_just_after <= TTL_THRESHOLD);
+
+    assert_eq!(client.list_profiles(&Role::Issuer, &0, &1), expected);
+    let index_extended = persistent_ttl(&env, &contract_id, &index_key);
+    let count_extended = persistent_ttl(&env, &contract_id, &count_key);
+    assert!(index_extended > index_just_after);
+    assert!(index_extended >= 1_999_000);
+    assert!(count_extended >= 1_999_000);
 }

@@ -1,7 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, BytesN, Env, Vec};
 use clearledger_pause::{require_not_paused, set_paused};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, BytesN, Env, Vec};
 
 mod constants;
 mod errors;
@@ -14,6 +14,22 @@ pub use errors::*;
 pub use types::*;
 
 const DEFAULT_MIN_LOCK_SECONDS: u64 = 60;
+
+/// Maximum number of [`EscrowEvent`] entries retained in contract storage per
+/// invoice. New events push out the oldest entries once this cap is reached;
+/// older history remains available from the emitted contract events.
+pub const MAX_HISTORY_EVENTS: u32 = 32;
+
+/// Minimum retention an admin may request from [`EscrowContract::compact_history`].
+/// At least one event is kept so the invoice's most recent state transition is
+/// always readable on-chain.
+pub const MIN_HISTORY_EVENTS: u32 = 1;
+
+/// Maximum number of entries a single [`EscrowContract::compact_history`] call
+/// removes. This bounds the CPU/memory cost of the call for legacy histories
+/// that predate automatic compaction; callers repeat the call until it returns
+/// `0`.
+pub const MAX_COMPACT_PER_CALL: u32 = 32;
 
 #[contract]
 pub struct EscrowContract;
@@ -167,7 +183,8 @@ impl EscrowContract {
     /// * `env` - The Soroban environment.
     /// * `invoice_id` - The invoice ID being locked.
     /// * `amount` - The amount to lock.
-    /// * `issuer` - The invoice issuer address authorized to receive released funds.
+    /// * `issuer` - The invoice issuer address authorized to receive released
+    ///   funds. Recorded as the sole source of truth for `release_to_issuer`.
     ///
     /// # Auth
     /// Requires authorization from the configured pool contract.
@@ -222,16 +239,25 @@ impl EscrowContract {
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `invoice_id` - The invoice whose escrow is released.
-    /// * `issuer` - The issuer address to receive funds.
+    /// * `issuer` - Caller-supplied issuer address. The parameter is retained
+    ///   for ABI compatibility; it must equal the issuer recorded by `lock`.
     ///
     /// # Auth
     /// Requires authorization from the configured pool contract.
     ///
+    /// # Trust boundary
+    /// The issuer stored in the [`EscrowRecord`] at lock time is the sole
+    /// source of truth. A caller-supplied `issuer` is accepted only when it
+    /// equals that stored address, and the token transfer and emitted event
+    /// always use the stored address. A mismatch reverts with
+    /// `InvalidRecipient` before any token transfer or storage mutation.
+    ///
     /// # Panics
     /// * `NotInitialized` if the contract has not been initialized.
     /// * `NotFound` if no escrow record exists for the invoice.
-    /// * `InvalidRecipient` if issuer is escrow or pool contract address.
-    /// * `InvalidRecipient` if issuer does not match the stored issuer address.
+    /// * `InvalidRecipient` if `issuer` does not match the stored issuer address.
+    /// * `InvalidRecipient` if the stored issuer is the escrow or pool contract address.
+    /// * `InvalidAmount` if the stored amount exceeds `i128::MAX`.
     ///
     /// # Returns
     /// * `bool` - `true` when funds are released.
@@ -244,10 +270,6 @@ impl EscrowContract {
         require_not_paused(&env);
         let pool = Self::require_pool_auth(&env);
 
-        if issuer == env.current_contract_address() || issuer == pool {
-            panic_with_error!(&env, EscrowError::InvalidRecipient);
-        }
-
         let key = DataKey::Locked(invoice_id.clone());
         let record: EscrowRecord = env
             .storage()
@@ -259,13 +281,18 @@ impl EscrowContract {
             panic_with_error!(&env, EscrowError::InvalidRecipient);
         }
 
+        let stored_issuer = record.issuer.clone();
+        if stored_issuer == env.current_contract_address() || stored_issuer == pool {
+            panic_with_error!(&env, EscrowError::InvalidRecipient);
+        }
+
         let usdc = Self::usdc_client(&env);
         if record.amount > i128::MAX as u128 {
             panic_with_error!(&env, EscrowError::InvalidAmount);
         }
         usdc.transfer(
             &env.current_contract_address(),
-            &issuer,
+            &stored_issuer,
             &(record.amount as i128),
         );
 
@@ -278,7 +305,7 @@ impl EscrowContract {
         );
         env.storage().persistent().remove(&key);
         Self::extend_instance_ttl(&env);
-        events::released_to_issuer(&env, &invoice_id, &issuer, record.amount);
+        events::released_to_issuer(&env, &invoice_id, &stored_issuer, record.amount);
         true
     }
 
@@ -317,7 +344,7 @@ impl EscrowContract {
         }
 
         let key = DataKey::Locked(invoice_id.clone());
-        let _record: EscrowRecord = env
+        let mut record: EscrowRecord = env
             .storage()
             .persistent()
             .get(&key)
@@ -337,7 +364,17 @@ impl EscrowContract {
             repayment_amount,
             None,
         );
-        env.storage().persistent().remove(&key);
+        if repayment_amount < record.amount {
+            record.amount -= repayment_amount;
+            env.storage().persistent().set(&key, &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        } else {
+            // Buyer repayment may include yield above the original lock.
+            // Preserve the existing terminal-settlement behavior in that case.
+            env.storage().persistent().remove(&key);
+        }
         Self::extend_instance_ttl(&env);
         events::released_to_pool(&env, &invoice_id, &pool, repayment_amount);
         true
@@ -546,7 +583,13 @@ impl EscrowContract {
             .unwrap_or(0)
     }
 
-    /// Returns the history of escrow events for an invoice.
+    /// Returns the recent history of escrow events for an invoice.
+    ///
+    /// Contract storage is bounded: at most [`MAX_HISTORY_EVENTS`] entries are
+    /// retained per invoice, in chronological (oldest first) order. Older
+    /// entries may have been pruned automatically or by
+    /// [`Self::compact_history`]; they are only available by replaying the
+    /// per-action contract events with an indexer.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -559,7 +602,8 @@ impl EscrowContract {
     /// Does not panic.
     ///
     /// # Returns
-    /// * `Vec<EscrowEvent>` - The history of escrow events for the invoice, or an empty vector if none exist.
+    /// * `Vec<EscrowEvent>` - The retained history for the invoice, oldest
+    ///   first, or an empty vector if none exists.
     ///
     /// # Example
     /// ```ignore
@@ -571,6 +615,73 @@ impl EscrowContract {
             .persistent()
             .get(&key)
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Prunes the oldest stored history events for an invoice down to `keep`.
+    ///
+    /// This is the manual half of the history compaction policy. Appends are
+    /// automatically capped at [`MAX_HISTORY_EVENTS`]; this entry point lets
+    /// the admin tighten retention further and drain histories written before
+    /// the cap existed. Removal is bounded to [`MAX_COMPACT_PER_CALL`] entries
+    /// per call, so an oversized legacy history may require repeated calls
+    /// until the return value is `0`.
+    ///
+    /// The newest `keep` events are retained in their original order. Pruned
+    /// events are not erased from the ledger's event stream: indexers that
+    /// ingested `funds_locked`, `released_to_issuer`, `released_to_pool` and
+    /// `default_resolved` still have the complete audit trail. Emits
+    /// `history_compacted(invoice_id, retained, removed)` when anything is
+    /// removed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `invoice_id` - The invoice whose history should be compacted.
+    /// * `keep` - Number of most-recent events to retain. Must be in
+    ///   [`MIN_HISTORY_EVENTS`]`..=`[`MAX_HISTORY_EVENTS`].
+    ///
+    /// # Auth
+    /// Requires authorization from the stored `admin`. Compaction is
+    /// destructive for on-chain reads, so it is deliberately admin-gated
+    /// rather than permissionless; a permissionless caller could make audit
+    /// data inaccessible to clients before they had a chance to sync.
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the contract has not been initialized.
+    /// * `InvalidRetention` if `keep` is outside the supported range.
+    /// * `NotFound` if no history exists for the invoice.
+    ///
+    /// # Returns
+    /// * `u32` - Number of events removed from contract storage.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let removed = client.compact_history(&invoice_id, &8);
+    /// ```
+    pub fn compact_history(env: Env, invoice_id: BytesN<32>, keep: u32) -> u32 {
+        if !(MIN_HISTORY_EVENTS..=MAX_HISTORY_EVENTS).contains(&keep) {
+            panic_with_error!(&env, EscrowError::InvalidRetention);
+        }
+
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let key = DataKey::History(invoice_id.clone());
+        let mut history: Vec<EscrowEvent> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotFound));
+
+        let removed = Self::prune_history(&mut history, keep, MAX_COMPACT_PER_CALL);
+        if removed > 0 {
+            env.storage().persistent().set(&key, &history);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            events::history_compacted(&env, &invoice_id, history.len(), removed);
+        }
+        Self::extend_instance_ttl(&env);
+        removed
     }
 
     fn append_history(
@@ -593,10 +704,26 @@ impl EscrowContract {
             timestamp: env.ledger().timestamp(),
             caller,
         });
+        let max_remove = history.len();
+        let removed = Self::prune_history(&mut history, MAX_HISTORY_EVENTS, max_remove);
         env.storage().persistent().set(&key, &history);
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        if removed > 0 {
+            events::history_compacted(env, invoice_id, history.len(), removed);
+        }
+    }
+
+    /// Removes up to `max_remove` events from the front of `history` until at
+    /// most `keep` remain, preserving the relative order of the survivors.
+    fn prune_history(history: &mut Vec<EscrowEvent>, keep: u32, max_remove: u32) -> u32 {
+        let mut removed = 0u32;
+        while history.len() > keep && removed < max_remove {
+            history.pop_front();
+            removed += 1;
+        }
+        removed
     }
 
     fn extend_instance_ttl(env: &Env) {

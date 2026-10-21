@@ -133,6 +133,7 @@ discrepancy noted below).
 | `set_protocol_fee` | Pool | Fee (≤ 2000 bps) and treasury address |
 | `set_max_utilization` | Pool | **See authorization discrepancy below** |
 | `register_asset`, `register_existing_pool` | Pool factory | Deploys or records a pool |
+| `compact_history` | Escrow | Prunes on-chain history; admin is accountable for retention |
 
 **Pool authorization discrepancy (`set_max_utilization`).** The function
 accepts an `admin: Address` argument and calls `admin.require_auth()` on that
@@ -153,7 +154,8 @@ One contract authenticates as the caller of another contract's function.
 | `mark_defaulted` | Invoice | The invoice's recorded `funding_pool` | Persists default status |
 | `receive_repayment`, `receive_repayment_with_refund` | Pool | The configured invoice contract | Prevents faking repayment accounting |
 | `handle_default` | Pool | The configured invoice contract | Prevents unauthorised default recovery |
-| `lock`, `release_to_issuer`, `release_to_pool` | Escrow | The configured pool contract | Only the pool can move escrowed funds |
+| `lock`, `release_to_pool` | Escrow | The configured pool contract | Only the pool can move escrowed funds |
+| `release_to_issuer` | Escrow | The configured pool contract | Only the pool can release, and the recipient must match the issuer recorded at lock time |
 | `handle_default` | Escrow | The configured pool contract **or** the escrow admin | The admin can force recovery after the 60-second lock grace period |
 
 `mark_funded` additionally checks that its `pool_address` argument equals the
@@ -182,7 +184,11 @@ deployed instance chooses its admin.
 | `trigger_default` | Invoice | Any caller once `now >= due_date` and status is `Funded`/`Active`/`Confirmed` |
 | `submit_attestation` | Invoice | No caller auth; trust comes from the secp256k1 signature and agent registry |
 | `get_profile`, `is_verified`, `get_verification_status`, `get_admin`, `get_profile_count`, `list_profiles` | Registry | Read-only |
+| `list_profiles_page` | Registry | Read-only view |
 | All `get_*`, `get_by_*`, `get_counts`, `balance`, `total_supply`, `allowance`, `get_attestation` | Invoice, Pool, Escrow | Read-only |
+| `get_stats`, `get_lp_position`, `get_utilization_rate`, `get_usdc_asset` | Pool | Read-only views |
+| `get_locked`, `get_locked_at`, `get_history` | Escrow | Read-only views |
+| `get_funded_amount`, `get_expiry_window` | Invoice | Read-only views |
 | `get_pool_for_asset`, `get_aggregate_stats`, `list_assets` | Pool factory | Read-only |
 
 Read-only views remain callable while a contract is paused.
@@ -516,6 +522,16 @@ funding/default/attestation but cannot choose amounts or recipients.
   through escrow during repayment and invokes pool accounting. It does not
   custody funds.
 - **Factory** holds no funds; it deploys and indexes pool instances.
+
+### Issuer Provenance on Release
+
+`lock()` records the issuer alongside the locked amount, and
+`release_to_issuer()` treats that stored address as the source of truth. The
+caller-supplied `issuer` parameter is only an assertion checked for equality;
+the token transfer and `released_to_issuer` event always use the stored
+address. A mismatch reverts with `InvalidRecipient` before any token transfer
+or storage mutation, so the pool cannot redirect escrowed funds to an
+arbitrary recipient and a replayed release finds no lock record.
 
 ### TTL Management
 
