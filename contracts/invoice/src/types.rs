@@ -39,6 +39,10 @@ pub struct Invoice {
     pub face_value: u128,
     /// Discount applied when the invoice is funded, in basis points
     /// (1 bp = 0.01%). Determines the yield to funders.
+    ///
+    /// On early repayment the pool earns only the time-proportional share,
+    /// `floor(discount * elapsed / term)`, rounded down to the stroop; the
+    /// unearned remainder is refunded to the buyer (issue #26).
     pub discount_bps: u32,
     /// Amount that has been funded against this invoice, in USDC stroops.
     ///
@@ -118,7 +122,20 @@ pub enum DataKey {
     // the full `StatusIndexEntry` scans previously used for duplicate and
     // idempotency checks (issues #831 / #835). Appended after every existing
     // variant so already-deployed key discriminants stay stable.
+    //
+    // Kept as a *legacy* read path only: new writes use the collision-free
+    // `StatusPosition` map below, and the bounded migration clears these rows.
     StatusMembership(InvoiceStatus, u64),
+    // Position of an invoice inside its status's compacted slot array:
+    // `(status, full invoice id)` -> `u32` slot. Presence is membership and
+    // the value is the exact `StatusIndexEntry` slot, so leaving a status is
+    // O(1) (swap-and-pop with the last slot) instead of a linear scan.
+    // Appended after `StatusMembership` so existing discriminants stay stable.
+    StatusPosition(InvoiceStatus, BytesN<32>),
+    // Cursor (source slot) for the bounded, paged status-index migration.
+    StatusMigrationCursor(InvoiceStatus),
+    // Number of live members written by the migration so far.
+    StatusMigrationKept(InvoiceStatus),
 }
 
 /// A risk attestation recorded against an invoice by a registered

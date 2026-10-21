@@ -7,8 +7,9 @@ use soroban_sdk::{contracttype, BytesN};
 /// - `amount` must be greater than zero — guaranteed by [`EscrowContract::lock`].
 /// - `locked_at` is set to `env.ledger().timestamp()` at lock time and is never
 ///   updated for the lifetime of the record.
-/// - A record is removed (via `persistent().remove`) when escrow is released
-///   or default-handled; after removal `get_locked` / `get_locked_at` return `0`.
+/// - Partial pool releases reduce `amount` and retain this record. Terminal
+///   release or default removes it; afterward `get_locked` / `get_locked_at`
+///   return `0`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowRecord {
@@ -23,8 +24,10 @@ pub struct EscrowRecord {
     /// a [`default`](EscrowAction::DefaultHandled) can be triggered.
     pub locked_at: u64,
     /// The invoice issuer address that is authorized to receive released funds.
-    /// Set from the `issuer` argument of [`EscrowContract::lock`] and validated
-    /// in [`EscrowContract::release_to_issuer`].
+    /// Set from the `issuer` argument of [`EscrowContract::lock`] and treated as
+    /// the sole source of truth by [`EscrowContract::release_to_issuer`]: a
+    /// caller-supplied address must match this value, and the release transfer
+    /// always uses this stored value.
     pub issuer: soroban_sdk::Address,
 }
 
