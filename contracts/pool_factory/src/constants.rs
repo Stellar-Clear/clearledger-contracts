@@ -1,6 +1,23 @@
 pub const TTL_THRESHOLD: u32 = clearledger_ttl::THRESHOLD;
 pub const TTL_EXTEND_TO: u32 = clearledger_ttl::EXTEND_TO;
 
+/// Maximum number of registered assets one [`get_aggregate_stats_page`] call
+/// may walk (and therefore at most that many pool `get_stats` cross-contract
+/// calls).
+///
+/// An unbounded aggregate read hydrates every registered asset and invokes
+/// every pool in a single invocation, so its resource use grows without bound
+/// as the registry grows. Capping a page keeps each call inside a predictable
+/// Soroban budget; `50` mirrors the workspace's other batch ceilings (invoice
+/// `MAX_PAGE_SIZE`, escrow `MAX_HISTORY_LIMIT`).
+///
+/// Requests with `limit == 0` or `limit > MAX_AGGREGATE_STATS_PAGE_LIMIT`
+/// panic with
+/// [`PoolFactoryError::InvalidAggregateStatsLimit`](crate::PoolFactoryError::InvalidAggregateStatsLimit).
+///
+/// [`get_aggregate_stats_page`]: crate::PoolFactoryContract::get_aggregate_stats_page
+pub const MAX_AGGREGATE_STATS_PAGE_LIMIT: u32 = 50;
+
 /// Minimum initial deposit the factory passes to a newly deployed pool
 /// instance's `initialize`. Mirrors `clearledger_pool::DEFAULT_MIN_INITIAL_DEPOSIT`;
 /// duplicated here rather than imported because `clearledger-pool` is a

@@ -66,10 +66,18 @@ A security audit is planned prior to any mainnet deployment.
 ## Further Reading
 
 - [Threat Model](./docs/THREAT_MODEL.md) — detailed trust assumptions, auth gates, and attack vectors
+- [Pre-Mainnet Audit Scope](./docs/MAINNET_AUDIT_SCOPE.md) — code map, known-risk inventory, and independent-audit questions; not an audit or readiness claim
 - [Storage Schema](./docs/STORAGE.md) — on-chain data layout and TTL management
+- [Registry Metadata Privacy](./docs/METADATA_PRIVACY.md) — public visibility, prohibited personal data, and deletion limits
 - [Limitations](./docs/LIMITATIONS.md) — known gaps, testnet constraints, and unhandled edge cases
 
 ## Important Notice
 
 ClearLedger is experimental software. Do not deposit real funds.
 All contracts operate on Stellar testnet with test USDC only.
+
+## Admin signer incidents
+
+See the [admin signer response runbook](docs/admin-signer-incident-response.md)
+for dependency pause sequencing, signer/ownership replacement limits, redeployment
+considerations and public-only user communications.
