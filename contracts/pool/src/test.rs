@@ -3258,6 +3258,21 @@ fn test_withdraw_all_shares_panics_when_insufficient_liquidity_at_full_utilizati
     te.pool.withdraw(&te.lp, &DEFAULT_FUNDED_AMOUNT);
 }
 
+#[test]
+fn test_withdraw_preview_matches_committed_liquidity_while_invoice_is_funded() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &DEFAULT_FUNDED_AMOUNT);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    assert!(te.pool.fund_invoice(&invoice_id));
+
+    let stats = te.pool.get_stats();
+    let preview = te.pool.preview_withdraw(&DEFAULT_FUNDED_AMOUNT);
+    assert_eq!(stats.available_liquidity, 0);
+    assert_eq!(preview.available_liquidity, 0);
+    assert!(!preview.liquidity_ok);
+    assert!(te.pool.try_withdraw(&te.lp, &DEFAULT_FUNDED_AMOUNT).is_err());
+}
+
 // LP deposits more than the funded amount, so some liquidity remains available.
 // A partial withdraw within that available liquidity succeeds.
 #[test]
