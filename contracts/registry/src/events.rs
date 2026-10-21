@@ -1,4 +1,7 @@
+use crate::types::RevocationReason;
 use soroban_sdk::{Address, Env, Symbol};
+
+use crate::Role;
 
 pub fn contract_initialized(env: &Env, admin: &Address) {
     env.events().publish(
@@ -17,9 +20,17 @@ pub fn buyer_registered(env: &Env, address: &Address) {
         .publish((Symbol::new(env, "buyer_registered"), address.clone()), ());
 }
 
-pub fn address_revoked(env: &Env, address: &Address) {
-    env.events()
-        .publish((Symbol::new(env, "address_revoked"), address.clone()), ());
+/// Emitted by `revoke`. The profile role is indexed in `topic[2]`; the
+/// machine-readable revocation reason is encoded in the event data.
+pub fn address_revoked(env: &Env, address: &Address, role: &Role, reason: &RevocationReason) {
+    env.events().publish(
+        (
+            Symbol::new(env, "address_revoked"),
+            address.clone(),
+            role.clone(),
+        ),
+        reason.clone(),
+    );
 }
 
 pub fn batch_registered(env: &Env, registered: u32, skipped: u32) {
@@ -29,15 +40,17 @@ pub fn batch_registered(env: &Env, registered: u32, skipped: u32) {
     );
 }
 
-/// Emitted by `verify_profile` when a profile's verification status changes.
-/// `address` is the profile being updated and `admin` is the stored contract
-/// admin that authorized the change; both are indexed so indexers can
-/// attribute the status update to the authorizing admin.
-pub fn profile_verified(env: &Env, address: &Address, admin: &Address, status: bool) {
+/// Emitted by `verify_profile`. `role` is indexed in `topic[2]` so indexers
+/// can classify the profile without an extra `get_profile` read. The stored
+/// contract admin that authorized the change is appended as `topic[3]`, and
+/// `data` remains the `bool` verification status. Both additions are
+/// additive: existing topic positions and the data payload are unchanged.
+pub fn profile_verified(env: &Env, address: &Address, status: bool, role: &Role, admin: &Address) {
     env.events().publish(
         (
             Symbol::new(env, "profile_verified"),
             address.clone(),
+            role.clone(),
             admin.clone(),
         ),
         status,
@@ -49,9 +62,15 @@ pub fn profile_updated(env: &Env, address: &Address) {
         .publish((Symbol::new(env, "profile_updated"), address.clone()), ());
 }
 
-pub fn address_reinstated(env: &Env, address: &Address) {
+/// Emitted by `reinstate`. `role` is indexed in `topic[2]` so indexers can
+/// classify the profile without an extra `get_profile` read.
+pub fn address_reinstated(env: &Env, address: &Address, role: &Role) {
     env.events().publish(
-        (Symbol::new(env, "address_reinstated"), address.clone()),
+        (
+            Symbol::new(env, "address_reinstated"),
+            address.clone(),
+            role.clone(),
+        ),
         (),
     );
 }

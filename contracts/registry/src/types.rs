@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Map, String};
+use soroban_sdk::{contracttype, Address, Map, String, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -14,6 +14,26 @@ pub enum VerificationStatus {
     Pending,
     Verified,
     Revoked,
+}
+
+/// Machine-readable reason attached to an admin revocation.
+///
+/// The numeric discriminants are part of the public ABI: off-chain indexers
+/// decode the `address_revoked` payload as a `u32` and must keep working if a
+/// new variant is appended. Existing values must never be renumbered.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevocationReason {
+    /// No specific reason supplied (used by the legacy `revoke` entry point).
+    Unspecified = 0,
+    /// Regulatory or policy compliance action.
+    Compliance = 1,
+    /// Suspected or confirmed fraud.
+    Fraud = 2,
+    /// Account dormant for the operator's inactivity policy.
+    Inactivity = 3,
+    /// Any other reason not covered by the codes above.
+    Other = 4,
 }
 
 #[contracttype]
@@ -78,6 +98,25 @@ impl Profile {
     }
 }
 
+/// One page of addresses returned by
+/// [`RegistryContract::list_profiles_page`](crate::RegistryContract::list_profiles_page).
+///
+/// `items` holds the addresses found in the scanned index slots, in
+/// registration order. `next_cursor` is the cursor to pass to the next call,
+/// or `None` when the end of the role's index has been reached.
+///
+/// A page never contains more than the requested `limit` entries, and walking
+/// the cursor from `None` until `next_cursor` is `None` visits every indexed
+/// address exactly once. `items` can be shorter than `limit` when an index slot
+/// has aged out; `next_cursor` still advances past that gap, so the caller can
+/// keep making progress without re-reading the same slots.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfilePage {
+    pub items: Vec<Address>,
+    pub next_cursor: Option<u32>,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -95,7 +134,7 @@ pub enum DataKey {
     ///
     /// Backs [`RegistryContract::get_profile_count`](crate::RegistryContract::get_profile_count)
     /// and doubles as the exclusive upper bound (the total number of indexed
-    /// addresses) for `list_profiles`, so a caller can size the last page
-    /// without first enumerating.
+    /// addresses) for `list_profiles` and `list_profiles_page`, so a caller
+    /// can size the last page without first enumerating.
     ProfileCount(Role),
 }
