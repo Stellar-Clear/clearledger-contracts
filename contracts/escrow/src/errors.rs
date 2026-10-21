@@ -15,8 +15,14 @@ pub enum EscrowError {
     InvalidAmount = 5,
     /// Returned when an action is attempted before the contract has been initialized.
     NotInitialized = 6,
-    /// Returned when releasing funds to a recipient that is invalid (e.g., not the invoice issuer).
+    /// Returned when releasing funds to a recipient that is invalid (e.g., not
+    /// the issuer recorded at lock time, or the escrow/pool contract address).
     InvalidRecipient = 7,
     /// Returned when attempting to initialize with colliding addresses (e.g., pool_contract == usdc_asset).
     InvalidConfig = 8,
+    /// Returned when the requested history retention is outside the supported
+    /// range (`MIN_HISTORY_EVENTS..=MAX_HISTORY_EVENTS`).
+    ///
+    /// Codes 9-12 are reserved by open issues #83 and #50.
+    InvalidRetention = 13,
 }

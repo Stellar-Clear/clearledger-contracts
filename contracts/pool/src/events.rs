@@ -44,6 +44,15 @@ pub fn shares_transferred(env: &Env, from: &Address, to: &Address, amount: i128)
     );
 }
 
+/// Explicit companion used by funding paths; the legacy helper remains byte-compatible.
+#[allow(dead_code)] // Emitter modules are also compiled standalone by golden-fixture tests.
+pub fn invoice_funded_v1(env: &Env, invoice_id: &BytesN<32>, funded_amount: u128) {
+    env.events().publish(
+        (Symbol::new(env, "invoice_funded_v1"), invoice_id.clone()),
+        (1u32, funded_amount),
+    );
+}
+
 pub fn invoice_funded(env: &Env, invoice_id: &BytesN<32>, funded_amount: u128) {
     env.events().publish(
         (Symbol::new(env, "invoice_funded"), invoice_id.clone()),
@@ -71,10 +80,10 @@ pub fn invoice_defaulted(env: &Env, invoice_id: &BytesN<32>, loss_amount: u128) 
     );
 }
 
-pub fn max_utilization_updated(env: &Env, old_cap_bps: u32, new_cap_bps: u32) {
+pub fn max_utilization_updated(env: &Env, admin: &Address, old_cap_bps: u32, new_cap_bps: u32) {
     env.events().publish(
         (Symbol::new(env, "max_utilization_updated"),),
-        (old_cap_bps, new_cap_bps),
+        (admin.clone(), old_cap_bps, new_cap_bps),
     );
 }
 
@@ -99,10 +108,16 @@ pub fn unpaused(env: &Env, admin: &Address) {
         .publish((Symbol::new(env, "unpaused"), admin.clone()), ());
 }
 
-pub fn protocol_fee_updated(env: &Env, old_fee_bps: u32, new_fee_bps: u32, treasury: &Address) {
+pub fn protocol_fee_updated(
+    env: &Env,
+    admin: &Address,
+    old_fee_bps: u32,
+    new_fee_bps: u32,
+    treasury: &Address,
+) {
     env.events().publish(
         (Symbol::new(env, "protocol_fee_updated"),),
-        (old_fee_bps, new_fee_bps, treasury.clone()),
+        (admin.clone(), old_fee_bps, new_fee_bps, treasury.clone()),
     );
 }
 
