@@ -54,7 +54,12 @@ if ($keysOutput -match "^${keyName}$") {
 }
 else {
     Write-Host "Creating and funding testnet deployer account..."
-    & $stellar keys generate $keyName --network testnet --fund
+    $generateOutput = & $stellar keys generate $keyName --network testnet --fund 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Error: Stellar CLI could not generate and fund the deployer key."
+        Write-Host "       CLI output was withheld to avoid exposing key material."
+        exit 1
+    }
     $deployerAddress = & $stellar keys address $keyName
     Write-Host "Deployer address: $deployerAddress"
     Write-Host "Account created and funded."

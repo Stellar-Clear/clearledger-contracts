@@ -127,7 +127,7 @@ Any account can call these.
 | Function | Contract | Notes |
 |----------|----------|-------|
 | `get_profile`, `is_verified`, `get_verification_status`, `get_admin`, `get_profile_count`, `list_profiles` | Registry | Read-only views |
-| `get`, `get_status`, `get_face_value`, `get_discount_bps`, `get_funding_asset`, `get_issuer`, `get_by_status`, `get_by_issuer`, `get_by_buyer`, `get_invoice_count_by_issuer`, `get_invoice_count_by_buyer`, `get_counts`, `get_expiry_window` | Invoice | Read-only views |
+| `get`, `get_status`, `get_face_value`, `get_funded_amount`, `get_discount_bps`, `get_funding_asset`, `get_issuer`, `get_by_status`, `get_by_issuer`, `get_by_buyer`, `get_invoice_count_by_issuer`, `get_invoice_count_by_buyer`, `get_counts`, `get_expiry_window` | Invoice | Read-only views |
 | `get_locked`, `get_history` | Escrow | Read-only views |
 | `get_stats`, `get_lp_position`, `get_utilization_rate`, `get_usdc_asset` | Pool | Read-only views |
 | `expire_listing` | Invoice | Also callable by issuer (Pattern A) |
