@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, Symbol};
 
 /// Published when the pool factory is initialized.
 pub fn contract_initialized(env: &Env, admin: &Address) {
@@ -34,5 +34,13 @@ pub fn existing_pool_registered(env: &Env, asset: &Address, pool_address: &Addre
     env.events().publish(
         (Symbol::new(env, "existing_pool_registered"), asset.clone()),
         pool_address.clone(),
+    );
+}
+
+/// Provenance record consumed by indexers and operator audit tooling.
+pub fn pool_provenance(env: &Env, asset: &Address, pool: &Address, admin: &Address, wasm_hash: &BytesN<32>) {
+    env.events().publish(
+        (Symbol::new(env, "pool_provenance"), asset.clone()),
+        (pool.clone(), admin.clone(), wasm_hash.clone()),
     );
 }

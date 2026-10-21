@@ -189,7 +189,7 @@ impl PoolFactoryContract {
         let pool_address = env
             .deployer()
             .with_current_contract(Self::asset_salt(&env, &asset))
-            .deploy(pool_wasm_hash);
+            .deploy(pool_wasm_hash.clone());
 
         Self::initialize_pool(
             &env,
@@ -204,6 +204,7 @@ impl PoolFactoryContract {
         // deployed but not yet initialized.
         Self::record_pool(&env, &asset, &pool_address);
         events::pool_instance_created(&env, &asset, &pool_address);
+        events::pool_provenance(&env, &asset, &pool_address, &admin, &pool_wasm_hash);
         pool_address
     }
 
@@ -264,6 +265,13 @@ impl PoolFactoryContract {
 
         Self::record_pool(&env, &asset, &pool_address);
         events::existing_pool_registered(&env, &asset, &pool_address);
+        events::pool_provenance(
+            &env,
+            &asset,
+            &pool_address,
+            &admin,
+            &BytesN::from_array(&env, &[0; 32]),
+        );
     }
 
     /// Returns the pool instance the factory manages for an asset.
